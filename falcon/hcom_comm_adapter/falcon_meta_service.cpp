@@ -546,7 +546,8 @@ FalconErrorCode FalconMetaServiceSerializer::SerializeRequestToSerializedData(co
 bool FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(const void *data,
                                                                         size_t size,
                                                                         FalconMetaServiceResponse *response,
-                                                                        FalconMetaOperationType operation)
+                                                                        FalconMetaOperationType operation,
+                                                                        FalconMetaServiceSmallResponseStorage *smallResponseStorage)
 {
     if (data == nullptr || size < sizeof(sd_size_t)) {
         fprintf(stderr, "[WARNING] [FalconMetaService] DeserializeResponse: attachment too small, size=%zu\n", size);
@@ -584,6 +585,22 @@ bool FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(const vo
     response->opcode = operation;
     response->status = meta_response->error_code();
 
+    auto getCreateResponse = [&]() -> CreateResponse * {
+        return smallResponseStorage != nullptr ? smallResponseStorage->createResponse : new CreateResponse();
+    };
+    auto getOpenResponse = [&]() -> OpenResponse * {
+        return smallResponseStorage != nullptr ? smallResponseStorage->openResponse : new OpenResponse();
+    };
+    auto getStatResponse = [&]() -> StatResponse * {
+        return smallResponseStorage != nullptr ? smallResponseStorage->statResponse : new StatResponse();
+    };
+    auto getUnlinkResponse = [&]() -> UnlinkResponse * {
+        return smallResponseStorage != nullptr ? smallResponseStorage->unlinkResponse : new UnlinkResponse();
+    };
+    auto getOpenDirResponse = [&]() -> OpenDirResponse * {
+        return smallResponseStorage != nullptr ? smallResponseStorage->openDirResponse : new OpenDirResponse();
+    };
+
     if (response->status != SUCCESS) {
         fprintf(stderr,
                 "[LOG] [FalconMetaService] DeserializeResponse: opcode=%d, error_code=%d, creating empty response\n",
@@ -592,23 +609,27 @@ bool FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(const vo
 
         switch (operation) {
         case DFC_CREATE: {
-            response->data = new CreateResponse();
-            memset(response->data, 0, sizeof(CreateResponse));
+            CreateResponse *createResp = getCreateResponse();
+            *createResp = CreateResponse();
+            response->data = createResp;
             return true;
         }
         case DFC_STAT: {
-            response->data = new StatResponse();
-            memset(response->data, 0, sizeof(StatResponse));
+            StatResponse *statResp = getStatResponse();
+            *statResp = StatResponse();
+            response->data = statResp;
             return true;
         }
         case DFC_OPEN: {
-            response->data = new OpenResponse();
-            memset(response->data, 0, sizeof(OpenResponse));
+            OpenResponse *openResp = getOpenResponse();
+            *openResp = OpenResponse();
+            response->data = openResp;
             return true;
         }
         case DFC_UNLINK: {
-            response->data = new UnlinkResponse();
-            memset(response->data, 0, sizeof(UnlinkResponse));
+            UnlinkResponse *unlinkResp = getUnlinkResponse();
+            *unlinkResp = UnlinkResponse();
+            response->data = unlinkResp;
             return true;
         }
         case DFC_READDIR: {
@@ -617,8 +638,9 @@ bool FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(const vo
             return true;
         }
         case DFC_OPENDIR: {
-            response->data = new OpenDirResponse();
-            memset(response->data, 0, sizeof(OpenDirResponse));
+            OpenDirResponse *openDirResp = getOpenDirResponse();
+            *openDirResp = OpenDirResponse();
+            response->data = openDirResp;
             return true;
         }
         case DFC_GET_KV_META: {
@@ -662,22 +684,23 @@ bool FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(const vo
             return false;
         }
         const auto *fbs_resp = meta_response->response_as_CreateResponse();
-        CreateResponse *create_resp = new CreateResponse();
-        create_resp->st_ino = fbs_resp->st_ino();
-        create_resp->node_id = fbs_resp->node_id();
-        create_resp->st_dev = fbs_resp->st_dev();
-        create_resp->st_mode = fbs_resp->st_mode();
-        create_resp->st_nlink = fbs_resp->st_nlink();
-        create_resp->st_uid = fbs_resp->st_uid();
-        create_resp->st_gid = fbs_resp->st_gid();
-        create_resp->st_rdev = fbs_resp->st_rdev();
-        create_resp->st_size = fbs_resp->st_size();
-        create_resp->st_blksize = fbs_resp->st_blksize();
-        create_resp->st_blocks = fbs_resp->st_blocks();
-        create_resp->st_atim = fbs_resp->st_atim();
-        create_resp->st_mtim = fbs_resp->st_mtim();
-        create_resp->st_ctim = fbs_resp->st_ctim();
-        response->data = create_resp;
+        CreateResponse *createResp = getCreateResponse();
+        *createResp = CreateResponse();
+        createResp->st_ino = fbs_resp->st_ino();
+        createResp->node_id = fbs_resp->node_id();
+        createResp->st_dev = fbs_resp->st_dev();
+        createResp->st_mode = fbs_resp->st_mode();
+        createResp->st_nlink = fbs_resp->st_nlink();
+        createResp->st_uid = fbs_resp->st_uid();
+        createResp->st_gid = fbs_resp->st_gid();
+        createResp->st_rdev = fbs_resp->st_rdev();
+        createResp->st_size = fbs_resp->st_size();
+        createResp->st_blksize = fbs_resp->st_blksize();
+        createResp->st_blocks = fbs_resp->st_blocks();
+        createResp->st_atim = fbs_resp->st_atim();
+        createResp->st_mtim = fbs_resp->st_mtim();
+        createResp->st_ctim = fbs_resp->st_ctim();
+        response->data = createResp;
         return true;
     }
 
@@ -686,21 +709,22 @@ bool FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(const vo
             return false;
         }
         const auto *fbs_resp = meta_response->response_as_StatResponse();
-        StatResponse *stat_resp = new StatResponse();
-        stat_resp->st_ino = fbs_resp->st_ino();
-        stat_resp->st_dev = fbs_resp->st_dev();
-        stat_resp->st_mode = fbs_resp->st_mode();
-        stat_resp->st_nlink = fbs_resp->st_nlink();
-        stat_resp->st_uid = fbs_resp->st_uid();
-        stat_resp->st_gid = fbs_resp->st_gid();
-        stat_resp->st_rdev = fbs_resp->st_rdev();
-        stat_resp->st_size = fbs_resp->st_size();
-        stat_resp->st_blksize = fbs_resp->st_blksize();
-        stat_resp->st_blocks = fbs_resp->st_blocks();
-        stat_resp->st_atim = fbs_resp->st_atim();
-        stat_resp->st_mtim = fbs_resp->st_mtim();
-        stat_resp->st_ctim = fbs_resp->st_ctim();
-        response->data = stat_resp;
+        StatResponse *statResp = getStatResponse();
+        *statResp = StatResponse();
+        statResp->st_ino = fbs_resp->st_ino();
+        statResp->st_dev = fbs_resp->st_dev();
+        statResp->st_mode = fbs_resp->st_mode();
+        statResp->st_nlink = fbs_resp->st_nlink();
+        statResp->st_uid = fbs_resp->st_uid();
+        statResp->st_gid = fbs_resp->st_gid();
+        statResp->st_rdev = fbs_resp->st_rdev();
+        statResp->st_size = fbs_resp->st_size();
+        statResp->st_blksize = fbs_resp->st_blksize();
+        statResp->st_blocks = fbs_resp->st_blocks();
+        statResp->st_atim = fbs_resp->st_atim();
+        statResp->st_mtim = fbs_resp->st_mtim();
+        statResp->st_ctim = fbs_resp->st_ctim();
+        response->data = statResp;
         return true;
     }
 
@@ -709,22 +733,23 @@ bool FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(const vo
             return false;
         }
         const auto *fbs_resp = meta_response->response_as_OpenResponse();
-        OpenResponse *open_resp = new OpenResponse();
-        open_resp->st_ino = fbs_resp->st_ino();
-        open_resp->node_id = fbs_resp->node_id();
-        open_resp->st_dev = fbs_resp->st_dev();
-        open_resp->st_mode = fbs_resp->st_mode();
-        open_resp->st_nlink = fbs_resp->st_nlink();
-        open_resp->st_uid = fbs_resp->st_uid();
-        open_resp->st_gid = fbs_resp->st_gid();
-        open_resp->st_rdev = fbs_resp->st_rdev();
-        open_resp->st_size = fbs_resp->st_size();
-        open_resp->st_blksize = fbs_resp->st_blksize();
-        open_resp->st_blocks = fbs_resp->st_blocks();
-        open_resp->st_atim = fbs_resp->st_atim();
-        open_resp->st_mtim = fbs_resp->st_mtim();
-        open_resp->st_ctim = fbs_resp->st_ctim();
-        response->data = open_resp;
+        OpenResponse *openResp = getOpenResponse();
+        *openResp = OpenResponse();
+        openResp->st_ino = fbs_resp->st_ino();
+        openResp->node_id = fbs_resp->node_id();
+        openResp->st_dev = fbs_resp->st_dev();
+        openResp->st_mode = fbs_resp->st_mode();
+        openResp->st_nlink = fbs_resp->st_nlink();
+        openResp->st_uid = fbs_resp->st_uid();
+        openResp->st_gid = fbs_resp->st_gid();
+        openResp->st_rdev = fbs_resp->st_rdev();
+        openResp->st_size = fbs_resp->st_size();
+        openResp->st_blksize = fbs_resp->st_blksize();
+        openResp->st_blocks = fbs_resp->st_blocks();
+        openResp->st_atim = fbs_resp->st_atim();
+        openResp->st_mtim = fbs_resp->st_mtim();
+        openResp->st_ctim = fbs_resp->st_ctim();
+        response->data = openResp;
         return true;
     }
 
@@ -733,11 +758,12 @@ bool FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(const vo
             return false;
         }
         const auto *fbs_resp = meta_response->response_as_UnlinkResponse();
-        UnlinkResponse *unlink_resp = new UnlinkResponse();
-        unlink_resp->st_ino = fbs_resp->st_ino();
-        unlink_resp->st_size = fbs_resp->st_size();
-        unlink_resp->node_id = fbs_resp->node_id();
-        response->data = unlink_resp;
+        UnlinkResponse *unlinkResp = getUnlinkResponse();
+        *unlinkResp = UnlinkResponse();
+        unlinkResp->st_ino = fbs_resp->st_ino();
+        unlinkResp->st_size = fbs_resp->st_size();
+        unlinkResp->node_id = fbs_resp->node_id();
+        response->data = unlinkResp;
         return true;
     }
 
@@ -746,9 +772,10 @@ bool FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(const vo
             return false;
         }
         const auto *fbs_resp = meta_response->response_as_OpenDirResponse();
-        OpenDirResponse *opendir_resp = new OpenDirResponse();
-        opendir_resp->st_ino = fbs_resp->st_ino();
-        response->data = opendir_resp;
+        OpenDirResponse *openDirResp = getOpenDirResponse();
+        *openDirResp = OpenDirResponse();
+        openDirResp->st_ino = fbs_resp->st_ino();
+        response->data = openDirResp;
         return true;
     }
 

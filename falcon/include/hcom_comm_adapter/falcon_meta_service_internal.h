@@ -18,6 +18,14 @@ namespace meta_service {
 
 constexpr size_t FALCON_MAX_NAME_LENGTH = 255;
 
+struct FalconMetaServiceSmallResponseStorage {
+    CreateResponse *createResponse;
+    OpenResponse *openResponse;
+    StatResponse *statResponse;
+    UnlinkResponse *unlinkResponse;
+    OpenDirResponse *openDirResponse;
+};
+
 /**
  * Falcon 元数据服务序列化工具类
  *
@@ -56,7 +64,8 @@ public:
         const void* data,
         size_t size,
         FalconMetaServiceResponse* response,
-        FalconMetaOperationType operation);
+        FalconMetaOperationType operation,
+        FalconMetaServiceSmallResponseStorage *smallResponseStorage = nullptr);
 };
 
 } // namespace meta_service

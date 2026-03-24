@@ -27,23 +27,8 @@ static void CleanupResponseData(FalconMetaServiceResponse &response)
         case DFC_PLAIN_COMMAND:
             delete static_cast<PlainCommandResponse *>(response.data);
             break;
-        case DFC_CREATE:
-            delete static_cast<CreateResponse *>(response.data);
-            break;
-        case DFC_OPEN:
-            delete static_cast<OpenResponse *>(response.data);
-            break;
-        case DFC_STAT:
-            delete static_cast<StatResponse *>(response.data);
-            break;
-        case DFC_UNLINK:
-            delete static_cast<UnlinkResponse *>(response.data);
-            break;
         case DFC_READDIR:
             delete static_cast<ReadDirResponse *>(response.data);
-            break;
-        case DFC_OPENDIR:
-            delete static_cast<OpenDirResponse *>(response.data);
             break;
         case DFC_RENAME_SUB_RENAME_LOCALLY:
             delete static_cast<RenameSubRenameLocallyResponse *>(response.data);
@@ -58,6 +43,18 @@ static void CleanupResponseData(FalconMetaServiceResponse &response)
             break;
     }
     response.data = nullptr;
+}
+
+FalconMetaServiceSmallResponseStorage FalconMetaServiceJob::GetSmallResponseStorage()
+{
+    FalconMetaServiceSmallResponseStorage storage = {
+        &m_createResponseStorage,
+        &m_openResponseStorage,
+        &m_statResponseStorage,
+        &m_unlinkResponseStorage,
+        &m_openDirResponseStorage
+    };
+    return storage;
 }
 
 static FalconMetaServiceType ConvertOperationToServiceType(FalconMetaOperationType op)
@@ -227,7 +224,12 @@ void FalconMetaServiceJob::ProcessResponse(void *data, size_t size, FalDataDelet
         return;
     }
 
-    if (!FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(data, size, &m_response, m_request.operation)) {
+    FalconMetaServiceSmallResponseStorage storage = GetSmallResponseStorage();
+    if (!FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(data,
+                                                                            size,
+                                                                            &m_response,
+                                                                            m_request.operation,
+                                                                            &storage)) {
         fprintf(stderr,
                 "[WARNING] [FalconMetaService] Failed to deserialize response for opcode=%d\n",
                 static_cast<int>(m_request.operation));

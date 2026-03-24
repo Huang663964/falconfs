@@ -873,6 +873,8 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
     while ((entry = hash_seq_search(&status)) != 0) {
         StringInfo inodeShardName = GetInodeShardName(entry->shardId);
         StringInfo inodeIndexShardName = GetInodeIndexShardName(entry->shardId);
+        Relation workerInodeRel = table_open(GetRelationOidByName_FALCON(inodeShardName->data), AccessShareLock);
+        Oid workerInodeIndexOid = GetRelationOidByName_FALCON(inodeIndexShardName->data);
 
         for (int i = 0; i < list_length(entry->info); ++i) {
             MetaProcessInfo info = list_nth(entry->info, i);
@@ -883,9 +885,9 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
             STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
 
             bool fileExist = SearchAndUpdateInodeTableInfo(inodeShardName->data,
-                                                           NULL,
+                                                           workerInodeRel,
                                                            inodeIndexShardName->data,
-                                                           InvalidOid,
+                                                           workerInodeIndexOid,
                                                            info->parentId_partId,
                                                            info->name,
                                                            false,
@@ -923,6 +925,8 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
 
             STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
         }
+
+        table_close(workerInodeRel, AccessShareLock);
     }
 }
 
