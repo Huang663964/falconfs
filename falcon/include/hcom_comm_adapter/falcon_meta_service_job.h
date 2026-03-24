@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "base_comm_adapter/base_meta_service_job.h"
+#include "hcom_comm_adapter/falcon_meta_service_internal.h"
 #include "hcom_comm_adapter/falcon_meta_service_interface.h"
 #include "remote_connection_utils/error_code_def.h"
 
@@ -36,12 +37,19 @@ class FalconMetaServiceJob : public BaseMetaServiceJob {
     FalconMetaServiceResponse &GetResponse() { return m_response; }
 
   private:
+    FalconMetaServiceSmallResponseStorage GetSmallResponseStorage();
+
     FalconMetaServiceRequest m_request;
     FalconMetaServiceResponse m_response;
     FalconMetaServiceCallback m_callback;
     void *m_user_context;
     std::chrono::steady_clock::time_point m_start_time;
     std::vector<char> m_request_buffer;
+    CreateResponse m_createResponseStorage;
+    OpenResponse m_openResponseStorage;
+    StatResponse m_statResponseStorage;
+    UnlinkResponse m_unlinkResponseStorage;
+    OpenDirResponse m_openDirResponseStorage;
 };
 
 } // namespace meta_service
