@@ -46,6 +46,15 @@ bool FalconPerfEnabled = true;
     "pqResult",      /* PQgetResult returned */ \
     "resultProc"     /* response processed, job done */
 
+#define SMALL_RESP_TAIL \
+    "respPrep",      /* builder cleared / per-item encode preparation done */ \
+    "respBuild",     /* response object built */ \
+    "respFinish",    /* MetaResponse finished in FlatBuffer */ \
+    "respCopy",      /* encoded response copied into SerializedData */ \
+    "shmemAlloc",    /* response shmem allocated */ \
+    "pqResult",      /* PQgetResult returned */ \
+    "resultProc"     /* response processed, job done */
+
 const char *g_checkpointNames[NOT_SUPPORTED][STAT_MAX_CHECKPOINTS] = {
     /* PLAIN_COMMAND (0) - not instrumented */
     {NULL},
@@ -75,19 +84,19 @@ const char *g_checkpointNames[NOT_SUPPORTED][STAT_MAX_CHECKPOINTS] = {
      "dirTableClose", "subTxnBegin", "indexReady",
      "beforeInsert", "insertDone",
      "batchDone", "shardClose",
-     COMMON_TAIL, NULL},
+     SMALL_RESP_TAIL, NULL},
 
     /* STAT (5) */
     {COMMON_PREFIX,
      "handlerEntry", "pathVerify", "batchSetup", "pathParse",
      "tableClose", "shardOpen", "fetchDone",
-     COMMON_TAIL, NULL},
+     SMALL_RESP_TAIL, NULL},
 
     /* OPEN (6) */
     {COMMON_PREFIX,
      "handlerEntry", "pathVerify", "batchSetup", "pathParse",
      "tableClose", "shardOpen", "fetchDone",
-     COMMON_TAIL, NULL},
+     SMALL_RESP_TAIL, NULL},
 
     /* CLOSE (7) */
     {COMMON_PREFIX,
@@ -99,7 +108,7 @@ const char *g_checkpointNames[NOT_SUPPORTED][STAT_MAX_CHECKPOINTS] = {
     {COMMON_PREFIX,
      "handlerEntry", "pathVerify", "batchSetup", "pathParse",
      "tableClose", "shardOpen", "unlinkModify",
-     COMMON_TAIL, NULL},
+     SMALL_RESP_TAIL, NULL},
 
     /* READDIR (9) */
     {COMMON_PREFIX,
@@ -109,7 +118,7 @@ const char *g_checkpointNames[NOT_SUPPORTED][STAT_MAX_CHECKPOINTS] = {
     /* OPENDIR (10) */
     {COMMON_PREFIX,
      "handlerEntry", "pathVerify", "tableOpen", "pathParse",
-     COMMON_TAIL, NULL},
+     SMALL_RESP_TAIL, NULL},
 
     /* RMDIR (11) */
     {COMMON_PREFIX,

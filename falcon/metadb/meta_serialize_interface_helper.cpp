@@ -4,6 +4,7 @@
 
 extern "C" {
 #include "metadb/meta_serialize_interface_helper.h"
+#include "perf_counter/falcon_per_request_stat.h"
 }
 
 #include "falcon_meta_param_generated.h"
@@ -53,6 +54,12 @@ static inline sd_size_t EstimateMetaResponseSegmentReserve(FalconMetaServiceType
     default:
         return 0;
     }
+}
+
+static inline void StatCheckpointCurrent(int32_t statArrayIndex)
+{
+    if (statArrayIndex >= 0 && g_FalconPerRequestStatShmem != NULL)
+        StatCheckpoint(statArrayIndex, g_FalconPerRequestStatShmem->statArray[statArrayIndex].checkpointCount);
 }
 
 FalconSupportMetaService MetaServiceTypeDecode(int32_t type){
@@ -627,6 +634,7 @@ static bool SerializedDataSmallMetaResponseEncode(FalconMetaServiceType metaServ
     for (int i = 0; i < count; ++i) {
         builder.Clear();
         MetaProcessInfo info = infoArray + i;
+        StatCheckpointCurrent(info->statArrayIndex);
         flatbuffers::Offset<falcon::meta_fbs::MetaResponse> metaResponse;
         if (info->errorCode != SUCCESS && info->errorCode != FILE_EXISTS) {
             metaResponse = falcon::meta_fbs::CreateMetaResponse(builder, info->errorCode);
@@ -719,9 +727,12 @@ static bool SerializedDataSmallMetaResponseEncode(FalconMetaServiceType metaServ
             }
         }
 
+        StatCheckpointCurrent(info->statArrayIndex);
         builder.Finish(metaResponse);
+        StatCheckpointCurrent(info->statArrayIndex);
         if (!AppendFinishedMetaResponse(builder, response))
             return false;
+        StatCheckpointCurrent(info->statArrayIndex);
     }
     return true;
 }

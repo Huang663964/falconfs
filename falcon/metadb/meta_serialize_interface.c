@@ -113,11 +113,6 @@ static SerializedData FileMetaProcess(FalconSupportMetaService metaService, int 
     SerializedDataInit(&response, NULL, 0, 0, &PgMemoryManager);
     if (!SerializedDataMetaResponseEncodeWithPerProcessFlatBufferBuilder(metaService, count, infoDataArray, &response))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "failed when serializing response.");
-    for (int i = 0; i < count && i < g_currentStatIndicesCount; i++) {
-        int32_t si = g_currentStatIndices[i];
-        if (si >= 0 && g_FalconPerRequestStatShmem != NULL)
-            StatCheckpoint(si, g_FalconPerRequestStatShmem->statArray[si].checkpointCount);
-    }
 
     return response;
 }
@@ -156,9 +151,6 @@ static SerializedData KVMetaProcess(FalconSupportMetaService metaService, char *
     SerializedDataInit(&response, NULL, 0, 0, &PgMemoryManager);
     if (!SerializedKvMetaResponseEncodeWithPerProcessFlatBufferBuilder(metaService, &infoData, &response))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "failed when serializing response.");
-    if (infoData.statArrayIndex >= 0 && g_FalconPerRequestStatShmem != NULL)
-        StatCheckpoint(infoData.statArrayIndex,
-                       g_FalconPerRequestStatShmem->statArray[infoData.statArrayIndex].checkpointCount);
 
     return response;
 }
@@ -203,11 +195,6 @@ static SerializedData SliceMetaProcess(FalconSupportMetaService metaService, int
     SerializedDataInit(&response, NULL, 0, 0, &PgMemoryManager);
     if (!SerializedSliceResponseEncodeWithPerProcessFlatBufferBuilder(metaService, count, infoDataArray, &response))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "failed when serializing response.");
-    for (int i = 0; i < count && i < g_currentStatIndicesCount; i++) {
-        int32_t si = g_currentStatIndices[i];
-        if (si >= 0 && g_FalconPerRequestStatShmem != NULL)
-            StatCheckpoint(si, g_FalconPerRequestStatShmem->statArray[si].checkpointCount);
-    }
 
     return response;
 }
@@ -234,9 +221,6 @@ static SerializedData SliceIdProcess(char *paramBuffer)
     SerializedDataInit(&response, NULL, 0, 0, &PgMemoryManager);
     if (!SerializedSliceIdResponseEncodeWithPerProcessFlatBufferBuilder(&infoData, &response))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "failed when serializing response.");
-    if (infoData.statArrayIndex >= 0 && g_FalconPerRequestStatShmem != NULL)
-        StatCheckpoint(infoData.statArrayIndex,
-                       g_FalconPerRequestStatShmem->statArray[infoData.statArrayIndex].checkpointCount);
 
     return response;
 }
