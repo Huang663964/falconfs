@@ -43,6 +43,7 @@ bool SerializedDataInit(SerializedData *data,
                         MemoryManager *memoryManager);
 void SerializedDataDestroy(SerializedData *data);
 void SerializedDataClear(SerializedData *data);
+bool SerializedDataReserve(SerializedData *data, sd_size_t size);
 
 char *SerializedDataApplyForSegment(SerializedData *data, sd_size_t size);
 bool SerializedDataAppend(SerializedData *dest, const SerializedData *src);
@@ -120,6 +121,11 @@ void SerializedDataDestroy(SerializedData *data)
 }
 
 void SerializedDataClear(SerializedData *data) { data->size = 0; }
+
+bool SerializedDataReserve(SerializedData *data, sd_size_t size)
+{
+    return SerializedDataEnlarge(data, size);
+}
 
 char *SerializedDataApplyForSegment(SerializedData *data, sd_size_t size)
 {
