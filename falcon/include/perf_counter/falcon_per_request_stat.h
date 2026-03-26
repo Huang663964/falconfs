@@ -78,6 +78,20 @@ typedef struct FalconPerRequestStatShmem
 #define CKPT_HANDLER_START  9
 
 /*
+ * Split response tail offsets for small meta responses. These checkpoints use
+ * fixed indices so batched encoding keeps per-item encode cost and batch-level
+ * tail stages separately interpretable.
+ */
+#define CKPT_SMALL_RESP_WAIT_OFFSET         0
+#define CKPT_SMALL_RESP_BUILD_OFFSET        1
+#define CKPT_SMALL_RESP_FINISH_OFFSET       2
+#define CKPT_SMALL_RESP_COPY_OFFSET         3
+#define CKPT_SMALL_RESP_ENCODE_DONE_OFFSET  4
+#define CKPT_SMALL_RESP_SHMEM_ALLOC_OFFSET  5
+#define CKPT_SMALL_RESP_PQ_RESULT_OFFSET    6
+#define CKPT_SMALL_RESP_RESULT_PROC_OFFSET  7
+
+/*
  * Common PG tail checkpoints.
  * These are written AFTER the handler returns, using the handler's final
  * checkpoint index + 1, + 2.  The actual positions vary per opcode.
@@ -145,6 +159,44 @@ static inline void atomic_max_i64(volatile int64_t *target, int64_t value)
                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED))
             break;
     }
+}
+
+static inline bool FalconPerfUseSplitRespTail(int32_t opcode)
+{
+    switch ((FalconMetaServiceType)opcode) {
+    case CREATE:
+    case STAT:
+    case OPEN:
+    case UNLINK:
+    case OPENDIR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static inline int FalconPerfSplitRespTailBase(int32_t opcode)
+{
+    switch ((FalconMetaServiceType)opcode) {
+    case CREATE:
+        return CKPT_HANDLER_START + 11;
+    case STAT:
+    case OPEN:
+    case UNLINK:
+        return CKPT_HANDLER_START + 7;
+    case OPENDIR:
+        return CKPT_HANDLER_START + 4;
+    default:
+        return -1;
+    }
+}
+
+static inline int FalconPerfSplitRespCheckpoint(int32_t opcode, int offset)
+{
+    int base = FalconPerfSplitRespTailBase(opcode);
+    if (base < 0)
+        return -1;
+    return base + offset;
 }
 
 /*

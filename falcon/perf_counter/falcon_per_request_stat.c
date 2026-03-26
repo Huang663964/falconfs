@@ -47,10 +47,11 @@ bool FalconPerfEnabled = true;
     "resultProc"     /* response processed, job done */
 
 #define SMALL_RESP_TAIL \
-    "respPrep",      /* builder cleared / per-item encode preparation done */ \
+    "respWait",      /* waiting to start this item's response encode */ \
     "respBuild",     /* response object built */ \
     "respFinish",    /* MetaResponse finished in FlatBuffer */ \
     "respCopy",      /* encoded response copied into SerializedData */ \
+    "respEncodeDone",/* entire batch response encoding done */ \
     "shmemAlloc",    /* response shmem allocated */ \
     "pqResult",      /* PQgetResult returned */ \
     "resultProc"     /* response processed, job done */

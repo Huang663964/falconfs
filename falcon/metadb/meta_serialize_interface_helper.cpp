@@ -56,10 +56,39 @@ static inline sd_size_t EstimateMetaResponseSegmentReserve(FalconMetaServiceType
     }
 }
 
-static inline void StatCheckpointCurrent(int32_t statArrayIndex)
+static inline void StatCheckpointAt(int32_t statArrayIndex, int checkpointIdx)
 {
-    if (statArrayIndex >= 0 && g_FalconPerRequestStatShmem != NULL)
-        StatCheckpoint(statArrayIndex, g_FalconPerRequestStatShmem->statArray[statArrayIndex].checkpointCount);
+    if (statArrayIndex >= 0 && checkpointIdx >= 0 && g_FalconPerRequestStatShmem != NULL)
+        StatCheckpoint(statArrayIndex, checkpointIdx);
+}
+
+static inline void StatCheckpointSplitResp(FalconMetaServiceType metaService, int32_t statArrayIndex, int offset)
+{
+    StatCheckpointAt(statArrayIndex, FalconPerfSplitRespCheckpoint(static_cast<int32_t>(metaService), offset));
+}
+
+static inline void StatCheckpointSplitRespBatch(FalconMetaServiceType metaService,
+                                                int count,
+                                                MetaProcessInfoData *infoArray,
+                                                int offset)
+{
+    int checkpointIdx = FalconPerfSplitRespCheckpoint(static_cast<int32_t>(metaService), offset);
+    if (checkpointIdx < 0 || g_FalconPerRequestStatShmem == NULL)
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    for (int i = 0; i < count; ++i) {
+        int32_t statArrayIndex = infoArray[i].statArrayIndex;
+        if (statArrayIndex < 0 || statArrayIndex >= STAT_ARRAY_SIZE)
+            continue;
+        RequestStat *rs = &g_FalconPerRequestStatShmem->statArray[statArrayIndex];
+        rs->timestamps[checkpointIdx] = now;
+        if (checkpointIdx >= rs->checkpointCount)
+            rs->checkpointCount = checkpointIdx + 1;
+    }
 }
 
 FalconSupportMetaService MetaServiceTypeDecode(int32_t type){
@@ -634,7 +663,7 @@ static bool SerializedDataSmallMetaResponseEncode(FalconMetaServiceType metaServ
     for (int i = 0; i < count; ++i) {
         builder.Clear();
         MetaProcessInfo info = infoArray + i;
-        StatCheckpointCurrent(info->statArrayIndex);
+        StatCheckpointSplitResp(metaService, info->statArrayIndex, CKPT_SMALL_RESP_WAIT_OFFSET);
         flatbuffers::Offset<falcon::meta_fbs::MetaResponse> metaResponse;
         if (info->errorCode != SUCCESS && info->errorCode != FILE_EXISTS) {
             metaResponse = falcon::meta_fbs::CreateMetaResponse(builder, info->errorCode);
@@ -727,13 +756,15 @@ static bool SerializedDataSmallMetaResponseEncode(FalconMetaServiceType metaServ
             }
         }
 
-        StatCheckpointCurrent(info->statArrayIndex);
+        StatCheckpointSplitResp(metaService, info->statArrayIndex, CKPT_SMALL_RESP_BUILD_OFFSET);
         builder.Finish(metaResponse);
-        StatCheckpointCurrent(info->statArrayIndex);
+        StatCheckpointSplitResp(metaService, info->statArrayIndex, CKPT_SMALL_RESP_FINISH_OFFSET);
         if (!AppendFinishedMetaResponse(builder, response))
             return false;
-        StatCheckpointCurrent(info->statArrayIndex);
+        StatCheckpointSplitResp(metaService, info->statArrayIndex, CKPT_SMALL_RESP_COPY_OFFSET);
     }
+
+    StatCheckpointSplitRespBatch(metaService, count, infoArray, CKPT_SMALL_RESP_ENCODE_DONE_OFFSET);
     return true;
 }
 
