@@ -82,14 +82,16 @@ typedef struct FalconPerRequestStatShmem
  * fixed indices so batched encoding keeps per-item encode cost and batch-level
  * tail stages separately interpretable.
  */
-#define CKPT_SMALL_RESP_WAIT_OFFSET         0
-#define CKPT_SMALL_RESP_BUILD_OFFSET        1
-#define CKPT_SMALL_RESP_FINISH_OFFSET       2
-#define CKPT_SMALL_RESP_COPY_OFFSET         3
-#define CKPT_SMALL_RESP_ENCODE_DONE_OFFSET  4
-#define CKPT_SMALL_RESP_SHMEM_ALLOC_OFFSET  5
-#define CKPT_SMALL_RESP_PQ_RESULT_OFFSET    6
-#define CKPT_SMALL_RESP_RESULT_PROC_OFFSET  7
+#define CKPT_SMALL_RESP_ENCODE_READY_OFFSET 0
+#define CKPT_SMALL_RESP_LOOP_ENTER_OFFSET   1
+#define CKPT_SMALL_RESP_WAIT_OFFSET         2
+#define CKPT_SMALL_RESP_BUILD_OFFSET        3
+#define CKPT_SMALL_RESP_FINISH_OFFSET       4
+#define CKPT_SMALL_RESP_COPY_OFFSET         5
+#define CKPT_SMALL_RESP_ENCODE_DONE_OFFSET  6
+#define CKPT_SMALL_RESP_SHMEM_ALLOC_OFFSET  7
+#define CKPT_SMALL_RESP_PQ_RESULT_OFFSET    8
+#define CKPT_SMALL_RESP_RESULT_PROC_OFFSET  9
 
 /*
  * Common PG tail checkpoints.

@@ -660,9 +660,11 @@ static bool SerializedDataSmallMetaResponseEncode(FalconMetaServiceType metaServ
             return false;
     }
 
+    StatCheckpointSplitRespBatch(metaService, count, infoArray, CKPT_SMALL_RESP_ENCODE_READY_OFFSET);
     for (int i = 0; i < count; ++i) {
-        builder.Clear();
         MetaProcessInfo info = infoArray + i;
+        StatCheckpointSplitResp(metaService, info->statArrayIndex, CKPT_SMALL_RESP_LOOP_ENTER_OFFSET);
+        builder.Clear();
         StatCheckpointSplitResp(metaService, info->statArrayIndex, CKPT_SMALL_RESP_WAIT_OFFSET);
         flatbuffers::Offset<falcon::meta_fbs::MetaResponse> metaResponse;
         if (info->errorCode != SUCCESS && info->errorCode != FILE_EXISTS) {
