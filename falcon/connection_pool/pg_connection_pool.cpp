@@ -3,6 +3,7 @@
  */
 
 #include "connection_pool/pg_connection_pool.h"
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <iostream>
@@ -86,6 +87,21 @@ class PGConnectionPool {
     void Destroy();
 };
 
+namespace {
+int GetBatchDequeueLimit(int queueIndex, int queueSizeApprox)
+{
+    int batchLimit = FalconConnectionPoolBatchSize;
+
+    // Small metadata ops are cheap individually but accumulate noticeable
+    // per-request tail latency when too many are encoded serially in one batch.
+    if (queueIndex == (int)FalconBatchServiceType::STAT || queueIndex == (int)FalconBatchServiceType::OPEN) {
+        batchLimit = std::min(batchLimit, 64);
+    }
+
+    return std::min(queueSizeApprox, batchLimit);
+}
+}
+
 void PGConnectionPool::BackgroundPoolManager()
 {
     int waitTime = 100; // microseconds
@@ -104,7 +120,7 @@ void PGConnectionPool::BackgroundPoolManager()
                     continue;
                 }
                 maxCount = std::max(maxCount, queueSizeApprox);
-                int toDequeue = std::min(queueSizeApprox, FalconConnectionPoolBatchSize);
+                int toDequeue = GetBatchDequeueLimit(i, queueSizeApprox);
                 if (i < (int)FalconBatchServiceType::NOT_SUPPORT) {
                     BatchDequeueExec(toDequeue, i);
                 } else {

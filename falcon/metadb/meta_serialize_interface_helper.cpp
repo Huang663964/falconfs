@@ -7,6 +7,7 @@ extern "C" {
 #include "perf_counter/falcon_per_request_stat.h"
 }
 
+#include <algorithm>
 #include "falcon_meta_param_generated.h"
 #include "falcon_meta_response_generated.h"
 
@@ -65,6 +66,32 @@ static inline void StatCheckpointAt(int32_t statArrayIndex, int checkpointIdx)
 static inline void StatCheckpointSplitResp(FalconMetaServiceType metaService, int32_t statArrayIndex, int offset)
 {
     StatCheckpointAt(statArrayIndex, FalconPerfSplitRespCheckpoint(static_cast<int32_t>(metaService), offset));
+}
+
+static inline void StatCheckpointSplitRespPair(FalconMetaServiceType metaService,
+                                               int32_t statArrayIndex,
+                                               int firstOffset,
+                                               int secondOffset)
+{
+    if (statArrayIndex < 0 || statArrayIndex >= STAT_ARRAY_SIZE || g_FalconPerRequestStatShmem == NULL)
+        return;
+
+    int firstCheckpointIdx = FalconPerfSplitRespCheckpoint(static_cast<int32_t>(metaService), firstOffset);
+    int secondCheckpointIdx = FalconPerfSplitRespCheckpoint(static_cast<int32_t>(metaService), secondOffset);
+    if (firstCheckpointIdx < 0 || secondCheckpointIdx < 0)
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    RequestStat *rs = &g_FalconPerRequestStatShmem->statArray[statArrayIndex];
+    rs->timestamps[firstCheckpointIdx] = now;
+    rs->timestamps[secondCheckpointIdx] = now;
+
+    int maxCheckpointIdx = std::max(firstCheckpointIdx, secondCheckpointIdx);
+    if (maxCheckpointIdx >= rs->checkpointCount)
+        rs->checkpointCount = maxCheckpointIdx + 1;
 }
 
 static inline void StatCheckpointSplitRespBatch(FalconMetaServiceType metaService,
@@ -663,9 +690,14 @@ static bool SerializedDataSmallMetaResponseEncode(FalconMetaServiceType metaServ
     StatCheckpointSplitRespBatch(metaService, count, infoArray, CKPT_SMALL_RESP_ENCODE_READY_OFFSET);
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray + i;
-        StatCheckpointSplitResp(metaService, info->statArrayIndex, CKPT_SMALL_RESP_LOOP_ENTER_OFFSET);
         builder.Clear();
-        StatCheckpointSplitResp(metaService, info->statArrayIndex, CKPT_SMALL_RESP_WAIT_OFFSET);
+        // For small responses, entering the encode loop and starting the actual
+        // object build are effectively the same boundary. Record both logical
+        // checkpoints with a single timestamp to avoid extra clock_gettime cost.
+        StatCheckpointSplitRespPair(metaService,
+                                    info->statArrayIndex,
+                                    CKPT_SMALL_RESP_LOOP_ENTER_OFFSET,
+                                    CKPT_SMALL_RESP_WAIT_OFFSET);
         flatbuffers::Offset<falcon::meta_fbs::MetaResponse> metaResponse;
         if (info->errorCode != SUCCESS && info->errorCode != FILE_EXISTS) {
             metaResponse = falcon::meta_fbs::CreateMetaResponse(builder, info->errorCode);
