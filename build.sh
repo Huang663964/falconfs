@@ -10,6 +10,7 @@ WITH_RDMA=false
 WITH_PROMETHEUS=false
 WITH_OBS_STORAGE=false
 WITH_ASAN=false
+WITH_COVERAGE=false
 COMM_PLUGIN="brpc"
 
 FALCONFS_INSTALL_DIR="${FALCONFS_INSTALL_DIR:-/usr/local/falconfs}"
@@ -115,11 +116,21 @@ build_falconfs() {
 	gen_proto
 
 	PG_CFLAGS=""
+	PG_LDFLAGS=""
 	if [[ "$BUILD_TYPE" == "Debug" ]]; then
 		CONFIGURE_OPTS+=(--enable-debug)
 		PG_CFLAGS="-ggdb -O0 -g3 -Wall -fno-omit-frame-pointer"
 	else
 		PG_CFLAGS="-O0 -g"
+	fi
+	if [[ "$WITH_COVERAGE" == "true" ]]; then
+		if [[ "$BUILD_TYPE" != "Debug" ]]; then
+			echo "Coverage requires Debug build flags, switching build type to Debug."
+			BUILD_TYPE="Debug"
+			PG_CFLAGS="-ggdb -O0 -g3 -Wall -fno-omit-frame-pointer"
+		fi
+		PG_CFLAGS="$PG_CFLAGS --coverage"
+		PG_LDFLAGS="--coverage"
 	fi
 	echo "Building FalconFS Meta (mode: $BUILD_TYPE)..."
 	cd $FALCONFS_DIR/falcon
@@ -128,7 +139,7 @@ build_falconfs() {
 		ASAN_MAKE_OPT="WITH_ASAN=1"
 	fi
 	make USE_PGXS=1 CFLAGS="-Wno-shadow $PG_CFLAGS" CXXFLAGS="-Wno-shadow $PG_CFLAGS" \
-		FALCONFS_INSTALL_DIR="$FALCONFS_INSTALL_DIR" $ASAN_MAKE_OPT
+		LDFLAGS="$PG_LDFLAGS" FALCONFS_INSTALL_DIR="$FALCONFS_INSTALL_DIR" $ASAN_MAKE_OPT
 
 	echo "Building FalconFS Client (mode: $BUILD_TYPE)..."
 	cmake -B "$BUILD_DIR" -GNinja "$FALCONFS_DIR" \
@@ -144,6 +155,7 @@ build_falconfs() {
 		-DWITH_PROMETHEUS="$WITH_PROMETHEUS" \
 		-DWITH_OBS_STORAGE="$WITH_OBS_STORAGE" \
 		-DENABLE_ASAN="$WITH_ASAN" \
+		-DENABLE_COVERAGE="$WITH_COVERAGE" \
 		-DBUILD_TEST=$BUILD_TEST &&
 		cd "$BUILD_DIR" && ninja
 
@@ -171,6 +183,60 @@ clean_tests() {
 	echo "Cleaning FalconFS tests..."
 	rm -rf "$BUILD_DIR/tests"
 	echo "FalconFS tests clean complete."
+}
+
+clean_coverage() {
+	echo "Cleaning FalconFS coverage artifacts..."
+	rm -rf "$BUILD_DIR/coverage"
+	find "$FALCONFS_DIR/falcon" "$BUILD_DIR" -type f \( -name "*.gcda" -o -name "*.gcno" -o -name "*.info" \) -delete 2>/dev/null || true
+	echo "FalconFS coverage clean complete."
+}
+
+run_unit_tests() {
+	TARGET_DIRS=("$FALCONFS_DIR/build/tests/falcon_store/" "$FALCONFS_DIR/build/tests/falcon_plugin/")
+
+	for TARGET_DIR in "${TARGET_DIRS[@]}"; do
+		if [ -d "$TARGET_DIR" ]; then
+			echo "Running tests in: $TARGET_DIR"
+			find "$TARGET_DIR" -type f -executable -name "*UT" | while read -r executable_file; do
+				echo "Executing: $executable_file"
+				"$executable_file"
+				echo "---------------------------------------------------------------------------------------"
+			done
+		else
+			echo "Test directory not found: $TARGET_DIR"
+		fi
+	done
+
+	TARGET_DIR="$FALCONFS_DIR/build/tests/falcon/"
+	find "$TARGET_DIR" -maxdepth 1 -type f -executable -not -name "*.cmake" -not -path "*/CMakeFiles/*" | while read -r executable_file; do
+		echo "Executing: $executable_file"
+		"$executable_file"
+		echo "---------------------------------------------------------------------------------------"
+	done
+
+	echo "All unit tests passed."
+}
+
+generate_coverage_report() {
+	if ! command -v lcov >/dev/null 2>&1; then
+		echo "Error: lcov is required to generate coverage reports." >&2
+		exit 1
+	fi
+	if ! command -v genhtml >/dev/null 2>&1; then
+		echo "Error: genhtml is required to generate coverage HTML output." >&2
+		exit 1
+	fi
+	if [[ ! -d "$BUILD_DIR" ]]; then
+		echo "Error: build directory not found: $BUILD_DIR" >&2
+		exit 1
+	fi
+
+	cd "$BUILD_DIR"
+	ninja coverage_reset
+	run_unit_tests
+	ninja coverage_report
+	echo "Coverage report generated at: $BUILD_DIR/coverage/html/index.html"
 }
 
 install_falcon_meta() {
@@ -398,6 +464,7 @@ print_help() {
 		echo ""
 		echo "Commands:"
 		echo "  build     Build components"
+		echo "  coverage  Build with coverage and generate LCOV report"
 		echo "  clean     Clean artifacts"
 		echo "  test      Run tests"
 		echo "  install   Install components"
@@ -478,6 +545,9 @@ build)
 			--with-asan)
 				WITH_ASAN=true
 				;;
+			--with-coverage)
+				WITH_COVERAGE=true
+				;;
 			--comm-plugin)
 				if [[ -z "${2:-}" ]]; then
 					echo "Error: --comm-plugin requires a value (brpc|hcom)" >&2
@@ -505,6 +575,7 @@ build)
 				echo "  --with-prometheus    Enable Prometheus metrics"
 				echo "  --with-obs-storage   Enable OBS storage"
 				echo "  --with-asan          Enable AddressSanitizer with dynamic linking for memory debugging"
+				echo "  --with-coverage      Enable gcov/lcov coverage instrumentation"
 				exit 0
 				;;
 			*)
@@ -520,6 +591,65 @@ build)
 		build_falconfs
 		;;
 	esac
+	;;
+coverage)
+	shift
+	BUILD_TYPE="Debug"
+	BUILD_TEST=true
+	WITH_COVERAGE=true
+
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--with-fuse-opt)
+			WITH_FUSE_OPT=true
+			;;
+		--with-zk-init)
+			WITH_ZK_INIT=true
+			;;
+		--with-rdma)
+			WITH_RDMA=true
+			;;
+		--with-prometheus)
+			WITH_PROMETHEUS=true
+			;;
+		--with-obs-storage)
+			WITH_OBS_STORAGE=true
+			;;
+		--comm-plugin)
+			if [[ -z "${2:-}" ]]; then
+				echo "Error: --comm-plugin requires a value (brpc|hcom)" >&2
+				exit 1
+			fi
+			set_comm_plugin "$2"
+			shift
+			;;
+		--comm-plugin=*)
+			set_comm_plugin "${1#*=}"
+			;;
+		--help | -h)
+			echo "Usage: $0 coverage [options]"
+			echo ""
+			echo "Build FalconFS with gcov instrumentation, run unit tests and generate LCOV HTML."
+			echo ""
+			echo "Options:"
+			echo "  --comm-plugin=PLUGIN Communication plugin: brpc (default) or hcom"
+			echo "  --with-fuse-opt      Enable FUSE optimizations"
+			echo "  --with-zk-init       Enable Zookeeper initialization for containerized deployment"
+			echo "  --with-rdma          Enable RDMA support"
+			echo "  --with-prometheus    Enable Prometheus metrics"
+			echo "  --with-obs-storage   Enable OBS storage"
+			exit 0
+			;;
+		*)
+			echo "Unknown option: $1"
+			exit 1
+			;;
+		esac
+		shift
+	done
+
+	build_falconfs
+	generate_coverage_report
 	;;
 clean)
 	case "${2:-}" in
@@ -543,7 +673,18 @@ clean)
 				exit 0
 			fi
 		done
-		clean_tests
+	clean_tests
+		;;
+	coverage)
+		# Check for --help in clean coverage
+		for arg in "${@:3}"; do
+			if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+				echo "Usage: $0 clean coverage"
+				echo "Clean FalconFS coverage artifacts"
+				exit 0
+			fi
+		done
+		clean_coverage
 		;;
 	*)
 		# Main clean command options
@@ -561,29 +702,7 @@ clean)
 	esac
 	;;
 test)
-	TARGET_DIRS=("$FALCONFS_DIR/build/tests/falcon_store/" "$FALCONFS_DIR/build/tests/falcon_plugin/")
-
-	for TARGET_DIR in "${TARGET_DIRS[@]}"; do
-		if [ -d "$TARGET_DIR" ]; then
-			echo "Running tests in: $TARGET_DIR"
-			find "$TARGET_DIR" -type f -executable -name "*UT" | while read -r executable_file; do
-				echo "Executing: $executable_file"
-				"$executable_file"
-				echo "---------------------------------------------------------------------------------------"
-			done
-		else
-			echo "Test directory not found: $TARGET_DIR"
-		fi
-	done
-	TARGET_DIR="$FALCONFS_DIR/build/tests/falcon/"
-	# Find executable files directly in the test directory (not in subdirectories)
-	# Exclude .cmake files and anything in CMakeFiles/
-	find "$TARGET_DIR" -maxdepth 1 -type f -executable -not -name "*.cmake" -not -path "*/CMakeFiles/*" | while read -r executable_file; do
-		echo "Executing: $executable_file"
-		"$executable_file"
-		echo "---------------------------------------------------------------------------------------"
-	done
-	echo "All unit tests passed."
+	run_unit_tests
 	;;
 install)
 	case "${2:-}" in

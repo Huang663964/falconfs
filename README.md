@@ -110,6 +110,43 @@ test
 ./build.sh test
 ```
 
+coverage
+
+Install `lcov` first in the build container or host, then run:
+
+``` bash
+./build.sh coverage
+```
+
+The HTML report will be generated at `build/coverage/html/index.html`.
+
+To clean only coverage artifacts without removing the full build output, run:
+
+``` bash
+./build.sh clean coverage
+```
+
+### Coverage Workflow Recommendation
+
+For local development, use coverage when validating test effectiveness, reviewing changes in core modules, or preparing a change for merge. The recommended workflow is:
+
+``` bash
+./build.sh clean coverage
+./build.sh coverage
+```
+
+After the run completes, review `build/coverage/html/index.html` and check the modules changed by the current branch first. If the report appears inconsistent with the executed tests, clean coverage artifacts and rerun to avoid mixing stale counters with the latest test execution.
+
+For CI integration, keep coverage as a dedicated job separate from the normal build job. A recommended pipeline is:
+
+1. Install the normal build dependencies together with `lcov`.
+2. Run `./build.sh clean coverage`.
+3. Run `./build.sh coverage`.
+4. Archive `build/coverage/html` and `build/coverage/coverage.info` as CI artifacts.
+5. Optionally apply a coverage threshold in a later quality-gate step.
+
+The current coverage configuration excludes system headers, third-party code and test sources, so the generated report focuses on FalconFS implementation code. If new generated sources or external dependencies are added later, update the lcov exclude rules in the top-level CMake configuration to keep the report stable and readable.
+
 clean
 
 ``` bash

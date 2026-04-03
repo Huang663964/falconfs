@@ -53,6 +53,20 @@ if(ENABLE_ASAN)
     message(STATUS "AddressSanitizer enabled with dynamic linking: ${ASAN_FLAGS}")
 endif()
 
+option(ENABLE_COVERAGE "Enable gcov/lcov coverage instrumentation" OFF)
+if(ENABLE_COVERAGE)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "Coverage is only supported with GCC or Clang")
+    endif()
+
+    set(COVERAGE_FLAGS "--coverage -O0 -g")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COVERAGE_FLAGS}")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COVERAGE_FLAGS}")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --coverage")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} --coverage")
+    message(STATUS "Coverage instrumentation enabled: ${COVERAGE_FLAGS}")
+endif()
+
 add_compile_options(
     -Wno-deprecated
     -Wno-deprecated-declarations
@@ -201,4 +215,48 @@ install(TARGETS falcon_client
 if (BUILD_TEST)
     message("Building tests...")
     add_subdirectory(tests)
+endif()
+
+if(ENABLE_COVERAGE AND BUILD_TEST)
+    find_program(LCOV_EXECUTABLE lcov)
+    find_program(GENHTML_EXECUTABLE genhtml)
+
+    if(LCOV_EXECUTABLE AND GENHTML_EXECUTABLE)
+        set(COVERAGE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/coverage")
+
+        add_custom_target(coverage_reset
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${COVERAGE_OUTPUT_DIR}"
+            COMMAND ${LCOV_EXECUTABLE} --directory "${CMAKE_BINARY_DIR}" --zerocounters
+            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+            COMMENT "Resetting coverage counters"
+        )
+
+        add_custom_target(coverage_report
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${COVERAGE_OUTPUT_DIR}"
+            COMMAND ${LCOV_EXECUTABLE}
+                --capture
+                --directory "${CMAKE_BINARY_DIR}"
+                --output-file "${COVERAGE_OUTPUT_DIR}/coverage.raw.info"
+                --rc lcov_branch_coverage=1
+            COMMAND ${LCOV_EXECUTABLE}
+                --remove "${COVERAGE_OUTPUT_DIR}/coverage.raw.info"
+                "/usr/*"
+                "${PROJECT_SOURCE_DIR}/tests/*"
+                "${PROJECT_SOURCE_DIR}/third_party/*"
+                "${CMAKE_BINARY_DIR}/_deps/*"
+                "${CMAKE_BINARY_DIR}/coverage/*"
+                --output-file "${COVERAGE_OUTPUT_DIR}/coverage.info"
+                --rc lcov_branch_coverage=1
+            COMMAND ${GENHTML_EXECUTABLE}
+                "${COVERAGE_OUTPUT_DIR}/coverage.info"
+                --output-directory "${COVERAGE_OUTPUT_DIR}/html"
+                --branch-coverage
+                --legend
+                --title "FalconFS Coverage"
+            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+            COMMENT "Generating LCOV HTML coverage report"
+        )
+    else()
+        message(WARNING "lcov/genhtml not found, coverage targets will be unavailable")
+    endif()
 endif()
