@@ -10,6 +10,7 @@ WITH_RDMA=false
 WITH_PROMETHEUS=false
 WITH_OBS_STORAGE=false
 WITH_ASAN=false
+COVERAGE=false
 COMM_PLUGIN="brpc"
 
 FALCONFS_INSTALL_DIR="${FALCONFS_INSTALL_DIR:-/usr/local/falconfs}"
@@ -115,11 +116,16 @@ build_falconfs() {
 	gen_proto
 
 	PG_CFLAGS=""
+	local cmake_coverage="OFF"
 	if [[ "$BUILD_TYPE" == "Debug" ]]; then
 		CONFIGURE_OPTS+=(--enable-debug)
 		PG_CFLAGS="-ggdb -O0 -g3 -Wall -fno-omit-frame-pointer"
 	else
 		PG_CFLAGS="-O0 -g"
+	fi
+	if [[ "$COVERAGE" == true ]]; then
+		cmake_coverage="ON"
+		PG_CFLAGS="$PG_CFLAGS --coverage"
 	fi
 	echo "Building FalconFS Meta (mode: $BUILD_TYPE)..."
 	cd $FALCONFS_DIR/falcon
@@ -143,6 +149,7 @@ build_falconfs() {
 		-DWITH_RDMA="$WITH_RDMA" \
 		-DWITH_PROMETHEUS="$WITH_PROMETHEUS" \
 		-DWITH_OBS_STORAGE="$WITH_OBS_STORAGE" \
+		-DENABLE_COVERAGE="$cmake_coverage" \
 		-DENABLE_ASAN="$WITH_ASAN" \
 		-DBUILD_TEST=$BUILD_TEST &&
 		cd "$BUILD_DIR" && ninja
@@ -171,6 +178,87 @@ clean_tests() {
 	echo "Cleaning FalconFS tests..."
 	rm -rf "$BUILD_DIR/tests"
 	echo "FalconFS tests clean complete."
+}
+
+clean_coverage_data() {
+	echo "Cleaning coverage artifacts..."
+	find "$BUILD_DIR" "$FALCONFS_DIR/falcon" -type f \( -name "*.gcda" -o -name "*.gcno" -o -name "*.info" \) -delete 2>/dev/null || true
+	rm -rf "$BUILD_DIR/coverage"
+	echo "Coverage artifacts cleaned."
+}
+
+require_coverage_tools() {
+	for tool in lcov genhtml; do
+		if ! command -v "$tool" >/dev/null 2>&1; then
+			echo "Error: required tool '$tool' not found in PATH" >&2
+			exit 1
+		fi
+	done
+}
+
+resolve_gcov_tool() {
+	local compiler_major
+	compiler_major="$(g++ -dumpversion | cut -d. -f1)"
+	if command -v "gcov-$compiler_major" >/dev/null 2>&1; then
+		echo "gcov-$compiler_major"
+	elif command -v gcov >/dev/null 2>&1; then
+		echo "gcov"
+	else
+		echo "Error: gcov tool not found in PATH" >&2
+		exit 1
+	fi
+}
+
+run_unit_tests() {
+	cd "$FALCONFS_DIR"
+
+	TARGET_DIRS=("$FALCONFS_DIR/build/tests/falcon_store/" "$FALCONFS_DIR/build/tests/falcon_plugin/")
+
+	for TARGET_DIR in "${TARGET_DIRS[@]}"; do
+		if [ -d "$TARGET_DIR" ]; then
+			echo "Running tests in: $TARGET_DIR"
+			find "$TARGET_DIR" -type f -executable -name "*UT" | while read -r executable_file; do
+				echo "Executing: $executable_file"
+				"$executable_file"
+				echo "---------------------------------------------------------------------------------------"
+			done
+		else
+			echo "Test directory not found: $TARGET_DIR"
+		fi
+	done
+	TARGET_DIR="$FALCONFS_DIR/build/tests/falcon/"
+	find "$TARGET_DIR" -maxdepth 1 -type f -executable -not -name "*.cmake" -not -path "*/CMakeFiles/*" | while read -r executable_file; do
+		echo "Executing: $executable_file"
+		"$executable_file"
+		echo "---------------------------------------------------------------------------------------"
+	done
+	echo "All unit tests passed."
+}
+
+generate_coverage_report() {
+	require_coverage_tools
+	local gcov_tool
+	gcov_tool="$(resolve_gcov_tool)"
+	local coverage_dir="$BUILD_DIR/coverage"
+	local raw_info="$coverage_dir/raw.info"
+	local filtered_info="$coverage_dir/filtered.info"
+	local html_dir="$coverage_dir/html"
+
+	mkdir -p "$coverage_dir"
+	lcov --capture --directory "$BUILD_DIR" --gcov-tool "$gcov_tool" --ignore-errors mismatch --output-file "$raw_info"
+	lcov --remove "$raw_info" --ignore-errors unused '/usr/*' '*/third_party/*' '*/tests/*' '*/build/*_deps/*' '*/CMakeFiles/*' --output-file "$filtered_info"
+	genhtml "$filtered_info" --output-directory "$html_dir" --title "FalconFS Coverage"
+	echo "Coverage report generated: $html_dir/index.html"
+}
+
+run_coverage() {
+	BUILD_TYPE="Debug"
+	COVERAGE=true
+	clean_coverage_data
+	clean_falconfs
+	build_falconfs
+	run_unit_tests
+	generate_coverage_report
 }
 
 install_falcon_meta() {
@@ -369,11 +457,13 @@ print_help() {
 		echo "Options:"
 		echo "  --debug              Build debug versions"
 		echo "  --release            Build release versions (default)"
+		echo "  --coverage           Build with gcov/lcov instrumentation"
 		echo "  --comm-plugin=PLUGIN Communication plugin: brpc (default) or hcom"
 		echo "  -h, --help           Show this help message"
 		echo ""
 		echo "Examples:"
 		echo "  $0 build --debug                 # Build everything in debug mode"
+		echo "  $0 build --debug --coverage      # Build with coverage instrumentation"
 		echo "  $0 build --comm-plugin=hcom      # Build with hcom communication plugin"
 		;;
 	clean)
@@ -384,6 +474,7 @@ print_help() {
 		echo "Targets:"
 		echo "  falcon   Clean FalconFS build artifacts"
 		echo "  test     Clean test binaries"
+		echo "  coverage Clean coverage artifacts and report"
 		echo ""
 		echo "Options:"
 		echo "  -h, --help  Show this help message"
@@ -400,6 +491,7 @@ print_help() {
 		echo "  build     Build components"
 		echo "  clean     Clean artifacts"
 		echo "  test      Run tests"
+		echo "  coverage  Build, test and generate lcov report"
 		echo "  install   Install components"
 		echo ""
 		echo "Run '$0 <command> --help' for more information on a specific command"
@@ -421,6 +513,10 @@ build)
 			BUILD_TYPE="Release"
 			shift
 			;;
+		--coverage)
+			COVERAGE=true
+			shift
+			;;
 		--help | -h)
 			print_help "build"
 			exit 0
@@ -440,7 +536,7 @@ build)
 		*)
 			# Only break if this isn't the combined build case
 			[[ -z "${2:-}" || "$2" == "pg" || "$2" == "falcon" ]] && break
-			echo "Error: Combined build only supports --debug, --deploy or --comm-plugin" >&2
+			echo "Error: Combined build only supports --debug, --deploy, --coverage or --comm-plugin" >&2
 			exit 1
 			;;
 		esac
@@ -459,6 +555,9 @@ build)
 				;;
 			--relwithdebinfo)
 				BUILD_TYPE="RelWithDebInfo"
+				;;
+			--coverage)
+				COVERAGE=true
 				;;
 			--with-fuse-opt)
 				WITH_FUSE_OPT=true
@@ -498,6 +597,7 @@ build)
 				echo "  --debug              Build in debug mode"
 				echo "  --release            Build in release mode"
 				echo "  --relwithdebinfo     Build with debug symbols"
+				echo "  --coverage           Build with gcov/lcov instrumentation"
 				echo "  --comm-plugin=PLUGIN Communication plugin: brpc (default) or hcom"
 				echo "  --with-fuse-opt      Enable FUSE optimizations"
 				echo "  --with-zk-init       Enable Zookeeper initialization for containerized deployment"
@@ -545,6 +645,9 @@ clean)
 		done
 		clean_tests
 		;;
+	coverage)
+		clean_coverage_data
+		;;
 	*)
 		# Main clean command options
 		while true; do
@@ -561,29 +664,15 @@ clean)
 	esac
 	;;
 test)
-	TARGET_DIRS=("$FALCONFS_DIR/build/tests/falcon_store/" "$FALCONFS_DIR/build/tests/falcon_plugin/")
-
-	for TARGET_DIR in "${TARGET_DIRS[@]}"; do
-		if [ -d "$TARGET_DIR" ]; then
-			echo "Running tests in: $TARGET_DIR"
-			find "$TARGET_DIR" -type f -executable -name "*UT" | while read -r executable_file; do
-				echo "Executing: $executable_file"
-				"$executable_file"
-				echo "---------------------------------------------------------------------------------------"
-			done
-		else
-			echo "Test directory not found: $TARGET_DIR"
-		fi
-	done
-	TARGET_DIR="$FALCONFS_DIR/build/tests/falcon/"
-	# Find executable files directly in the test directory (not in subdirectories)
-	# Exclude .cmake files and anything in CMakeFiles/
-	find "$TARGET_DIR" -maxdepth 1 -type f -executable -not -name "*.cmake" -not -path "*/CMakeFiles/*" | while read -r executable_file; do
-		echo "Executing: $executable_file"
-		"$executable_file"
-		echo "---------------------------------------------------------------------------------------"
-	done
-	echo "All unit tests passed."
+	run_unit_tests
+	;;
+coverage)
+	if [[ "${2:-}" == "--help" || "${2:-}" == "-h" ]]; then
+		echo "Usage: $0 coverage"
+		echo "Build FalconFS with coverage, run unit tests, and generate lcov html report"
+		exit 0
+	fi
+	run_coverage
 	;;
 install)
 	case "${2:-}" in

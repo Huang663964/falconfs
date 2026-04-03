@@ -110,6 +110,23 @@ test
 ./build.sh test
 ```
 
+coverage (lcov)
+
+``` bash
+# install tools in container/host once
+apt-get update && apt-get install -y lcov
+
+# build with gcov instrumentation, run UT, generate html report
+# artifacts are kept by default
+./build.sh coverage
+
+# optional: auto-clean artifacts after report generation
+./build.sh coverage --auto-clean
+
+# open report (when artifacts are kept)
+xdg-open build/coverage/html/index.html
+```
+
 clean
 
 ``` bash

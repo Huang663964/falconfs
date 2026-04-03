@@ -8,16 +8,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_FIND_DEBUG_MODE OFF)
 
 set(CMAKE_CXX_FLAGS "-D_FILE_OFFSET_BITS=64 -DTHREADED -DWITH_FUSE_OPT=${WITH_FUSE_OPT}")
-
-# Set default build type if not specified
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
-endif()
-
-# Set build type specific flags
-set(CMAKE_CXX_FLAGS_DEBUG "-O0 -Wall -g -ggdb -DDEBUG" CACHE STRING "Debug flags" FORCE)
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -Wall -DNDEBUG" CACHE STRING "Release flags" FORCE)
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -Wall -DNDEBUG" CACHE STRING "RelWithDebInfo flags" FORCE)
+set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_CXX_FLAGS_DEBUG "$ENV{CXXFLAGS} -O0 -Wall -g -ggdb")
+set(CMAKE_CXX_FLAGS_RELEASE "$ENV{CXXFLAGS} -O2 -Wall")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "$ENV{CXXFLAGS} -O2 -g -Wall")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--copy-dt-needed-entries")
 set(CMAKE_CONFIGURATION_TYPES "Debug;Release;RelWithDebInfo" CACHE STRING "Build types" FORCE)
 option(WITH_ZK_INIT "Enable Zookeeper initialization for containerized deployment" OFF)
@@ -40,19 +34,6 @@ if(WITH_OBS_STORAGE)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DWITH_OBS_STORAGE")
 endif()
 
-option(ENABLE_ASAN "Enable AddressSanitizer for memory debugging (uses dynamic libasan)" OFF)
-if(ENABLE_ASAN)
-    # Use shared/dynamic libasan instead of static linking
-    # GCC: -fsanitize=address uses dynamic libasan by default
-    # Clang: uses dynamic libasan by default as well
-    set(ASAN_FLAGS "-fsanitize=address -fno-omit-frame-pointer")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${ASAN_FLAGS}")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${ASAN_FLAGS}")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${ASAN_FLAGS}")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${ASAN_FLAGS}")
-    message(STATUS "AddressSanitizer enabled with dynamic linking: ${ASAN_FLAGS}")
-endif()
-
 add_compile_options(
     -Wno-deprecated
     -Wno-deprecated-declarations
@@ -63,6 +44,8 @@ option(BUILD_TEST "Enable test compile" OFF)
 if(BUILD_TEST)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUNIT_TEST")
 endif()
+
+option(ENABLE_COVERAGE "Enable gcov/lcov instrumentation" OFF)
 
 option(FALCON_ENABLE_PLUGINS "Enable plugin support" ON)
 
@@ -112,7 +95,15 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 # Compiler flags with GFlags namespace
 set(GFLAGS_NS "gflags")
 set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -DGFLAGS_NS=${GFLAGS_NS} -faligned-new")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CPP_FLAGS} -D__const__=__unused__ -pipe -W -Wall -Wno-unused-parameter -fPIE -fPIC -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CPP_FLAGS} -O2 -D__const__=__unused__ -pipe -W -Wall -Wno-unused-parameter -fPIE -fPIC -fno-omit-frame-pointer")
+
+if(ENABLE_COVERAGE)
+    message(STATUS "Coverage enabled: compiling with --coverage")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} --coverage -O0 -g")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --coverage -O0 -g")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --coverage")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} --coverage")
+endif()
 
 # Dynamic libraries
 set(DYNAMIC_LIB
