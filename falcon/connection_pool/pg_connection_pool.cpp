@@ -104,7 +104,6 @@ int GetBatchDequeueLimit(int queueIndex, int queueSizeApprox)
 
 void PGConnectionPool::BackgroundPoolManager()
 {
-    int waitTime = 100; // microseconds
     while (working) {
         if (!working)
             break;
@@ -131,9 +130,22 @@ void PGConnectionPool::BackgroundPoolManager()
                 withTasks = false;
             }
         }
-        // determine the amount to batch
-        waitTime = AdjustWaitTime(waitTime, maxCount);
-        std::this_thread::sleep_for(std::chrono::microseconds(waitTime));
+
+        if (maxCount == 0) {
+            std::unique_lock<std::mutex> lk(pendingTaskMutex);
+            cvPendingTaskNotEmpty.wait(lk, [this]() {
+                if (!working) {
+                    return true;
+                }
+
+                for (int i = 0; i <= (int)FalconBatchServiceType::NOT_SUPPORT; ++i) {
+                    if (supportBatchTaskList[i].jobList.size_approx() > 0) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+        }
     }
 }
 
@@ -255,6 +267,7 @@ void PGConnectionPool::DispatchMetaServiceJob(BaseMetaServiceJob *job)
         std::this_thread::yield();
     }
     STAT_CKPT(job->statArrayIndex, CKPT_ENQUEUE);
+    cvPendingTaskNotEmpty.notify_one();
 }
 
 bool PGConnectionPool::Init(const uint16_t port,
@@ -298,6 +311,7 @@ void PGConnectionPool::Destroy()
     }
 
     working = false;
+    cvPendingTaskNotEmpty.notify_all();
     for (auto it = currentManagedConn.begin(); it != currentManagedConn.end(); ++it) {
         (*it)->Stop();
     }
