@@ -113,8 +113,10 @@ test
 coverage (lcov)
 
 ``` bash
-# install tools in container/host once
-apt-get update && apt-get install -y lcov
+# lcov/genhtml are preinstalled in ghcr.io/falcon-infra/falconfs-dev
+# if running on a host, install lcov first:
+#   Ubuntu/Debian: apt-get update && apt-get install -y lcov
+#   openEuler:     dnf install -y lcov
 
 # build with gcov instrumentation, run UT, generate html report
 # artifacts are kept by default
