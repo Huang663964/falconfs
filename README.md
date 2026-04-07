@@ -120,9 +120,6 @@ apt-get update && apt-get install -y lcov
 # artifacts are kept by default
 ./build.sh coverage
 
-# optional: auto-clean artifacts after report generation
-./build.sh coverage --auto-clean
-
 # open report (when artifacts are kept)
 xdg-open build/coverage/html/index.html
 ```
