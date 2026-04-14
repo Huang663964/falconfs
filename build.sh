@@ -11,7 +11,9 @@ WITH_PROMETHEUS=false
 WITH_OBS_STORAGE=false
 WITH_ASAN=false
 COVERAGE=false
+RUN_LOCAL_SERVICE_FOR_COVERAGE=false
 COMM_PLUGIN="brpc"
+SERVICE_COVERAGE_GCOV_PREFIX="${SERVICE_COVERAGE_GCOV_PREFIX:-/tmp/falconfs_service_gcov}"
 
 FALCONFS_INSTALL_DIR="${FALCONFS_INSTALL_DIR:-/usr/local/falconfs}"
 export FALCONFS_INSTALL_DIR=$FALCONFS_INSTALL_DIR
@@ -116,6 +118,7 @@ build_falconfs() {
 	gen_proto
 
 	PG_CFLAGS=""
+	local cmake_coverage_extra_flags=""
 	local cmake_coverage="OFF"
 	if [[ "$BUILD_TYPE" == "Debug" ]]; then
 		CONFIGURE_OPTS+=(--enable-debug)
@@ -125,7 +128,8 @@ build_falconfs() {
 	fi
 	if [[ "$COVERAGE" == true ]]; then
 		cmake_coverage="ON"
-		PG_CFLAGS="$PG_CFLAGS --coverage"
+		PG_CFLAGS="$PG_CFLAGS --coverage -fprofile-update=atomic"
+		cmake_coverage_extra_flags="-fprofile-update=atomic"
 	fi
 	echo "Building FalconFS Meta (mode: $BUILD_TYPE)..."
 	cd $FALCONFS_DIR/falcon
@@ -141,6 +145,8 @@ build_falconfs() {
 		-DCMAKE_INSTALL_PREFIX=$FALCON_CLIENT_INSTALL_DIR \
 		-DCMAKE_EXPORT_COMPILE_COMMANDS=1 \
 		-DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+		-DCMAKE_C_FLAGS="$cmake_coverage_extra_flags" \
+		-DCMAKE_CXX_FLAGS="$cmake_coverage_extra_flags" \
 		-DPOSTGRES_INCLUDE_DIR="$POSTGRES_INCLUDE_DIR" \
 		-DPOSTGRES_LIB_DIR="$POSTGRES_LIB_DIR" \
 		-DPG_PKGLIBDIR="$PG_PKGLIBDIR" \
@@ -184,6 +190,7 @@ clean_coverage_data() {
 	echo "Cleaning coverage artifacts..."
 	find "$BUILD_DIR" "$FALCONFS_DIR/falcon" -type f \( -name "*.gcda" -o -name "*.gcno" -o -name "*.info" \) -delete 2>/dev/null || true
 	rm -rf "$BUILD_DIR/coverage"
+	rm -rf "$SERVICE_COVERAGE_GCOV_PREFIX"
 	echo "Coverage artifacts cleaned."
 }
 
@@ -209,15 +216,18 @@ resolve_gcov_tool() {
 	fi
 }
 
-run_unit_tests() {
+run_non_service_unit_tests() {
 	cd "$FALCONFS_DIR"
 
-	TARGET_DIRS=("$FALCONFS_DIR/build/tests/falcon_store/" "$FALCONFS_DIR/build/tests/falcon_plugin/")
+	TARGET_DIRS=("$FALCONFS_DIR/build/tests/falcon_store/" "$FALCONFS_DIR/build/tests/falcon_plugin/" "$FALCONFS_DIR/build/tests/private-directory-test/")
 
 	for TARGET_DIR in "${TARGET_DIRS[@]}"; do
 		if [ -d "$TARGET_DIR" ]; then
 			echo "Running tests in: $TARGET_DIR"
 			find "$TARGET_DIR" -type f -executable -name "*UT" | while read -r executable_file; do
+				if [[ "$(basename "$executable_file")" == "LocalRunWorkloadUT" ]]; then
+					continue
+				fi
 				echo "Executing: $executable_file"
 				"$executable_file"
 				echo "---------------------------------------------------------------------------------------"
@@ -232,7 +242,88 @@ run_unit_tests() {
 		"$executable_file"
 		echo "---------------------------------------------------------------------------------------"
 	done
+}
+
+run_service_dependent_unit_tests() {
+	local local_run_ut="$FALCONFS_DIR/build/tests/private-directory-test/LocalRunWorkloadUT"
+	local service_server_ip
+	local service_server_port
+	service_server_ip="$(resolve_service_test_server_ip)"
+	service_server_port="$(resolve_service_test_server_port)"
+	if [[ -x "$local_run_ut" ]]; then
+		echo "Running service-dependent tests in: $FALCONFS_DIR/build/tests/private-directory-test/"
+		echo "Service-dependent UT endpoint: ${service_server_ip}:${service_server_port}"
+		echo "Executing: $local_run_ut"
+		SERVER_IP="$service_server_ip" \
+		SERVER_PORT="$service_server_port" \
+		LOCAL_RUN_MOUNT_DIR="${LOCAL_RUN_MOUNT_DIR:-/}" \
+		LOCAL_RUN_FILE_PER_THREAD="${LOCAL_RUN_FILE_PER_THREAD:-1}" \
+		LOCAL_RUN_THREAD_NUM_PER_CLIENT="${LOCAL_RUN_THREAD_NUM_PER_CLIENT:-1}" \
+		LOCAL_RUN_CLIENT_ID="${LOCAL_RUN_CLIENT_ID:-0}" \
+		LOCAL_RUN_MOUNT_PER_CLIENT="${LOCAL_RUN_MOUNT_PER_CLIENT:-1}" \
+		LOCAL_RUN_CLIENT_CACHE_SIZE="${LOCAL_RUN_CLIENT_CACHE_SIZE:-16384}" \
+		LOCAL_RUN_WAIT_PORT="${LOCAL_RUN_WAIT_PORT:-1111}" \
+		LOCAL_RUN_FILE_SIZE="${LOCAL_RUN_FILE_SIZE:-4096}" \
+		LOCAL_RUN_CLIENT_NUM="${LOCAL_RUN_CLIENT_NUM:-1}" \
+		"$local_run_ut"
+		echo "---------------------------------------------------------------------------------------"
+	fi
+}
+
+run_unit_tests() {
+	run_non_service_unit_tests
+	run_service_dependent_unit_tests
 	echo "All unit tests passed."
+}
+
+start_local_service_for_coverage() {
+	echo "Starting local FalconFS service for service-dependent coverage tests..."
+	rm -rf "$SERVICE_COVERAGE_GCOV_PREFIX"
+	mkdir -p "$SERVICE_COVERAGE_GCOV_PREFIX"
+	bash -lc "export GCOV_PREFIX='$SERVICE_COVERAGE_GCOV_PREFIX'; export GCOV_PREFIX_STRIP='0'; source '$FALCONFS_DIR/deploy/falcon_env.sh' && '$FALCONFS_DIR/deploy/falcon_start.sh'"
+}
+
+stop_local_service_for_coverage() {
+	echo "Stopping local FalconFS service..."
+	bash -lc "source '$FALCONFS_DIR/deploy/falcon_env.sh' && '$FALCONFS_DIR/deploy/falcon_stop.sh'"
+}
+
+resolve_service_test_server_ip() {
+	if [[ -n "${LOCAL_RUN_META_SERVER_IP:-}" ]]; then
+		echo "$LOCAL_RUN_META_SERVER_IP"
+		return 0
+	fi
+
+	local meta_config="$FALCONFS_DIR/deploy/meta/falcon_meta_config.sh"
+	if [[ -f "$meta_config" ]]; then
+		local cn_ip=""
+		cn_ip="$(bash -lc "source '$meta_config' >/dev/null 2>&1; printf '%s' \"\${cnIp:-}\"")"
+		if [[ -n "$cn_ip" ]]; then
+			echo "$cn_ip"
+			return 0
+		fi
+	fi
+
+	echo "127.0.0.1"
+}
+
+resolve_service_test_server_port() {
+	if [[ -n "${LOCAL_RUN_META_SERVER_PORT:-}" ]]; then
+		echo "$LOCAL_RUN_META_SERVER_PORT"
+		return 0
+	fi
+
+	local meta_config="$FALCONFS_DIR/deploy/meta/falcon_meta_config.sh"
+	if [[ -f "$meta_config" ]]; then
+		local cn_port_prefix=""
+		cn_port_prefix="$(bash -lc "source '$meta_config' >/dev/null 2>&1; printf '%s' \"\${cnPortPrefix:-}\"")"
+		if [[ -n "$cn_port_prefix" ]]; then
+			echo "${cn_port_prefix}0"
+			return 0
+		fi
+	fi
+
+	echo "55500"
 }
 
 generate_coverage_report() {
@@ -240,13 +331,17 @@ generate_coverage_report() {
 	local gcov_tool
 	gcov_tool="$(resolve_gcov_tool)"
 	local coverage_dir="$BUILD_DIR/coverage"
+	local baseline_info="$coverage_dir/baseline.info"
 	local raw_info="$coverage_dir/raw.info"
+	local merged_info="$coverage_dir/merged.info"
 	local filtered_info="$coverage_dir/filtered.info"
 	local html_dir="$coverage_dir/html"
 
 	mkdir -p "$coverage_dir"
+	lcov --capture --initial --directory "$BUILD_DIR" --gcov-tool "$gcov_tool" --ignore-errors mismatch --output-file "$baseline_info"
 	lcov --capture --directory "$BUILD_DIR" --gcov-tool "$gcov_tool" --ignore-errors mismatch --output-file "$raw_info"
-	lcov --remove "$raw_info" --ignore-errors unused '/usr/*' '*/third_party/*' '*/tests/*' '*/build/*_deps/*' '*/CMakeFiles/*' --output-file "$filtered_info"
+	lcov -a "$baseline_info" -a "$raw_info" --output-file "$merged_info"
+	lcov --remove "$merged_info" --ignore-errors unused '/usr/*' '*/third_party/*' '*/tests/*' '*/build/*_deps/*' '*/CMakeFiles/*' '*/build/generated/*' '*/generated/*' '*.pb.cc' '*.pb.h' '*.pb.c' '*.pb.hpp' '*.pb' '*.fbs.h' '*/brpc_comm_adapter/proto/*' '*/connection_pool/fbs/*' --output-file "$filtered_info"
 	genhtml "$filtered_info" --output-directory "$html_dir" --title "FalconFS Coverage"
 	echo "Coverage report generated: $html_dir/index.html"
 }
@@ -257,7 +352,27 @@ run_coverage() {
 	clean_coverage_data
 	clean_falconfs
 	build_falconfs
-	run_unit_tests
+	local local_service_started=false
+	cleanup_coverage_local_service() {
+		if [[ "$local_service_started" == true ]]; then
+			stop_local_service_for_coverage
+			local_service_started=false
+		fi
+	}
+	trap cleanup_coverage_local_service RETURN
+
+	if [[ "$RUN_LOCAL_SERVICE_FOR_COVERAGE" == true ]]; then
+		start_local_service_for_coverage
+		local_service_started=true
+		run_unit_tests
+	else
+		run_unit_tests
+	fi
+
+	if [[ "$local_service_started" == true ]]; then
+		stop_local_service_for_coverage
+		local_service_started=false
+	fi
 	generate_coverage_report
 }
 
@@ -483,6 +598,23 @@ print_help() {
 		echo "  $0 clean           # Clean everything"
 		echo "  $0 clean falcon    # Clean only FalconFS"
 		;;
+	coverage)
+		echo "Usage: $0 coverage [options]"
+		echo ""
+		echo "Build FalconFS with coverage, run unit tests, and generate lcov html report"
+		echo ""
+		echo "Options:"
+		echo "  --local-run        Start local service and run service-dependent UT cases"
+		echo "  -h, --help         Show this help message"
+		echo ""
+		echo "Examples:"
+		echo "  $0 coverage"
+		echo "  $0 coverage --local-run"
+		echo ""
+		echo "Behavior:"
+		echo "  $0 coverage             # do not start local service"
+		echo "  $0 coverage --local-run # start local service"
+		;;
 	*)
 		# General help information
 		echo "Usage: $0 <command> [subcommand] [options]"
@@ -667,11 +799,23 @@ test)
 	run_unit_tests
 	;;
 coverage)
-	if [[ "${2:-}" == "--help" || "${2:-}" == "-h" ]]; then
-		echo "Usage: $0 coverage"
-		echo "Build FalconFS with coverage, run unit tests, and generate lcov html report"
-		exit 0
-	fi
+	shift
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--help | -h)
+			print_help "coverage"
+			exit 0
+			;;
+		--local-run)
+			RUN_LOCAL_SERVICE_FOR_COVERAGE=true
+			;;
+		*)
+			echo "Unknown option for coverage: $1" >&2
+			exit 1
+			;;
+		esac
+		shift
+	done
 	run_coverage
 	;;
 install)
