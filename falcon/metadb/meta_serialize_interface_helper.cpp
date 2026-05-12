@@ -6,7 +6,6 @@ extern "C" {
 #include "metadb/meta_serialize_interface_helper.h"
 }
 
-#include <algorithm>
 #include "falcon_meta_param_generated.h"
 #include "falcon_meta_response_generated.h"
 

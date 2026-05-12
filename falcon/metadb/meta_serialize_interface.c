@@ -45,10 +45,7 @@ static SerializedData FileMetaProcess(FalconSupportMetaService metaService, int 
     }
     for (int i = 0; i < count && i < g_currentStatIndicesCount; i++) {
         infoArray[i]->statArrayIndex = g_currentStatIndices[i];
-    }
-    if (g_currentStatIndices != NULL) {
-        int statCount = (count < g_currentStatIndicesCount) ? count : g_currentStatIndicesCount;
-        StatCheckpointBroadcast(g_currentStatIndices, statCount, CKPT_PARAM_DECODE);
+        STAT_CKPT(g_currentStatIndices[i], CKPT_PARAM_DECODE);
     }
 
     switch (metaService) {
@@ -193,10 +190,7 @@ static SerializedData SliceMetaProcess(FalconSupportMetaService metaService, int
     }
     for (int i = 0; i < count && i < g_currentStatIndicesCount; i++) {
         infoArray[i]->statArrayIndex = g_currentStatIndices[i];
-    }
-    if (g_currentStatIndices != NULL) {
-        int statCount = (count < g_currentStatIndicesCount) ? count : g_currentStatIndicesCount;
-        StatCheckpointBroadcast(g_currentStatIndices, statCount, CKPT_PARAM_DECODE);
+        STAT_CKPT(g_currentStatIndices[i], CKPT_PARAM_DECODE);
     }
 
     switch (metaService) {
