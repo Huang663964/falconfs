@@ -26,7 +26,7 @@ class PGConnectionPool {
   private:
     std::unordered_set<PGConnection *> currentManagedConn;
 
-    bool working;
+    std::atomic_bool working;
 
     std::queue<PGConnection *> connPool;
     std::mutex connPoolMutex;
