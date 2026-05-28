@@ -9,6 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <algorithm>
+#include <chrono>
 
 #include <sys/statfs.h>
 #include <sys/time.h>
@@ -19,16 +20,47 @@
 std::vector<CacheItem> DiskCache::initCacheVector;
 std::mutex DiskCache::initCacheMutex;
 
+namespace {
+using DiskCacheClock = std::chrono::steady_clock;
+
+uint64_t ElapsedUs(DiskCacheClock::time_point start, DiskCacheClock::time_point end)
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+}
+} // namespace
+
 DiskCache::DiskCache(float ratio) { freeRatio = ratio; }
 
 DiskCache::~DiskCache()
 {
+    SetEvictListener(nullptr);
     stop = true;
     if (cleanupThread.joinable()) {
         cleanupThread.join();
     }
     inodeToCacheIter.clear();
     cacheItems.clear();
+}
+
+void DiskCache::SetEvictListener(DiskCacheEvictListener *listener)
+{
+    std::lock_guard<std::mutex> lock(listenerMutex);
+    evictListener = listener;
+}
+
+void DiskCache::NotifyEvicted(const std::vector<EvictedItem> &evictedItems)
+{
+    DiskCacheEvictListener *listener = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(listenerMutex);
+        listener = evictListener;
+    }
+    if (listener == nullptr) {
+        return;
+    }
+    for (const auto &item : evictedItems) {
+        listener->OnEvicted(item);
+    }
 }
 
 int DiskCache::Start(std::string &path, int dirNum, float ratio, float bgEvitRatio)
@@ -157,9 +189,9 @@ void DiskCache::CheckFreeSpace()
     }
 }
 
-void DiskCache::CleanupForEvict(uint64_t preAllocSize)
+void DiskCache::CleanupForEvict(uint64_t preAllocSize, std::vector<EvictedItem> &evictedItems)
 {
-    // lock
+    auto cleanupStart = DiskCacheClock::now();
     uint64_t toFreeCap = 0;
     uint64_t toFreeInode = 0;
     float freeBlockRatio = blockRatio - (preAllocSize + reservedCap) * 1.0 / totalCap;
@@ -183,16 +215,23 @@ void DiskCache::CleanupForEvict(uint64_t preAllocSize)
 
     uint64_t freedCap = 0;
     uint64_t freedInode = 0;
+    uint64_t failedInode = 0;
+    uint64_t scannedInode = 0;
+    uint64_t removeElapsedUs = 0;
 
     for (auto it = cacheItems.begin(); it != cacheItems.end();) {
         if (it->refs > 0) {
             ++it;
             continue;
         }
+        ++scannedInode;
         uint64_t key = it->inode;
         uint64_t size = it->size;
+        std::string path = it->path;
         std::string fileName = GetFilePath(key);
+        auto removeStart = DiskCacheClock::now();
         int ret = remove(fileName.c_str());
+        removeElapsedUs += ElapsedUs(removeStart, DiskCacheClock::now());
         if (ret == 0) {
             freedCap += size;
             freedInode++;
@@ -200,22 +239,29 @@ void DiskCache::CleanupForEvict(uint64_t preAllocSize)
             inodeToCacheIter.erase(key);
             usedCap -= size;
             freeCap += size;
-            FALCON_LOG(LOG_WARNING) << "Evict file: " << fileName;
+            evictedItems.push_back({key, size, path});
         } else {
+            int err = errno;
+            ++failedInode;
             ++it;
-            FALCON_LOG(LOG_WARNING) << "Evict file: " << fileName << " failed: " << strerror(errno);
+            FALCON_LOG(LOG_WARNING) << "Evict file: " << fileName << " failed: " << strerror(err);
         }
         if (freedCap >= toFreeCap && freedInode >= toFreeInode) {
-            FALCON_LOG(LOG_WARNING) << "DiskCache::CleanupForEvict(): Evicted " << freedInode << " files, all size is "
-                                    << freedCap;
             break;
         }
     }
+
+    FALCON_LOG(LOG_WARNING) << "DiskCache::CleanupForEvict(): Evicted " << freedInode << " files, all size is "
+                            << freedCap << ", failed files = " << failedInode << ", scanned files = "
+                            << scannedInode << ", cleanup elapsed us = "
+                            << ElapsedUs(cleanupStart, DiskCacheClock::now()) << ", remove elapsed us = "
+                            << removeElapsedUs;
 }
 
 void DiskCache::Cleanup()
 {
-    // lock
+    auto cleanupStart = DiskCacheClock::now();
+    std::vector<EvictedItem> evictedItems;
     uint64_t toFreeCap = 0;
     uint64_t toFreeInode = 0;
     float freeRatio = bgFreeRatio;
@@ -239,16 +285,23 @@ void DiskCache::Cleanup()
 
     uint64_t freedCap = 0;
     uint64_t freedInode = 0;
+    uint64_t failedInode = 0;
+    uint64_t scannedInode = 0;
+    uint64_t removeElapsedUs = 0;
 
     for (auto it = cacheItems.begin(); it != cacheItems.end();) {
         if (it->refs > 0) {
             ++it;
             continue;
         }
+        ++scannedInode;
         uint64_t key = it->inode;
         uint64_t size = it->size;
+        std::string path = it->path;
         std::string fileName = GetFilePath(key);
+        auto removeStart = DiskCacheClock::now();
         int ret = remove(fileName.c_str());
+        removeElapsedUs += ElapsedUs(removeStart, DiskCacheClock::now());
         if (ret == 0) {
             freedCap += size;
             freedInode++;
@@ -256,16 +309,27 @@ void DiskCache::Cleanup()
             inodeToCacheIter.erase(key);
             usedCap -= size;
             freeCap += size;
-            FALCON_LOG(LOG_WARNING) << "Evict file: " << fileName;
+            evictedItems.push_back({key, size, path});
         } else {
+            int err = errno;
+            ++failedInode;
             ++it;
-            FALCON_LOG(LOG_WARNING) << "Evict file: " << fileName << " failed: " << strerror(errno);
+            FALCON_LOG(LOG_WARNING) << "Evict file: " << fileName << " failed: " << strerror(err);
         }
         if (freedCap >= toFreeCap && freedInode >= toFreeInode) {
-            FALCON_LOG(LOG_WARNING) << "DiskCache::CleanupForEvict(): Evicted " << freedInode << " files, all size is "
-                                    << freedCap;
             break;
         }
+    }
+
+    FALCON_LOG(LOG_WARNING) << "DiskCache::Cleanup(): Evicted " << freedInode << " files, all size is " << freedCap
+                            << ", failed files = " << failedInode << ", scanned files = " << scannedInode
+                            << ", cleanup elapsed us = " << ElapsedUs(cleanupStart, DiskCacheClock::now())
+                            << ", remove elapsed us = " << removeElapsedUs;
+    auto notifyStart = DiskCacheClock::now();
+    NotifyEvicted(evictedItems);
+    if (!evictedItems.empty()) {
+        FALCON_LOG(LOG_WARNING) << "DiskCache::Cleanup(): NotifyEvicted " << evictedItems.size()
+                                << " items, elapsed us = " << ElapsedUs(notifyStart, DiskCacheClock::now());
     }
 }
 
@@ -356,7 +420,22 @@ void DiskCache::DeleteOldCacheWithNoPin(uint64_t key)
     }
 }
 
-void DiskCache::InsertAndUpdate(uint64_t key, uint64_t size, bool needPin)
+bool DiskCache::UpdatePath(uint64_t key, const std::string &path)
+{
+    if (stop) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    auto iter = inodeToCacheIter.find(key);
+    if (iter == inodeToCacheIter.end()) {
+        return false;
+    }
+    iter->second->path = path;
+    iter->second->atime = static_cast<uint64_t>(time(nullptr));
+    return true;
+}
+
+void DiskCache::InsertAndUpdate(uint64_t key, uint64_t size, bool needPin, const std::string &path)
 {
     if (stop) {
         return;
@@ -368,6 +447,9 @@ void DiskCache::InsertAndUpdate(uint64_t key, uint64_t size, bool needPin)
         freeCap -= static_cast<int64_t>(size - inodeToCacheIter[key]->size);
         inodeToCacheIter[key]->atime = static_cast<uint64_t>(time(nullptr));
         inodeToCacheIter[key]->size = size;
+        if (!path.empty()) {
+            inodeToCacheIter[key]->path = path;
+        }
         //
     } else {
         // insert
@@ -375,6 +457,7 @@ void DiskCache::InsertAndUpdate(uint64_t key, uint64_t size, bool needPin)
         elem.atime = static_cast<uint64_t>(time(nullptr));
         elem.size = size;
         elem.inode = key;
+        elem.path = path;
         cacheItems.emplace_back(elem);
         inodeToCacheIter[key] = prev(cacheItems.end());
         usedCap += size;
@@ -431,9 +514,18 @@ bool DiskCache::Add(uint64_t key, uint64_t size)
 
 void DiskCache::Evict(uint64_t size)
 {
-    std::lock_guard<std::mutex> lock(mutex);
-    GetCurFreeRatio();
-    CleanupForEvict(size);
+    std::vector<EvictedItem> evictedItems;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        GetCurFreeRatio();
+        CleanupForEvict(size, evictedItems);
+    }
+    auto notifyStart = DiskCacheClock::now();
+    NotifyEvicted(evictedItems);
+    if (!evictedItems.empty()) {
+        FALCON_LOG(LOG_WARNING) << "DiskCache::Evict(): NotifyEvicted " << evictedItems.size()
+                                << " items, elapsed us = " << ElapsedUs(notifyStart, DiskCacheClock::now());
+    }
 }
 
 bool DiskCache::PreAllocSpace(uint64_t size)

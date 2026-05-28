@@ -602,7 +602,7 @@ int FalconStore::OpenFile(OpenInstance *openInstance)
                     openInstance->physicalFd = static_cast<uint64_t>(localFd);
                     /* here insert the new file to disk cache and pin, visible to other user */
                     if (openInstance->originalSize == 0 || (openInstance->oflags & O_CREAT) != 0) {
-                        DiskCache::GetInstance().InsertAndUpdate(openInstance->inodeId, 0, true);
+                        DiskCache::GetInstance().InsertAndUpdate(openInstance->inodeId, 0, true, openInstance->path);
                     }
                     FALCON_LOG(LOG_INFO) << "OpenFile(): create local cache file " << fileName
                                          << " , fd = " << openInstance->physicalFd;
@@ -693,7 +693,7 @@ int FalconStore::DownLoadFromStorage(OpenInstance *openInstance, bool isSync, bo
             }
             size = -EIO;
         } else {
-            DiskCache::GetInstance().InsertAndUpdate(inodeId, fileSize, isSync);
+            DiskCache::GetInstance().InsertAndUpdate(inodeId, fileSize, isSync, path);
         }
         DiskCache::GetInstance().FreePreAllocSpace(fileSize);
         return size < 0 ? size : 0;
@@ -861,7 +861,7 @@ int FalconStore::CloseTmpFiles(OpenInstance *openInstance, bool isFlush, bool is
         }
         /* flush file */
         /* update diskcache file size, do not pin */
-        DiskCache::GetInstance().InsertAndUpdate(openInstance->inodeId, openInstance->currentSize, false);
+        DiskCache::GetInstance().InsertAndUpdate(openInstance->inodeId, openInstance->currentSize, false, openInstance->path);
         if (openInstance->writeCnt > 0 && !openInstance->writeFail) {
             if (isSync) {
                 fsync(openInstance->physicalFd);
@@ -989,7 +989,7 @@ int FalconStore::ReadSmallFiles(OpenInstance *openInstance)
         }
         /* Async write to local cache file */
         /* Read buffer is read only after initialization above */
-        return WriteToFileAsync(inodeId, fileName, openInstance->readBuffer, bufSize);
+        return WriteToFileAsync(inodeId, path, fileName, openInstance->readBuffer, bufSize);
     }
     return 0;
 }
@@ -998,7 +998,7 @@ int FalconStore::ReadSmallFiles(OpenInstance *openInstance)
  * Called by OpenFile and ReadSmallFile. Large file try open and return, small file read obs if failed
  * Use a shared_ptr from read buffer to store the file content
  */
-int FalconStore::WriteToFileAsync(uint64_t inodeId, std::string &fileName, std::shared_ptr<char> buf, size_t bufSize)
+int FalconStore::WriteToFileAsync(uint64_t inodeId, const std::string &path, std::string &fileName, std::shared_ptr<char> buf, size_t bufSize)
 {
     auto lockerPtr = std::make_shared<FileLocker>(&fileLock, inodeId, LockMode::X, false);
     if (lockerPtr == nullptr) {
@@ -1029,7 +1029,7 @@ int FalconStore::WriteToFileAsync(uint64_t inodeId, std::string &fileName, std::
 
     /* Async write the file to local file */
     ThreadTask task;
-    task.task = [fd, buf, bufSize, inodeId, lockerPtr]() {
+    task.task = [fd, buf, bufSize, inodeId, path, lockerPtr]() {
         FalconStats::GetInstance().stats[BLOCKCACHE_WRITE] += bufSize;
         int retSize = pwrite(fd, buf.get(), bufSize, 0);
         int err = errno;
@@ -1037,7 +1037,7 @@ int FalconStore::WriteToFileAsync(uint64_t inodeId, std::string &fileName, std::
         if (retSize < 0) {
             FALCON_LOG(LOG_ERROR) << "WriteToFileAsync(): pwrite failed : " << strerror(err);
         } else {
-            DiskCache::GetInstance().InsertAndUpdate(inodeId, bufSize, false);
+            DiskCache::GetInstance().InsertAndUpdate(inodeId, bufSize, false, path);
         }
         DiskCache::GetInstance().FreePreAllocSpace(bufSize);
     };
@@ -1184,7 +1184,7 @@ int FalconStore::DownLoadFromStorageForBrpc(uint64_t inodeId,
             }
             size = -EIO;
         } else {
-            DiskCache::GetInstance().InsertAndUpdate(inodeId, bufSize, isSync);
+            DiskCache::GetInstance().InsertAndUpdate(inodeId, bufSize, isSync, path);
         }
         DiskCache::GetInstance().FreePreAllocSpace(bufSize);
         return size < 0 ? size : 0;

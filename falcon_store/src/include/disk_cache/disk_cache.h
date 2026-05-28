@@ -28,6 +28,20 @@ struct CacheItem
     uint64_t size{0};
     uint64_t atime{0};
     uint32_t refs{0};
+    std::string path;
+};
+
+struct EvictedItem
+{
+    uint64_t inode{0};
+    uint64_t size{0};
+    std::string path;
+};
+
+class DiskCacheEvictListener {
+  public:
+    virtual ~DiskCacheEvictListener() = default;
+    virtual void OnEvicted(const EvictedItem &item) = 0;
 };
 
 class DiskCache {
@@ -43,7 +57,8 @@ class DiskCache {
     int Start(std::string &path, int dirNum, float ratio, float bgEvitRatio);
     bool Find(uint64_t key, bool needPin);
     void DeleteOldCacheWithNoPin(uint64_t key);
-    void InsertAndUpdate(uint64_t key, uint64_t size, bool needPin);
+    bool UpdatePath(uint64_t key, const std::string &path);
+    void InsertAndUpdate(uint64_t key, uint64_t size, bool needPin, const std::string &path = "");
     bool Add(uint64_t key, uint64_t size);
     bool Update(uint64_t key, uint64_t size);
     int Delete(uint64_t key);
@@ -53,6 +68,7 @@ class DiskCache {
     bool PreAllocSpace(uint64_t size);
     void FreePreAllocSpace(uint64_t size);
     bool HasFreeSpace();
+    void SetEvictListener(DiskCacheEvictListener *listener);
 
   private:
     uint64_t totalCap{0};
@@ -82,6 +98,8 @@ class DiskCache {
 
     std::atomic<uint64_t> reservedCap{0};
     std::mutex allocMutex;
+    std::mutex listenerMutex;
+    DiskCacheEvictListener *evictListener{nullptr};
 
     static std::mutex initCacheMutex;
 
@@ -89,7 +107,8 @@ class DiskCache {
     int GetCurFreeRatio();
     void CheckFreeSpace();
     void Cleanup();
-    void CleanupForEvict(uint64_t size);
+    void CleanupForEvict(uint64_t size, std::vector<EvictedItem> &evictedItems);
+    void NotifyEvicted(const std::vector<EvictedItem> &evictedItems);
     int ScanCache();
     static int Walk(std::string dirPath);
     int CheckSpaceEnough();

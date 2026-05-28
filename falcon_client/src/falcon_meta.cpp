@@ -6,10 +6,13 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <queue>
+#include <thread>
 #include <unordered_map>
 
 #include <sys/stat.h>
@@ -17,6 +20,7 @@
 
 #include "buffer/dir_open_instance.h"
 #include "cm/falcon_cm.h"
+#include "disk_cache/disk_cache.h"
 #include "falcon_store/falcon_store.h"
 #include "inner_falcon_meta.h"
 #include "router.h"
@@ -27,6 +31,106 @@ constexpr int FILE_NUMBER_PER_WORKER = 4096;
 
 std::shared_ptr<Router> router;
 
+static int FalconUnlinkMetadataOnly(const std::string &path);
+
+class FalconEvictUnlinkListener : public DiskCacheEvictListener {
+  public:
+    ~FalconEvictUnlinkListener() override { Stop(); }
+
+    void Start() { worker = std::thread(&FalconEvictUnlinkListener::Run, this); }
+
+    void Stop()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopped = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    void OnEvicted(const EvictedItem &item) override
+    {
+        if (item.path.empty()) {
+            FALCON_LOG(LOG_WARNING) << "Skip evicted inode " << item.inode << " without logical path";
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopped) {
+                return;
+            }
+            constexpr std::size_t kMaxPendingEvictions = 10000;
+            constexpr std::size_t kHighWatermark = static_cast<std::size_t>(kMaxPendingEvictions * 8 / 10);
+            if (pending.size() >= kMaxPendingEvictions) {
+                FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener pending queue at capacity ("
+                                        << kMaxPendingEvictions << "), dropping eviction for inode " << item.inode
+                                        << " path " << item.path;
+                return;
+            }
+
+            pending.push(item);
+            if (pending.size() == kHighWatermark) {
+                FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener pending queue reached high watermark: "
+                                        << pending.size() << " items; max capacity is " << kMaxPendingEvictions;
+            }
+        }
+        cv.notify_one();
+    }
+
+  private:
+    void Run()
+    {
+        while (true) {
+            EvictedItem item;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [this]() { return stopped || !pending.empty(); });
+                if (stopped && pending.empty()) {
+                    return;
+                }
+                item = pending.front();
+                pending.pop();
+            }
+
+            int ret = FalconUnlinkMetadataOnly(item.path);
+            if (ret != SUCCESS) {
+                FALCON_LOG(LOG_WARNING) << "Evict unlink failed for path " << item.path << ", error code: " << ret;
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::queue<EvictedItem> pending;
+    bool stopped{false};
+    std::thread worker;
+};
+
+std::unique_ptr<FalconEvictUnlinkListener> evictUnlinkListener;
+
+void StartEvictUnlinkListener()
+{
+    if (evictUnlinkListener != nullptr) {
+        return;
+    }
+    evictUnlinkListener = std::make_unique<FalconEvictUnlinkListener>();
+    evictUnlinkListener->Start();
+    DiskCache::GetInstance().SetEvictListener(evictUnlinkListener.get());
+}
+
+void StopEvictUnlinkListener()
+{
+    DiskCache::GetInstance().SetEvictListener(nullptr);
+    if (evictUnlinkListener == nullptr) {
+        return;
+    }
+    evictUnlinkListener->Stop();
+    evictUnlinkListener.reset();
+}
+
 int FalconInit(std::string &coordinatorIp, int coordinatorPort)
 {
     int ret = FalconStore::GetInstance()->GetInitStatus();
@@ -35,6 +139,7 @@ int FalconInit(std::string &coordinatorIp, int coordinatorPort)
     }
     ServerIdentifier coordinator(coordinatorIp, coordinatorPort);
     router = std::make_shared<Router>(coordinator);
+    StartEvictUnlinkListener();
     return 0;
 }
 
@@ -66,6 +171,7 @@ int FalconInitWithZK(std::string zkEndPoint, const std::string &zkPath)
     }
     ServerIdentifier coordinator(coordinatorIp, coordinatorPort);
     router = std::make_shared<Router>(coordinator);
+    StartEvictUnlinkListener();
     return 0;
 }
 
@@ -279,6 +385,35 @@ int FalconClose(const std::string &path, uint64_t fd, bool isFlush, int datasync
     return errorCode;
 }
 
+static int FalconUnlinkMetadataOnly(const std::string &path)
+{
+    std::shared_ptr<Connection> conn = router->GetWorkerConnByPath(path);
+    if (!conn) {
+        FALCON_LOG(LOG_ERROR) << "route error";
+        return PROGRAM_ERROR;
+    }
+
+    uint64_t inodeId = 0;
+    int64_t size = 0;
+    int32_t nodeId = 0;
+    int errorCode = conn->Unlink(path.c_str(), inodeId, size, nodeId);
+#ifdef ZK_INIT
+    int cnt = 0;
+    while (cnt < RETRY_CNT && errorCode == SERVER_FAULT) {
+        ++cnt;
+        sleep(SLEEPTIME);
+        conn = router->TryToUpdateWorkerConn(conn);
+        errorCode = conn->Unlink(path.c_str(), inodeId, size, nodeId);
+    }
+#endif
+    if (errorCode != SUCCESS) {
+        FALCON_LOG(LOG_ERROR) << "FalconUnlinkMetadataOnly failed for path: " << path << ", DN: " << conn->server.id
+                              << ", ip: " << conn->server.ip << ", error code: " << errorCode;
+    }
+
+    return errorCode;
+}
+
 int FalconUnlink(const std::string &path)
 {
     std::shared_ptr<Connection> conn = router->GetWorkerConnByPath(path);
@@ -301,7 +436,8 @@ int FalconUnlink(const std::string &path)
     }
 #endif
     if (errorCode != SUCCESS) {
-        FALCON_LOG(LOG_ERROR) << "FalconUnlink failed for path: " << path << ", DN: " << conn->server.id << ", ip: " << conn->server.ip << ", error code: " << errorCode;
+        FALCON_LOG(LOG_ERROR) << "FalconUnlink failed for path: " << path << ", DN: " << conn->server.id << ", ip: "
+                              << conn->server.ip << ", error code: " << errorCode;
     }
     int ret = 0;
     if (errorCode == SUCCESS) {
@@ -456,6 +592,7 @@ int FalconCloseDir(uint64_t fd)
 
 int FalconDestroy()
 {
+    StopEvictUnlinkListener();
     FalconStore::GetInstance()->DeleteInstance();
 
     return 0;
@@ -514,6 +651,10 @@ int FalconRead(const std::string & /*path*/, uint64_t fd, char *buffer, size_t s
 
 int FalconRename(const std::string &srcName, const std::string &dstName)
 {
+    struct stat srcStat;
+    (void)memset(&srcStat, 0, sizeof(srcStat));
+    int statRet = FalconGetStat(srcName, &srcStat);
+
     std::shared_ptr<Connection> conn = router->GetCoordinatorConn();
     if (!conn) {
         FALCON_LOG(LOG_ERROR) << "route error";
@@ -531,6 +672,9 @@ int FalconRename(const std::string &srcName, const std::string &dstName)
 #endif
     if (errorCode != SUCCESS) {
         FALCON_LOG(LOG_ERROR) << "FalconRename failed for srcName: " << srcName << ", DN: " << conn->server.id << ", ip: " << conn->server.ip << ", error code: " << errorCode;
+    }
+    if (errorCode == SUCCESS && statRet == SUCCESS) {
+        DiskCache::GetInstance().UpdatePath(srcStat.st_ino, dstName);
     }
     return errorCode;
 }
@@ -574,6 +718,7 @@ int FalconRenamePersist(const std::string &srcName, const std::string &dstName)
         FALCON_LOG(LOG_ERROR) << "FalconRenamePersist failed for srcName: " << srcName << ", DN: " << conn->server.id << ", ip: " << conn->server.ip << ", error code: " << errorCode;
     }
     if (errorCode == SUCCESS) {
+        DiskCache::GetInstance().UpdatePath(stbuf.st_ino, dstName);
         // delete src object
         InnerFalconDeleteDataAfterRename(srcName);
     } else {
