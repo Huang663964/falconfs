@@ -201,6 +201,31 @@ target_include_directories(falcon_client PUBLIC
     ${PROJECT_SOURCE_DIR}/common/src/include
 )
 
+add_executable(falcon_internal_perf ${PROJECT_SOURCE_DIR}/tools/falcon_internal_perf.cpp)
+set_target_properties(falcon_internal_perf PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/internal_perf"
+)
+target_link_libraries(falcon_internal_perf
+    FalconStore
+    FalconClient
+    pthread
+    pq
+    fuse
+    zookeeper_mt
+    glog
+    jsoncpp
+    ${BRPC_LIBRARIES}
+    ${DYNAMIC_LIB}
+)
+target_link_directories(falcon_internal_perf PUBLIC
+    ${POSTGRES_LIB_DIR}
+)
+target_include_directories(falcon_internal_perf PUBLIC
+    ${POSTGRES_INCLUDE_DIR}
+    ${PROJECT_SOURCE_DIR}/falcon_store/src/include
+    ${PROJECT_SOURCE_DIR}/common/src/include
+)
+
 # ==================== Install Targets =================
 install(TARGETS falcon_client
         RUNTIME DESTINATION bin

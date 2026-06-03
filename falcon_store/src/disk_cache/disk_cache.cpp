@@ -22,6 +22,10 @@ std::mutex DiskCache::initCacheMutex;
 
 namespace {
 using DiskCacheClock = std::chrono::steady_clock;
+constexpr float CLEANUP_HEADROOM_RATIO = 0.01F;
+constexpr int ACTIVE_CLEANUP_INTERVAL_MS = 100;
+constexpr int IDLE_CLEANUP_INTERVAL_MS = 1000;
+constexpr int MAX_CONTINUOUS_CLEANUP_ROUNDS = 8;
 
 uint64_t ElapsedUs(DiskCacheClock::time_point start, DiskCacheClock::time_point end)
 {
@@ -35,6 +39,8 @@ DiskCache::~DiskCache()
 {
     SetEvictListener(nullptr);
     stop = true;
+    cleanupCv.notify_all();
+    spaceCv.notify_all();
     if (cleanupThread.joinable()) {
         cleanupThread.join();
     }
@@ -172,20 +178,54 @@ int DiskCache::GetCurFreeRatio()
 
 void DiskCache::CheckFreeSpace()
 {
+    bool activeCleanup = false;
     while (!stop) {
+        {
+            std::unique_lock<std::mutex> waitLock(cleanupNotifyMutex);
+            auto waitTime = std::chrono::milliseconds(activeCleanup ? ACTIVE_CLEANUP_INTERVAL_MS : IDLE_CLEANUP_INTERVAL_MS);
+            cleanupCv.wait_for(waitLock, waitTime, [this]() {
+                return stop.load() || cleanupRequested.load();
+            });
+        }
+        if (stop) {
+            break;
+        }
+
+        bool shouldCleanup = false;
+        bool didCleanup = false;
+        uint64_t requestedBytes = 0;
         {
             std::lock_guard<std::mutex> lock(mutex);
             int ret = GetCurFreeRatio();
             if (ret != RETURN_OK) {
                 break;
             }
-            if (blockRatio < bgFreeRatio || inodeRatio < bgFreeRatio) {
+            requestedBytes = requestedCleanupBytes.exchange(0);
+            bool requested = cleanupRequested.exchange(false);
+            shouldCleanup = requested || blockRatio < bgFreeRatio || inodeRatio < bgFreeRatio;
+            if (shouldCleanup && usedCap > 0) {
                 hasFreeSpace = false;
-                Cleanup();
+                if (requestedBytes > 0) {
+                    FALCON_LOG(LOG_WARNING) << "DiskCache::CheckFreeSpace(): background cleanup requested, bytes = "
+                                            << requestedBytes;
+                }
+                float targetRatio = GetCleanupTargetRatio();
+                for (int round = 0; round < MAX_CONTINUOUS_CLEANUP_ROUNDS && usedCap > 0; ++round) {
+                    bool freed = Cleanup(targetRatio, requestedBytes);
+                    didCleanup = didCleanup || freed;
+                    requestedBytes = 0;
+                    if (!freed || (blockRatio >= bgFreeRatio && inodeRatio >= bgFreeRatio)) {
+                        break;
+                    }
+                    targetRatio = GetCleanupTargetRatio();
+                }
             }
             hasFreeSpace = blockRatio >= bgFreeRatio && inodeRatio >= bgFreeRatio;
+            activeCleanup = !hasFreeSpace.load() && usedCap > 0;
         }
-        sleep(10);
+        if (shouldCleanup || didCleanup) {
+            spaceCv.notify_all();
+        }
     }
 }
 
@@ -251,33 +291,44 @@ void DiskCache::CleanupForEvict(uint64_t preAllocSize, std::vector<EvictedItem> 
         }
     }
 
+    freeInodes += freedInode;
+    RefreshRatiosFromAccounting();
     FALCON_LOG(LOG_WARNING) << "DiskCache::CleanupForEvict(): Evicted " << freedInode << " files, all size is "
                             << freedCap << ", failed files = " << failedInode << ", scanned files = "
                             << scannedInode << ", cleanup elapsed us = "
                             << ElapsedUs(cleanupStart, DiskCacheClock::now()) << ", remove elapsed us = "
-                            << removeElapsedUs;
+                            << removeElapsedUs << ", blockRatio = " << blockRatio << ", inodeRatio = " << inodeRatio;
 }
 
-void DiskCache::Cleanup()
+bool DiskCache::Cleanup(float targetRatio, uint64_t requestedBytes)
 {
     auto cleanupStart = DiskCacheClock::now();
     std::vector<EvictedItem> evictedItems;
     uint64_t toFreeCap = 0;
     uint64_t toFreeInode = 0;
-    float freeRatio = bgFreeRatio;
-    if (blockRatio < freeRatio) {
-        toFreeCap = (uint64_t)(totalCap * (freeRatio - blockRatio));
+    targetRatio = std::max(targetRatio, bgFreeRatio);
+    if (blockRatio < bgFreeRatio) {
+        toFreeCap = (uint64_t)(totalCap * (targetRatio - blockRatio));
+        if (requestedBytes > 0) {
+            toFreeCap = std::max(toFreeCap, requestedBytes + reservedCap.load());
+        }
         FALCON_LOG(LOG_WARNING) << "DiskCache::Cleanup(): Evict file due to block limit, data toFreeCap = "
-                                << toFreeCap;
+                                << toFreeCap << ", targetRatio = " << targetRatio;
         if (toFreeCap > usedCap) {
             toFreeCap = usedCap;
         }
+    } else if (requestedBytes > 0) {
+        toFreeCap = std::min<uint64_t>(requestedBytes + reservedCap.load(), usedCap);
+        FALCON_LOG(LOG_WARNING) << "DiskCache::Cleanup(): Evict file due to explicit request, data toFreeCap = "
+                                << toFreeCap;
     }
 
-    if (inodeRatio < freeRatio) {
-        toFreeInode = (uint64_t)(totalInodes * (freeRatio - inodeRatio));
+    if (inodeRatio < bgFreeRatio) {
+        uint64_t recoverableInodes = freeInodes + inodeToCacheIter.size();
+        float inodeTargetRatio = std::min(targetRatio, recoverableInodes * 1.0F / totalInodes);
+        toFreeInode = (uint64_t)(totalInodes * (inodeTargetRatio - inodeRatio));
         FALCON_LOG(LOG_WARNING) << "DiskCache::Cleanup(): Evict file due to inode limit, inodes toFreeInode = "
-                                << toFreeInode;
+                                << toFreeInode << ", targetRatio = " << inodeTargetRatio;
         if (toFreeInode > inodeToCacheIter.size()) {
             toFreeInode = inodeToCacheIter.size();
         }
@@ -321,15 +372,38 @@ void DiskCache::Cleanup()
         }
     }
 
+    freeInodes += freedInode;
+    RefreshRatiosFromAccounting();
     FALCON_LOG(LOG_WARNING) << "DiskCache::Cleanup(): Evicted " << freedInode << " files, all size is " << freedCap
                             << ", failed files = " << failedInode << ", scanned files = " << scannedInode
                             << ", cleanup elapsed us = " << ElapsedUs(cleanupStart, DiskCacheClock::now())
-                            << ", remove elapsed us = " << removeElapsedUs;
+                            << ", remove elapsed us = " << removeElapsedUs << ", blockRatio = " << blockRatio
+                            << ", inodeRatio = " << inodeRatio;
     auto notifyStart = DiskCacheClock::now();
     NotifyEvicted(evictedItems);
     if (!evictedItems.empty()) {
         FALCON_LOG(LOG_WARNING) << "DiskCache::Cleanup(): NotifyEvicted " << evictedItems.size()
                                 << " items, elapsed us = " << ElapsedUs(notifyStart, DiskCacheClock::now());
+    }
+    return freedInode > 0;
+}
+
+float DiskCache::GetCleanupTargetRatio() const
+{
+    if (totalCap == 0) {
+        return bgFreeRatio;
+    }
+    float recoverableRatio = (freeCap.load() + usedCap) * 1.0F / totalCap;
+    return std::min(bgFreeRatio + CLEANUP_HEADROOM_RATIO, recoverableRatio);
+}
+
+void DiskCache::RefreshRatiosFromAccounting()
+{
+    if (totalCap > 0) {
+        blockRatio = freeCap.load() * 1.0F / totalCap;
+    }
+    if (totalInodes > 0) {
+        inodeRatio = freeInodes * 1.0F / totalInodes;
     }
 }
 
@@ -528,33 +602,63 @@ void DiskCache::Evict(uint64_t size)
     }
 }
 
+bool DiskCache::CanReserve(uint64_t size) const
+{
+    return reservedCap + size < freeCap.load();
+}
+
+void DiskCache::Reserve(uint64_t size)
+{
+    reservedCap += size;
+}
+
+void DiskCache::RequestBackgroundCleanup(uint64_t size)
+{
+    cleanupRequested = true;
+    requestedCleanupBytes.fetch_add(size);
+    cleanupCv.notify_one();
+}
+
 bool DiskCache::PreAllocSpace(uint64_t size)
 {
     if (stop) {
         return true;
     }
-    std::lock_guard<std::mutex> lock(allocMutex);
+    std::unique_lock<std::mutex> lock(allocMutex);
     //
-    if (reservedCap + size < freeCap.load()) {
-        reservedCap += size;
-        return true;
-    } else {
-        hasFreeSpace = false;
-        int retryCnt = 3;
-        do {
-            if (retryCnt == 0) {
-                FALCON_LOG(LOG_WARNING) << "PreAllocSpace failed, size = " << size << " ,reservedCap = " << reservedCap
-                                        << " ,freeCap = " << freeCap.load();
-                return false;
-            }
-            Evict(size);
-            --retryCnt;
-            sleep(1);
-        } while (reservedCap + size >= freeCap.load() && retryCnt >= 0);
-        hasFreeSpace = true;
-        reservedCap += size;
+    if (CanReserve(size)) {
+        Reserve(size);
         return true;
     }
+
+    hasFreeSpace = false;
+    RequestBackgroundCleanup(size);
+    for (int i = 0; i < 3; ++i) {
+        spaceCv.wait_for(lock, std::chrono::milliseconds(100));
+        if (CanReserve(size)) {
+            hasFreeSpace = true;
+            Reserve(size);
+            return true;
+        }
+    }
+
+    int retryCnt = 3;
+    do {
+        if (retryCnt == 0) {
+            FALCON_LOG(LOG_WARNING) << "PreAllocSpace failed, size = " << size << " ,reservedCap = " << reservedCap
+                                    << " ,freeCap = " << freeCap.load();
+            return false;
+        }
+        Evict(size);
+        --retryCnt;
+        if (CanReserve(size)) {
+            break;
+        }
+        spaceCv.wait_for(lock, std::chrono::milliseconds(100));
+    } while (!CanReserve(size) && retryCnt >= 0);
+    hasFreeSpace = true;
+    Reserve(size);
+    return true;
 }
 
 void DiskCache::FreePreAllocSpace(uint64_t size)
@@ -564,6 +668,7 @@ void DiskCache::FreePreAllocSpace(uint64_t size)
     }
     std::lock_guard<std::mutex> lock(allocMutex);
     reservedCap -= size;
+    spaceCv.notify_all();
 }
 
 bool DiskCache::HasFreeSpace() { return hasFreeSpace.load(); }

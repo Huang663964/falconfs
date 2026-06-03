@@ -4,7 +4,9 @@
 
 #include "falcon_meta.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdio>
@@ -14,6 +16,7 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -28,27 +31,82 @@
 
 constexpr int FILE_NUMBER_PER_EPOCH = 1048576;
 constexpr int FILE_NUMBER_PER_WORKER = 4096;
+constexpr std::size_t MAX_EVICT_UNLINK_WORKERS = 64;
 
 std::shared_ptr<Router> router;
 
 static int FalconUnlinkMetadataOnly(const std::string &path);
 
+static std::size_t GetEvictUnlinkWorkerCount()
+{
+    const char *workerCount = std::getenv("EVICT_UNLINK_WORKERS");
+    if (workerCount == nullptr) {
+        return 1;
+    }
+    char *end = nullptr;
+    unsigned long value = std::strtoul(workerCount, &end, 10);
+    if (end == workerCount || value == 0) {
+        FALCON_LOG(LOG_WARNING) << "Invalid EVICT_UNLINK_WORKERS value: " << workerCount << ", use 1";
+        return 1;
+    }
+    if (value > MAX_EVICT_UNLINK_WORKERS) {
+        FALCON_LOG(LOG_WARNING) << "EVICT_UNLINK_WORKERS " << value << " exceeds max "
+                                << MAX_EVICT_UNLINK_WORKERS << ", clamp to " << MAX_EVICT_UNLINK_WORKERS;
+        return MAX_EVICT_UNLINK_WORKERS;
+    }
+    return static_cast<std::size_t>(value);
+}
+
+static void UpdateAtomicMax(std::atomic<uint64_t> &target, uint64_t value)
+{
+    uint64_t current = target.load();
+    while (current < value && !target.compare_exchange_weak(current, value)) {
+    }
+}
+
+static uint64_t Percentile(std::vector<uint64_t> values, double q)
+{
+    if (values.empty()) {
+        return 0;
+    }
+    std::sort(values.begin(), values.end());
+    std::size_t idx = static_cast<std::size_t>(values.size() * q);
+    if (idx >= values.size()) {
+        idx = values.size() - 1;
+    }
+    return values[idx];
+}
+
 class FalconEvictUnlinkListener : public DiskCacheEvictListener {
   public:
     ~FalconEvictUnlinkListener() override { Stop(); }
 
-    void Start() { worker = std::thread(&FalconEvictUnlinkListener::Run, this); }
+    void Start()
+    {
+        workerCount = GetEvictUnlinkWorkerCount();
+        workers.reserve(workerCount);
+        for (std::size_t i = 0; i < workerCount; ++i) {
+            workers.emplace_back(&FalconEvictUnlinkListener::Run, this, i);
+        }
+        FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener started with " << workerCount << " worker(s)";
+    }
 
     void Stop()
     {
         {
             std::lock_guard<std::mutex> lock(mutex);
+            if (stopped) {
+                return;
+            }
             stopped = true;
         }
         cv.notify_all();
-        if (worker.joinable()) {
-            worker.join();
+        for (auto &worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
         }
+        LogStats();
     }
 
     void OnEvicted(const EvictedItem &item) override
@@ -65,6 +123,7 @@ class FalconEvictUnlinkListener : public DiskCacheEvictListener {
             constexpr std::size_t kMaxPendingEvictions = 10000;
             constexpr std::size_t kHighWatermark = static_cast<std::size_t>(kMaxPendingEvictions * 8 / 10);
             if (pending.size() >= kMaxPendingEvictions) {
+                droppedItems.fetch_add(1);
                 FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener pending queue at capacity ("
                                         << kMaxPendingEvictions << "), dropping eviction for inode " << item.inode
                                         << " path " << item.path;
@@ -72,6 +131,8 @@ class FalconEvictUnlinkListener : public DiskCacheEvictListener {
             }
 
             pending.push(item);
+            enqueuedItems.fetch_add(1);
+            UpdateAtomicMax(maxPendingItems, static_cast<uint64_t>(pending.size()));
             if (pending.size() == kHighWatermark) {
                 FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener pending queue reached high watermark: "
                                         << pending.size() << " items; max capacity is " << kMaxPendingEvictions;
@@ -81,7 +142,7 @@ class FalconEvictUnlinkListener : public DiskCacheEvictListener {
     }
 
   private:
-    void Run()
+    void Run(std::size_t workerId)
     {
         while (true) {
             EvictedItem item;
@@ -95,18 +156,66 @@ class FalconEvictUnlinkListener : public DiskCacheEvictListener {
                 pending.pop();
             }
 
+            auto start = std::chrono::steady_clock::now();
             int ret = FalconUnlinkMetadataOnly(item.path);
+            uint64_t elapsedUs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start)
+                    .count());
+            processedItems.fetch_add(1);
+            totalUnlinkLatencyUs.fetch_add(elapsedUs);
+            UpdateAtomicMax(maxUnlinkLatencyUs, elapsedUs);
+            {
+                std::lock_guard<std::mutex> lock(statsMutex);
+                unlinkLatencySamples.push_back(elapsedUs);
+            }
             if (ret != SUCCESS) {
-                FALCON_LOG(LOG_WARNING) << "Evict unlink failed for path " << item.path << ", error code: " << ret;
+                failedItems.fetch_add(1);
+                FALCON_LOG(LOG_WARNING) << "Evict unlink failed for path " << item.path << ", worker " << workerId
+                                        << ", error code: " << ret;
+            } else {
+                succeededItems.fetch_add(1);
             }
         }
+    }
+
+    void LogStats()
+    {
+        uint64_t processed = processedItems.load();
+        uint64_t avgLatencyUs = processed == 0 ? 0 : totalUnlinkLatencyUs.load() / processed;
+        std::vector<uint64_t> latencySamples;
+        {
+            std::lock_guard<std::mutex> lock(statsMutex);
+            latencySamples = unlinkLatencySamples;
+        }
+        FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener stopped, workers = " << workerCount
+                                << ", enqueued = " << enqueuedItems.load()
+                                << ", processed = " << processed
+                                << ", succeeded = " << succeededItems.load()
+                                << ", failed = " << failedItems.load()
+                                << ", dropped = " << droppedItems.load()
+                                << ", max pending = " << maxPendingItems.load()
+                                << ", avg unlink latency us = " << avgLatencyUs
+                                << ", p95 unlink latency us = " << Percentile(latencySamples, 0.95)
+                                << ", p99 unlink latency us = " << Percentile(latencySamples, 0.99)
+                                << ", max unlink latency us = " << maxUnlinkLatencyUs.load();
     }
 
     std::mutex mutex;
     std::condition_variable cv;
     std::queue<EvictedItem> pending;
     bool stopped{false};
-    std::thread worker;
+    std::vector<std::thread> workers;
+    std::size_t workerCount{1};
+    std::atomic<uint64_t> enqueuedItems{0};
+    std::atomic<uint64_t> processedItems{0};
+    std::atomic<uint64_t> succeededItems{0};
+    std::atomic<uint64_t> failedItems{0};
+    std::atomic<uint64_t> droppedItems{0};
+    std::atomic<uint64_t> maxPendingItems{0};
+    std::atomic<uint64_t> totalUnlinkLatencyUs{0};
+    std::atomic<uint64_t> maxUnlinkLatencyUs{0};
+    std::mutex statsMutex;
+    std::vector<uint64_t> unlinkLatencySamples;
 };
 
 std::unique_ptr<FalconEvictUnlinkListener> evictUnlinkListener;

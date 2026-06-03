@@ -7,6 +7,7 @@
 #include <dirent.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <list>
 #include <mutex>
 #include <string>
@@ -98,6 +99,11 @@ class DiskCache {
 
     std::atomic<uint64_t> reservedCap{0};
     std::mutex allocMutex;
+    std::mutex cleanupNotifyMutex;
+    std::condition_variable cleanupCv;
+    std::condition_variable spaceCv;
+    std::atomic<bool> cleanupRequested{false};
+    std::atomic<uint64_t> requestedCleanupBytes{0};
     std::mutex listenerMutex;
     DiskCacheEvictListener *evictListener{nullptr};
 
@@ -106,9 +112,14 @@ class DiskCache {
     static std::vector<CacheItem> initCacheVector;
     int GetCurFreeRatio();
     void CheckFreeSpace();
-    void Cleanup();
+    bool Cleanup(float targetRatio, uint64_t requestedBytes);
     void CleanupForEvict(uint64_t size, std::vector<EvictedItem> &evictedItems);
+    float GetCleanupTargetRatio() const;
+    void RefreshRatiosFromAccounting();
     void NotifyEvicted(const std::vector<EvictedItem> &evictedItems);
+    bool CanReserve(uint64_t size) const;
+    void Reserve(uint64_t size);
+    void RequestBackgroundCleanup(uint64_t size);
     int ScanCache();
     static int Walk(std::string dirPath);
     int CheckSpaceEnough();
