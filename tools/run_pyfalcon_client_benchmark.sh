@@ -720,7 +720,7 @@ PYDIAG
         log "missing json for ${case_id}: ${case_json}"
     fi
 
-    for file in "$case_log" "$idle_log" "$meta_log"; do
+    for file in "$case_log" "$idle_log" "$meta_log" "$ROOT_DIR/deploy/meta"/cnlogfile*.log "$ROOT_DIR/deploy/meta"/workerlogfile*.log; do
         if [[ -f "$file" ]]; then
             log "tail ${file}"
             tail -n 80 "$file" || true
