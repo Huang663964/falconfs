@@ -100,7 +100,6 @@ FILES=6000 \
 UNLINK_FILES=6000 \
 FILE_SIZE=2097152 \
 WAIT_SEC=45 \
-EVICT_THRESHOLD=0.72 \
 FIO_SIZE=2G \
 bash tools/run_pyfalcon_client_benchmark.sh all
 ```
@@ -139,13 +138,61 @@ bash tools/run_pyfalcon_client_benchmark.sh B-5
 | `CACHE_ROOT` | `/tmp/falcon_cache` 或 `$BENCHMARK_ROOT/falcon_cache` | Falcon DiskCache 本地 cache 目录，结束后清理 |
 | `REQUIRE_NVME` | 1 | 是否要求 `OUT_DIR/CACHE_ROOT/FIO_DIR/metadata workspace` 都在 NVMe 设备上；临时非 NVMe 测试可设为 0 |
 | `WRITE_THRESHOLD` | 1 | P-1/P-2/P-5 使用的 `STORAGE_THRESHOLD` |
-| `EVICT_THRESHOLD` | 0.72 | P-3 使用的 `STORAGE_THRESHOLD` |
+| `EVICT_THRESHOLD` | 0.72 | `AUTO_EVICT_CONFIG=0` 时 P-3 使用的固定 `STORAGE_THRESHOLD` |
+| `AUTO_EVICT_CONFIG` | 1 | 是否自动按 `CACHE_ROOT` 所在文件系统容量和当前已用空间计算 P-3 的水位线和文件数 |
+| `AUTO_EVICT_WRITE_RATIO` | 0.01 | 自动模式下目标 P-3 写入量至少覆盖文件系统总容量的比例 |
+| `AUTO_EVICT_MIN_WRITE_BYTES` | 12884901888 | 自动模式下 P-3 最小目标写入量，默认 12GiB |
+| `AUTO_EVICT_MAX_WRITE_BYTES` | 0 | 自动模式下 P-3 写入量硬上限；0 表示不设置绝对上限，保证能按磁盘空间触发 evict |
+| `AUTO_EVICT_MAX_AVAIL_RATIO` | 0.60 | 自动模式最多使用当前可用空间的比例来增加 P-3 写入量 |
+| `AUTO_EVICT_TRIGGER_RATIO` | 0.90 | 自动模式把水位线放在计划写入量靠后的阶段，减少为触发 evict 需要额外写入的数据量 |
+| `AUTO_EVICT_INIT_MARGIN_BYTES` | 1073741824 | 自动模式给 Falcon metadata 初始化预留的空间余量 |
+| `AUTO_EVICT_START_MARGIN_RATIO` | 0.12 | 自动模式为满足 Falcon 启动空闲空间检查，在当前已用比例上额外预留的比例 |
+| `AUTO_EVICT_MAX_THRESHOLD` | 0.98 | 自动模式计算出的水位线上限 |
 | `CONFIG_FILE_PATH` | `/usr/local/falconfs/falcon_client/config/config.json` | Python client 使用的配置文件 |
 | `PYTHON_INTERFACE` | `$ROOT_DIR/python_interface` | `pyfalconfs` Python 包路径 |
 
 P-5 的正式阶段总进程数是 `CLIENTS * 2`。例如 `CLIENTS=4` 时，是 4 个 writer client 加 4 个 deleter client。
 
-## 6. 输出文件
+## 6. P-3 自动 evict 配置
+
+默认 `AUTO_EVICT_CONFIG=1`。P-3 执行前脚本会在清理环境后读取 `CACHE_ROOT` 所在文件系统的空间信息：
+
+```text
+total_bytes
+used_bytes
+avail_bytes
+```
+
+然后根据 `FILES * FILE_SIZE`、磁盘总容量比例和最小写入量计算 P-3 的实际写入文件数。基础目标写入量为：
+
+```text
+max(FILES * FILE_SIZE, total_bytes * AUTO_EVICT_WRITE_RATIO, AUTO_EVICT_MIN_WRITE_BYTES)
+```
+
+如果 `AUTO_EVICT_MAX_WRITE_BYTES > 0`，脚本会把它当成硬上限；当实际需要写入的数据量超过这个上限时，脚本会失败并提示调大上限或降低启动安全余量。默认 `AUTO_EVICT_MAX_WRITE_BYTES=0`，表示不设置绝对上限。
+
+如果实际需要写入的数据量超过当前可用空间的 `AUTO_EVICT_MAX_AVAIL_RATIO`，脚本会失败并提示需要更多可用空间，避免为了触发 evict 写满盘。
+
+Falcon 启动阶段还要求当前空闲比例高于 `bgFreeRatio = 1.1 - STORAGE_THRESHOLD`。因此自动模式会保证水位线至少高于当前已用比例 `AUTO_EVICT_START_MARGIN_RATIO`，默认是 12 个百分点。水位线会放在计划写入量靠后的阶段：
+
+```text
+threshold >= used_ratio + AUTO_EVICT_START_MARGIN_RATIO
+threshold ~= (used_bytes + planned_write_bytes * AUTO_EVICT_TRIGGER_RATIO) / total_bytes
+```
+
+这样在不同容量、不同已用空间的 NVMe 盘上，P-3 会自动提高文件数，直到计划写入量足够跨过启动安全水位并触发 DiskCache evict。实际使用的参数会写入：
+
+```text
+$OUT_DIR/evict_config.txt
+```
+
+如果只想固定使用手动水位线，可以关闭自动模式：
+
+```bash
+AUTO_EVICT_CONFIG=0 EVICT_THRESHOLD=0.72 bash tools/run_pyfalcon_client_benchmark.sh P-3
+```
+
+## 7. 输出文件
 
 完整执行后会生成：
 
@@ -154,6 +201,7 @@ $OUT_DIR/run.log
 $OUT_DIR/benchmark_summary.md
 $OUT_DIR/benchmark_summary.log
 $OUT_DIR/storage_info.txt
+$OUT_DIR/evict_config.txt
 $OUT_DIR/python/P-1.json
 $OUT_DIR/python/P-2.json
 $OUT_DIR/python/P-3.json
@@ -179,6 +227,7 @@ $OUT_DIR/fio/B-5.json
 | `benchmark_summary.md` | 类似性能测试结果文档的最终汇总表，包含 Python internal 和 fio 基准 |
 | `benchmark_summary.log` | 与 `benchmark_summary.md` 内容一致，便于直接归档或 `cat` 查看 |
 | `storage_info.txt` | 记录 `OUT_DIR/CACHE_ROOT/FIO_DIR/metadata workspace` 对应的挂载点、设备和文件系统类型 |
+| `evict_config.txt` | 记录 P-3 自动计算出的 `threshold`、实际 `files`、磁盘总量/已用量/计划写入量 |
 
 重点字段：
 
@@ -221,7 +270,7 @@ fio 结果字段：
 | `B-4.json` | 多文件 direct 读基准 |
 | `B-5.json` | 本地多文件删除基准，字段包含 `delete_files_per_sec` 和 `delete_mib_per_sec` |
 
-## 7. 环境清理
+## 8. 环境清理
 
 脚本每个 Python internal case 前都会清理：
 
@@ -256,7 +305,7 @@ $CACHE_ROOT
 ss -ltnp | grep -E ':(55500|55510|55520|55530|56039)([[:space:]]|$)' || true
 ```
 
-## 8. NVMe 检查
+## 9. NVMe 检查
 
 默认 `REQUIRE_NVME=1`。如果没有显式传 `BENCHMARK_ROOT`，脚本会先尝试使用可写的 `/data4/hxing`；如果这个目录不存在或不可写，才会回落到 `/tmp`，此时 NVMe 检查会失败并提示设置 `BENCHMARK_ROOT=/data4/hxing`。脚本启动后会用 `findmnt -T` 和 `lsblk` 检查以下路径所在设备：
 
@@ -279,7 +328,7 @@ BENCHMARK_ROOT=/data4/hxing bash tools/run_pyfalcon_client_benchmark.sh all
 REQUIRE_NVME=0 bash tools/run_pyfalcon_client_benchmark.sh B-5
 ```
 
-## 9. 常见问题
+## 10. 常见问题
 
 如果看到：
 

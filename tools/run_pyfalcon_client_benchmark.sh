@@ -32,6 +32,15 @@ FIO_SIZE="${FIO_SIZE:-2G}"
 REQUIRE_NVME="${REQUIRE_NVME:-1}"
 WRITE_THRESHOLD="${WRITE_THRESHOLD:-1}"
 EVICT_THRESHOLD="${EVICT_THRESHOLD:-0.72}"
+AUTO_EVICT_CONFIG="${AUTO_EVICT_CONFIG:-1}"
+AUTO_EVICT_WRITE_RATIO="${AUTO_EVICT_WRITE_RATIO:-0.01}"
+AUTO_EVICT_MIN_WRITE_BYTES="${AUTO_EVICT_MIN_WRITE_BYTES:-12884901888}"
+AUTO_EVICT_MAX_WRITE_BYTES="${AUTO_EVICT_MAX_WRITE_BYTES:-0}"
+AUTO_EVICT_MAX_AVAIL_RATIO="${AUTO_EVICT_MAX_AVAIL_RATIO:-0.60}"
+AUTO_EVICT_TRIGGER_RATIO="${AUTO_EVICT_TRIGGER_RATIO:-0.90}"
+AUTO_EVICT_INIT_MARGIN_BYTES="${AUTO_EVICT_INIT_MARGIN_BYTES:-1073741824}"
+AUTO_EVICT_START_MARGIN_RATIO="${AUTO_EVICT_START_MARGIN_RATIO:-0.12}"
+AUTO_EVICT_MAX_THRESHOLD="${AUTO_EVICT_MAX_THRESHOLD:-0.98}"
 IDLE_WAIT_SEC="${IDLE_WAIT_SEC:-900}"
 SCENARIO="${1:-all}"
 FAILED_CASES=()
@@ -70,6 +79,15 @@ Environment overrides:
   REQUIRE_NVME=${REQUIRE_NVME}
   WRITE_THRESHOLD=${WRITE_THRESHOLD}
   EVICT_THRESHOLD=${EVICT_THRESHOLD}
+  AUTO_EVICT_CONFIG=${AUTO_EVICT_CONFIG}
+  AUTO_EVICT_WRITE_RATIO=${AUTO_EVICT_WRITE_RATIO}
+  AUTO_EVICT_MIN_WRITE_BYTES=${AUTO_EVICT_MIN_WRITE_BYTES}
+  AUTO_EVICT_MAX_WRITE_BYTES=${AUTO_EVICT_MAX_WRITE_BYTES}
+  AUTO_EVICT_MAX_AVAIL_RATIO=${AUTO_EVICT_MAX_AVAIL_RATIO}
+  AUTO_EVICT_TRIGGER_RATIO=${AUTO_EVICT_TRIGGER_RATIO}
+  AUTO_EVICT_INIT_MARGIN_BYTES=${AUTO_EVICT_INIT_MARGIN_BYTES}
+  AUTO_EVICT_START_MARGIN_RATIO=${AUTO_EVICT_START_MARGIN_RATIO}
+  AUTO_EVICT_MAX_THRESHOLD=${AUTO_EVICT_MAX_THRESHOLD}
   CONFIG_FILE_PATH=${CONFIG_FILE_PATH}
   PYTHON_INTERFACE=${PYTHON_INTERFACE}
 
@@ -143,6 +161,12 @@ write_storage_info() {
     local meta_root
     {
         echo "benchmark_root=${BENCHMARK_ROOT:-N/A}"
+        echo "auto_evict_config=$AUTO_EVICT_CONFIG"
+        echo "auto_evict_write_ratio=$AUTO_EVICT_WRITE_RATIO"
+        echo "auto_evict_min_write_bytes=$AUTO_EVICT_MIN_WRITE_BYTES"
+        echo "auto_evict_max_write_bytes=$AUTO_EVICT_MAX_WRITE_BYTES"
+        echo "auto_evict_trigger_ratio=$AUTO_EVICT_TRIGGER_RATIO"
+        echo "auto_evict_start_margin_ratio=$AUTO_EVICT_START_MARGIN_RATIO"
         path_device_info "$OUT_DIR"
         path_device_info "$FIO_DIR"
         if scenario_uses_falcon; then
@@ -316,6 +340,199 @@ stop_idle_server() {
     fi
 }
 
+bytes_to_mib() {
+    awk -v bytes="$1" 'BEGIN { printf "%.2f", bytes / 1048576.0 }'
+}
+
+configure_auto_evict_case() {
+    local current_threshold="$1"
+    local total used avail
+    local plan_file="$OUT_DIR/evict_config.txt"
+    local plan_error_file="$OUT_DIR/evict_config.err"
+
+    if [[ "$AUTO_EVICT_CONFIG" != "1" ]]; then
+        AUTO_EVICT_CASE_THRESHOLD="$current_threshold"
+        AUTO_EVICT_CASE_FILES="$FILES"
+        {
+            echo "auto_evict_config=0"
+            echo "threshold=$AUTO_EVICT_CASE_THRESHOLD"
+            echo "files=$AUTO_EVICT_CASE_FILES"
+            echo "reason=disabled"
+        } > "$plan_file"
+        log "auto evict disabled: threshold=${AUTO_EVICT_CASE_THRESHOLD}, files=${AUTO_EVICT_CASE_FILES}"
+        return 0
+    fi
+
+    mkdir -p "$CACHE_ROOT"
+    read -r total used avail < <(df -B1 --output=size,used,avail "$CACHE_ROOT" | awk 'NR==2 {print $1, $2, $3}')
+    if [[ -z "${total:-}" || -z "${used:-}" || -z "${avail:-}" ]]; then
+        echo "failed to read filesystem space for CACHE_ROOT=$CACHE_ROOT" >&2
+        {
+            echo "auto_evict_config=1"
+            echo "status=failed"
+            echo "reason=failed to read filesystem space for CACHE_ROOT=$CACHE_ROOT"
+        } > "$plan_file"
+        return 1
+    fi
+
+    local plan
+    plan="$(
+        TOTAL_BYTES="$total" \
+        USED_BYTES="$used" \
+        AVAIL_BYTES="$avail" \
+        FILES_VALUE="$FILES" \
+        FILE_SIZE_VALUE="$FILE_SIZE" \
+        AUTO_EVICT_WRITE_RATIO_VALUE="$AUTO_EVICT_WRITE_RATIO" \
+        AUTO_EVICT_MIN_WRITE_BYTES_VALUE="$AUTO_EVICT_MIN_WRITE_BYTES" \
+        AUTO_EVICT_MAX_WRITE_BYTES_VALUE="$AUTO_EVICT_MAX_WRITE_BYTES" \
+        AUTO_EVICT_MAX_AVAIL_RATIO_VALUE="$AUTO_EVICT_MAX_AVAIL_RATIO" \
+        AUTO_EVICT_TRIGGER_RATIO_VALUE="$AUTO_EVICT_TRIGGER_RATIO" \
+        AUTO_EVICT_INIT_MARGIN_BYTES_VALUE="$AUTO_EVICT_INIT_MARGIN_BYTES" \
+        AUTO_EVICT_START_MARGIN_RATIO_VALUE="$AUTO_EVICT_START_MARGIN_RATIO" \
+        AUTO_EVICT_MAX_THRESHOLD_VALUE="$AUTO_EVICT_MAX_THRESHOLD" \
+        python3 - 2>"$plan_error_file" <<'PYAUTO'
+import math
+import os
+
+total = int(os.environ["TOTAL_BYTES"])
+used = int(os.environ["USED_BYTES"])
+avail = int(os.environ["AVAIL_BYTES"])
+files = int(os.environ["FILES_VALUE"])
+file_size = int(os.environ["FILE_SIZE_VALUE"])
+write_ratio = float(os.environ["AUTO_EVICT_WRITE_RATIO_VALUE"])
+min_write = int(os.environ["AUTO_EVICT_MIN_WRITE_BYTES_VALUE"])
+max_write = int(os.environ["AUTO_EVICT_MAX_WRITE_BYTES_VALUE"])
+max_avail_ratio = float(os.environ["AUTO_EVICT_MAX_AVAIL_RATIO_VALUE"])
+trigger_ratio = float(os.environ["AUTO_EVICT_TRIGGER_RATIO_VALUE"])
+init_margin = int(os.environ["AUTO_EVICT_INIT_MARGIN_BYTES_VALUE"])
+start_margin_ratio = float(os.environ["AUTO_EVICT_START_MARGIN_RATIO_VALUE"])
+max_threshold = float(os.environ["AUTO_EVICT_MAX_THRESHOLD_VALUE"])
+
+if total <= 0 or file_size <= 0:
+    raise SystemExit("invalid total bytes or file size")
+if not (0.0 < trigger_ratio < 1.0):
+    raise SystemExit("AUTO_EVICT_TRIGGER_RATIO must be in (0, 1)")
+if not (0.0 < max_avail_ratio <= 1.0):
+    raise SystemExit("AUTO_EVICT_MAX_AVAIL_RATIO must be in (0, 1]")
+if not (0.0 < max_threshold < 1.0):
+    raise SystemExit("AUTO_EVICT_MAX_THRESHOLD must be in (0, 1)")
+if not (0.0 < start_margin_ratio < 1.0):
+    raise SystemExit("AUTO_EVICT_START_MARGIN_RATIO must be in (0, 1)")
+
+requested_write = files * file_size
+ratio_target = int(total * write_ratio)
+soft_target = max(ratio_target, min_write)
+if max_write > 0:
+    soft_target = min(soft_target, max_write)
+
+desired_write = max(requested_write, soft_target)
+used_ratio = used / total
+start_floor_ratio = min(max_threshold, used_ratio + start_margin_ratio)
+start_floor_bytes = int(total * start_floor_ratio)
+required_to_cross_start_floor = max(0, start_floor_bytes - used)
+required_write_for_threshold = int(math.ceil(required_to_cross_start_floor / trigger_ratio)) if required_to_cross_start_floor > 0 else 0
+desired_write = max(desired_write, required_write_for_threshold)
+
+if max_write > 0 and desired_write > max_write:
+    raise SystemExit(
+        "auto evict needs %.2f MiB to cross startup-safe threshold, but AUTO_EVICT_MAX_WRITE_BYTES allows only %.2f MiB; "
+        "increase AUTO_EVICT_MAX_WRITE_BYTES or reduce AUTO_EVICT_START_MARGIN_RATIO"
+        % (desired_write / 1048576.0, max_write / 1048576.0)
+    )
+
+safe_auto_write = int(avail * max_avail_ratio)
+if safe_auto_write > 0 and desired_write > safe_auto_write:
+    raise SystemExit(
+        "auto evict needs %.2f MiB to cross startup-safe threshold, but safe limit is %.2f MiB; "
+        "increase free space, reduce AUTO_EVICT_START_MARGIN_RATIO, or increase AUTO_EVICT_MAX_AVAIL_RATIO"
+        % (desired_write / 1048576.0, safe_auto_write / 1048576.0)
+    )
+
+auto_files = max(files, int(math.ceil(desired_write / file_size)))
+write_bytes = auto_files * file_size
+margin = max(init_margin, file_size * 4)
+low = max(used + margin, start_floor_bytes)
+high = used + write_bytes - margin
+if high <= low:
+    needed = int(math.ceil(((low - used) + margin) / file_size))
+    auto_files = max(auto_files, needed)
+    write_bytes = auto_files * file_size
+    high = used + write_bytes - margin
+if high <= low:
+    raise SystemExit("not enough write bytes to place an evict threshold safely")
+
+threshold_bytes = used + int(write_bytes * trigger_ratio)
+threshold_bytes = max(threshold_bytes, low)
+threshold_bytes = min(threshold_bytes, high)
+max_threshold_bytes = int(total * max_threshold)
+if threshold_bytes > max_threshold_bytes:
+    threshold_bytes = max_threshold_bytes
+if threshold_bytes <= used or threshold_bytes >= used + write_bytes:
+    raise SystemExit("cannot compute threshold between current usage and planned final usage")
+
+threshold = threshold_bytes / total
+final_ratio = (used + write_bytes) / total
+write_ratio_actual = write_bytes / total
+print(f"threshold={threshold:.6f}")
+print(f"files={auto_files}")
+print(f"total_bytes={total}")
+print(f"used_bytes={used}")
+print(f"avail_bytes={avail}")
+print(f"write_bytes={write_bytes}")
+print(f"requested_files={files}")
+print(f"requested_write_bytes={requested_write}")
+print(f"used_ratio={used_ratio:.6f}")
+print(f"final_ratio={final_ratio:.6f}")
+print(f"write_ratio={write_ratio_actual:.6f}")
+print(f"trigger_ratio={trigger_ratio:.6f}")
+print(f"start_margin_ratio={start_margin_ratio:.6f}")
+print(f"start_floor_ratio={start_floor_ratio:.6f}")
+print(f"required_write_for_threshold_bytes={required_write_for_threshold}")
+PYAUTO
+    )" || {
+        {
+            echo "auto_evict_config=1"
+            echo "status=failed"
+            echo "cache_root=$CACHE_ROOT"
+            echo "total_bytes=$total"
+            echo "used_bytes=$used"
+            echo "avail_bytes=$avail"
+            printf 'reason='
+            tr '\n' ' ' < "$plan_error_file"
+            printf '\n'
+        } > "$plan_file"
+        cat "$plan_error_file" >&2 || true
+        return 1
+    }
+
+    AUTO_EVICT_CASE_THRESHOLD=""
+    AUTO_EVICT_CASE_FILES=""
+    while IFS='=' read -r key value; do
+        case "$key" in
+            threshold) AUTO_EVICT_CASE_THRESHOLD="$value" ;;
+            files) AUTO_EVICT_CASE_FILES="$value" ;;
+        esac
+    done <<< "$plan"
+
+    if [[ -z "$AUTO_EVICT_CASE_THRESHOLD" || -z "$AUTO_EVICT_CASE_FILES" ]]; then
+        echo "invalid auto evict plan:" >&2
+        echo "$plan" >&2
+        return 1
+    fi
+
+    {
+        echo "auto_evict_config=1"
+        echo "$plan"
+        echo "cache_root=$CACHE_ROOT"
+    } > "$plan_file"
+
+    log "auto evict plan: threshold=${AUTO_EVICT_CASE_THRESHOLD}, files=${AUTO_EVICT_CASE_FILES}, write=$(bytes_to_mib $((AUTO_EVICT_CASE_FILES * FILE_SIZE)))MiB, cache_fs=$(path_device_info "$CACHE_ROOT")"
+    if (( AUTO_EVICT_CASE_FILES > FILES )); then
+        log "auto evict increased P-3 files from ${FILES} to ${AUTO_EVICT_CASE_FILES} to cross the evict threshold on this filesystem"
+    fi
+    return 0
+}
+
 run_fio_case() {
     local case_id="$1"
     local fio_files_per_job=$(( (FILES + CLIENTS - 1) / CLIENTS ))
@@ -468,20 +685,27 @@ run_case() {
     local case_id="$1"
     local mode="$2"
     local threshold="$3"
-    local status
+    local status case_files case_threshold
+    case_files="$FILES"
+    case_threshold="$threshold"
     ensure_binary || return 1
     clean_runtime || return 1
+    if [[ "$mode" == "create_evict" ]]; then
+        configure_auto_evict_case "$threshold" || return 1
+        case_threshold="$AUTO_EVICT_CASE_THRESHOLD"
+        case_files="$AUTO_EVICT_CASE_FILES"
+    fi
     prepare_cache_dirs || return 1
     mkdir -p "$OUT_DIR/python" "$OUT_DIR/work_${case_id}" || return 1
-    start_meta "$threshold" || return 1
-    start_idle_server "$threshold" "$case_id" || return 1
-    log "running ${case_id}: mode=${mode}, clients=${CLIENTS}, files=${FILES}, file_size=${FILE_SIZE}"
+    start_meta "$case_threshold" || return 1
+    start_idle_server "$case_threshold" "$case_id" || return 1
+    log "running ${case_id}: mode=${mode}, clients=${CLIENTS}, files=${case_files}, file_size=${FILE_SIZE}, threshold=${case_threshold}"
     (
         cd "$ROOT_DIR"
-        STORAGE_THRESHOLD="$threshold" python3 "$ROOT_DIR/tools/pyfalcon_client_perf.py" \
+        STORAGE_THRESHOLD="$case_threshold" python3 "$ROOT_DIR/tools/pyfalcon_client_perf.py" \
             --mode "$mode" \
             --clients "$CLIENTS" \
-            --files "$FILES" \
+            --files "$case_files" \
             --unlink-files "$UNLINK_FILES" \
             --file-size "$FILE_SIZE" \
             --wait-sec "$WAIT_SEC" \
