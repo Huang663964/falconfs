@@ -51,6 +51,29 @@ log() {
     printf '[%s] %s\n' "$(date '+%F %T')" "$*"
 }
 
+port_listeners() {
+    local pattern="$1"
+    local use_sudo="${2:-}"
+    local ss_cmd=(ss -ltnp)
+    if [[ "$use_sudo" == "sudo" ]]; then
+        ss_cmd=(sudo ss -ltnp)
+    fi
+
+    if command -v rg >/dev/null 2>&1; then
+        "${ss_cmd[@]}" | rg "$pattern" || true
+    else
+        "${ss_cmd[@]}" | grep -E "$pattern" || true
+    fi
+}
+
+falcon_port_listeners() {
+    port_listeners ':(55500|55510|55520|55530|56039)([[:space:]]|$)' sudo
+}
+
+idle_server_port_listeners() {
+    port_listeners ':(56039)([[:space:]]|$)'
+}
+
 source_falcon_env() {
     set +u
     source "$ROOT_DIR/deploy/falcon_env.sh"
@@ -66,15 +89,15 @@ ensure_binary() {
 
 release_ports() {
     for _ in $(seq 1 20); do
-        if ! sudo ss -ltnp | rg ':(55500|55510|55520|55530|56039)\b' >/dev/null; then
+        if [[ -z "$(falcon_port_listeners)" ]]; then
             return 0
         fi
         sudo fuser -k 55500/tcp 55510/tcp 55520/tcp 55530/tcp 56039/tcp >/dev/null 2>&1 || true
         sleep 0.5
     done
-    if sudo ss -ltnp | rg ':(55500|55510|55520|55530|56039)\b' >/dev/null; then
+    if [[ -n "$(falcon_port_listeners)" ]]; then
         echo "default Falcon ports are still busy:" >&2
-        sudo ss -ltnp | rg ':(55500|55510|55520|55530|56039)\b' >&2 || true
+        falcon_port_listeners >&2 || true
         exit 1
     fi
 }
@@ -123,7 +146,7 @@ start_idle_server() {
     ) >"$OUT_DIR/python/${case_id}-idle.log" 2>&1 &
     IDLE_PID=$!
     for _ in $(seq 1 30); do
-        if ss -ltnp | rg ':(56039)\b' >/dev/null; then
+        if [[ -n "$(idle_server_port_listeners)" ]]; then
             return 0
         fi
         sleep 1
