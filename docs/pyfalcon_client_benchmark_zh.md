@@ -228,6 +228,8 @@ $OUT_DIR/fio/B-5.json
 | `benchmark_summary.log` | 与 `benchmark_summary.md` 内容一致，便于直接归档或 `cat` 查看 |
 | `storage_info.txt` | 记录 `OUT_DIR/CACHE_ROOT/FIO_DIR/metadata workspace` 对应的挂载点、设备和文件系统类型 |
 | `evict_config.txt` | 记录 P-3 自动计算出的 `threshold`、实际 `files`、磁盘总量/已用量/计划写入量 |
+| `python/P-*.log` | 记录对应 Python internal case 的 stdout/stderr，case 失败时会自动打印尾部到 `run.log` |
+| `python/P-*-meta.log` | 记录对应 case 启动 Falcon meta service 的输出，case 失败时会自动打印尾部到 `run.log` |
 
 重点字段：
 

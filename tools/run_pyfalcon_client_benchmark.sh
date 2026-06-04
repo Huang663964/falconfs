@@ -289,14 +289,16 @@ prepare_cache_dirs() {
 
 start_meta() {
     local threshold="$1"
+    local case_id="${2:-meta}"
+    local meta_log="$OUT_DIR/python/${case_id}-meta.log"
     log "starting Falcon meta services, STORAGE_THRESHOLD=${threshold}"
     (
         cd "$ROOT_DIR"
         source_falcon_env
         STORAGE_THRESHOLD="$threshold" bash "$ROOT_DIR/deploy/meta/falcon_meta_start.sh"
-    ) >/tmp/pyfalcon_benchmark_meta.log 2>&1 || {
+    ) >"$meta_log" 2>&1 || {
         echo "failed to start Falcon meta services" >&2
-        cat /tmp/pyfalcon_benchmark_meta.log >&2 || true
+        cat "$meta_log" >&2 || true
         return 1
     }
     sleep 3
@@ -655,6 +657,77 @@ write_summary() {
         --fio-size "$FIO_SIZE"
 }
 
+print_python_case_diagnostics() {
+    local case_id="$1"
+    local case_json="$OUT_DIR/python/${case_id}.json"
+    local case_log="$OUT_DIR/python/${case_id}.log"
+    local idle_log="$OUT_DIR/python/${case_id}-idle.log"
+    local meta_log="$OUT_DIR/python/${case_id}-meta.log"
+
+    [[ "$case_id" != P-* ]] && return 0
+    log "diagnostics for ${case_id}"
+    if [[ -f "$case_json" ]]; then
+        python3 - "$case_json" <<'PYDIAG' || true
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+print(f"json={path}")
+print(f"mode={data.get('mode', 'N/A')}, error_count={data.get('error_count', 'N/A')}")
+
+def show_group(name, group):
+    if not isinstance(group, dict):
+        return
+    errors = group.get("errors") or []
+    if group.get("error_count", 0) or errors:
+        print(f"{name}.error_count={group.get('error_count', 0)}")
+    for item in errors[:10]:
+        print(
+            "%s error role=%s client=%s files=%s elapsed=%s msg=%s"
+            % (
+                name,
+                item.get("role", "N/A"),
+                item.get("client_id", "N/A"),
+                item.get("files", "N/A"),
+                item.get("elapsed_sec", "N/A"),
+                item.get("error", ""),
+            )
+        )
+    for item in (group.get("per_client") or []):
+        if item.get("error"):
+            print(
+                "%s per_client error role=%s client=%s files=%s elapsed=%s msg=%s"
+                % (
+                    name,
+                    item.get("role", "N/A"),
+                    item.get("client_id", "N/A"),
+                    item.get("files", "N/A"),
+                    item.get("elapsed_sec", "N/A"),
+                    item.get("error", ""),
+                )
+            )
+
+for name in ("create", "unlink", "prepare", "writer", "deleter"):
+    show_group(name, data.get(name))
+
+for item in (data.get("errors") or [])[:10]:
+    print(f"top error: {item}")
+PYDIAG
+    else
+        log "missing json for ${case_id}: ${case_json}"
+    fi
+
+    for file in "$case_log" "$idle_log" "$meta_log"; do
+        if [[ -f "$file" ]]; then
+            log "tail ${file}"
+            tail -n 80 "$file" || true
+        fi
+    done
+}
+
 run_step() {
     local case_id="$1"
     shift
@@ -674,6 +747,7 @@ run_step() {
 
     log "case ${case_id} failed, status=${status}, elapsed=${elapsed}s"
     FAILED_CASES+=("${case_id}:${status}")
+    print_python_case_diagnostics "$case_id"
     stop_idle_server 2>/dev/null || true
     if [[ "$case_id" == P-* ]]; then
         clean_runtime || true
@@ -697,7 +771,7 @@ run_case() {
     fi
     prepare_cache_dirs || return 1
     mkdir -p "$OUT_DIR/python" "$OUT_DIR/work_${case_id}" || return 1
-    start_meta "$case_threshold" || return 1
+    start_meta "$case_threshold" "$case_id" || return 1
     start_idle_server "$case_threshold" "$case_id" || return 1
     log "running ${case_id}: mode=${mode}, clients=${CLIENTS}, files=${case_files}, file_size=${FILE_SIZE}, threshold=${case_threshold}"
     (
@@ -714,7 +788,7 @@ run_case() {
             --config "$CONFIG_FILE_PATH" \
             --python-interface "$PYTHON_INTERFACE" \
             --output "$OUT_DIR/python/${case_id}.json"
-    )
+    ) >"$OUT_DIR/python/${case_id}.log" 2>&1
     status=$?
     stop_idle_server
     return "$status"
