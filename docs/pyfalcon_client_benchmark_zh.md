@@ -124,6 +124,7 @@ bash tools/run_pyfalcon_client_benchmark.sh B-5
 
 | 参数 | 默认值 | 说明 |
 | --- | ---: | --- |
+| `DEFAULT_BENCHMARK_ROOT` | `/data4/hxing` | 未显式设置 `BENCHMARK_ROOT` 时，如果该目录存在且可写，会自动作为测试根目录 |
 | `BENCHMARK_ROOT` | 空 | 测试根目录；设置为 `/data4/hxing` 后，默认 `OUT_DIR`、`CACHE_ROOT`、`FIO_DIR` 都在 `/data4/hxing` 下 |
 | `OUT_DIR` | `/tmp/pyfalcon_client_benchmark_<timestamp>` 或 `$BENCHMARK_ROOT/pyfalcon_client_benchmark_<timestamp>` | 输出目录，保留最终结果和日志 |
 | `CLIENTS` | 4 | 每组 Python client 进程数 |
@@ -255,7 +256,7 @@ ss -ltnp | grep -E ':(55500|55510|55520|55530|56039)([[:space:]]|$)' || true
 
 ## 8. NVMe 检查
 
-默认 `REQUIRE_NVME=1`，脚本启动后会用 `findmnt -T` 和 `lsblk` 检查以下路径所在设备：
+默认 `REQUIRE_NVME=1`。如果没有显式传 `BENCHMARK_ROOT`，脚本会先尝试使用可写的 `/data4/hxing`；如果这个目录不存在或不可写，才会回落到 `/tmp`，此时 NVMe 检查会失败并提示设置 `BENCHMARK_ROOT=/data4/hxing`。脚本启动后会用 `findmnt -T` 和 `lsblk` 检查以下路径所在设备：
 
 ```text
 OUT_DIR

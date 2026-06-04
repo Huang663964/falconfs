@@ -4,7 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
+DEFAULT_BENCHMARK_ROOT="${DEFAULT_BENCHMARK_ROOT:-/data4/hxing}"
 BENCHMARK_ROOT="${BENCHMARK_ROOT:-${PERF_ROOT:-}}"
+if [[ -z "$BENCHMARK_ROOT" && -d "$DEFAULT_BENCHMARK_ROOT" && -w "$DEFAULT_BENCHMARK_ROOT" ]]; then
+    BENCHMARK_ROOT="$DEFAULT_BENCHMARK_ROOT"
+fi
 if [[ -n "$BENCHMARK_ROOT" ]]; then
     mkdir -p "$BENCHMARK_ROOT"
     BENCHMARK_ROOT="$(readlink -f "$BENCHMARK_ROOT")"
@@ -51,6 +55,7 @@ Scenarios:
   B-5    local multi-file delete baseline after fio create.
 
 Environment overrides:
+  DEFAULT_BENCHMARK_ROOT=${DEFAULT_BENCHMARK_ROOT}
   BENCHMARK_ROOT=${BENCHMARK_ROOT:-}
   OUT_DIR=${OUT_DIR}
   CLIENTS=${CLIENTS}
