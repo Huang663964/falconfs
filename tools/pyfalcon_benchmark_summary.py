@@ -23,8 +23,11 @@ FIO_CASES = {
 def load_json(path):
     if not path.exists():
         return None
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as exc:
+        return {"_load_error": f"invalid json: {exc}"}
 
 
 def fmt_num(value, digits=2):
@@ -57,6 +60,8 @@ def fmt_rate(files_per_sec, mib_per_sec):
 def python_row(case_id, data):
     if data is None:
         return [case_id, PYTHON_CASES[case_id], "N/A", "N/A", "N/A", "N/A", "缺失"]
+    if data.get("_load_error"):
+        return [case_id, PYTHON_CASES[case_id], "N/A", "N/A", "N/A", "N/A", data["_load_error"]]
     error = data.get("error_count", 0)
     if case_id == "P-2":
         create = data.get("create", {})
@@ -157,6 +162,8 @@ def fio_metric(data, rw):
 def fio_row(case_id, data):
     if data is None:
         return [case_id, FIO_CASES[case_id], "N/A", "N/A", "N/A", "缺失"]
+    if data.get("_load_error"):
+        return [case_id, FIO_CASES[case_id], "N/A", "N/A", "N/A", data["_load_error"]]
     if case_id == "B-5":
         return [
             case_id,

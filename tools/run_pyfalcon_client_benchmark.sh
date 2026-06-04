@@ -34,6 +34,7 @@ WRITE_THRESHOLD="${WRITE_THRESHOLD:-1}"
 EVICT_THRESHOLD="${EVICT_THRESHOLD:-0.72}"
 IDLE_WAIT_SEC="${IDLE_WAIT_SEC:-900}"
 SCENARIO="${1:-all}"
+FAILED_CASES=()
 
 usage() {
     cat <<EOF
@@ -238,7 +239,7 @@ release_ports() {
     if [[ -n "$(falcon_port_listeners)" ]]; then
         echo "default Falcon ports are still busy:" >&2
         falcon_port_listeners >&2 || true
-        exit 1
+        return 1
     fi
 }
 
@@ -269,7 +270,11 @@ start_meta() {
         cd "$ROOT_DIR"
         source_falcon_env
         STORAGE_THRESHOLD="$threshold" bash "$ROOT_DIR/deploy/meta/falcon_meta_start.sh"
-    ) >/tmp/pyfalcon_benchmark_meta.log 2>&1
+    ) >/tmp/pyfalcon_benchmark_meta.log 2>&1 || {
+        echo "failed to start Falcon meta services" >&2
+        cat /tmp/pyfalcon_benchmark_meta.log >&2 || true
+        return 1
+    }
     sleep 3
 }
 
@@ -298,7 +303,9 @@ start_idle_server() {
     echo "idle RemoteIOServer did not start for ${case_id}" >&2
     cat "$OUT_DIR/python/${case_id}-idle.log" >&2 || true
     kill "$IDLE_PID" 2>/dev/null || true
-    exit 1
+    wait "$IDLE_PID" 2>/dev/null || true
+    IDLE_PID=""
+    return 1
 }
 
 stop_idle_server() {
@@ -323,7 +330,7 @@ run_fio_case() {
             fio --output="$OUT_DIR/fio/B-1.json" --output-format=json \
                 --name=pyfalcon_fio_single_write --directory="$FIO_DIR/single_write" \
                 --nrfiles=1 --rw=write --size="$FIO_SIZE" --bs=2M \
-                --iodepth=1 --numjobs="$CLIENTS" --direct=1 --group_reporting=1
+                --iodepth=1 --numjobs="$CLIENTS" --direct=1 --group_reporting=1 || return 1
             rm -rf "$FIO_DIR/single_write"
             ;;
         B-2)
@@ -333,11 +340,11 @@ run_fio_case() {
             fio --output="$OUT_DIR/fio/B-2-prepare.json" --output-format=json \
                 --name=pyfalcon_fio_single_read_prepare --directory="$FIO_DIR/single_read" \
                 --nrfiles=1 --rw=write --size="$FIO_SIZE" --bs=2M \
-                --iodepth=1 --numjobs="$CLIENTS" --direct=1 --group_reporting=1
+                --iodepth=1 --numjobs="$CLIENTS" --direct=1 --group_reporting=1 || return 1
             fio --output="$OUT_DIR/fio/B-2.json" --output-format=json \
                 --name=pyfalcon_fio_single_read --directory="$FIO_DIR/single_read" \
                 --nrfiles=1 --rw=read --size="$FIO_SIZE" --bs=2M \
-                --iodepth=1 --numjobs="$CLIENTS" --direct=1 --group_reporting=1
+                --iodepth=1 --numjobs="$CLIENTS" --direct=1 --group_reporting=1 || return 1
             rm -rf "$FIO_DIR/single_read"
             ;;
         B-3)
@@ -348,18 +355,18 @@ run_fio_case() {
                 --name=pyfalcon_fio_multi_write --directory="$FIO_DIR/multi" \
                 --nrfiles="$fio_files_per_job" --filesize="$FILE_SIZE" \
                 --rw=write --bs=2M --iodepth=1 --numjobs="$CLIENTS" --direct=1 \
-                --openfiles=1 --file_service_type=sequential --group_reporting=1 --unlink=0
+                --openfiles=1 --file_service_type=sequential --group_reporting=1 --unlink=0 || return 1
             ;;
         B-4)
             log "running B-4: fio multi-file direct read, jobs=${CLIENTS}, files=${FILES}, file_size=${FILE_SIZE}"
             if [[ ! -d "$FIO_DIR/multi" ]] || [[ "$(find "$FIO_DIR/multi" -type f | wc -l)" -eq 0 ]]; then
-                run_fio_case B-3
+                run_fio_case B-3 || return 1
             fi
             fio --output="$OUT_DIR/fio/B-4.json" --output-format=json \
                 --name=pyfalcon_fio_multi_read --directory="$FIO_DIR/multi" \
                 --nrfiles="$fio_files_per_job" --filesize="$FILE_SIZE" \
                 --rw=read --bs=2M --iodepth=1 --numjobs="$CLIENTS" --direct=1 \
-                --openfiles=1 --file_service_type=sequential --group_reporting=1 --unlink=0
+                --openfiles=1 --file_service_type=sequential --group_reporting=1 --unlink=0 || return 1
             rm -rf "$FIO_DIR/multi"
             ;;
         B-5)
@@ -370,7 +377,7 @@ run_fio_case() {
                 --name=pyfalcon_fio_delete_prepare --directory="$FIO_DIR/delete" \
                 --nrfiles="$fio_unlink_files_per_job" --filesize="$FILE_SIZE" \
                 --rw=write --bs=2M --iodepth=1 --numjobs="$CLIENTS" --direct=1 \
-                --openfiles=1 --file_service_type=sequential --group_reporting=1 --unlink=0
+                --openfiles=1 --file_service_type=sequential --group_reporting=1 --unlink=0 || return 1
             local count_before start_ns end_ns elapsed_ns count_after
             count_before="$(find "$FIO_DIR/delete" -type f | wc -l)"
             start_ns="$(date +%s%N)"
@@ -405,18 +412,18 @@ PY2
 }
 
 run_python_group() {
-    run_case P-1 write_only "$WRITE_THRESHOLD"
-    run_case P-2 unlink_only "$WRITE_THRESHOLD"
-    run_case P-3 create_evict "$EVICT_THRESHOLD"
-    run_case P-5 concurrent_unlink "$WRITE_THRESHOLD"
+    run_step P-1 run_case P-1 write_only "$WRITE_THRESHOLD"
+    run_step P-2 run_case P-2 unlink_only "$WRITE_THRESHOLD"
+    run_step P-3 run_case P-3 create_evict "$EVICT_THRESHOLD"
+    run_step P-5 run_case P-5 concurrent_unlink "$WRITE_THRESHOLD"
 }
 
 run_fio_group() {
-    run_fio_case B-1
-    run_fio_case B-2
-    run_fio_case B-3
-    run_fio_case B-4
-    run_fio_case B-5
+    run_step B-1 run_fio_case B-1
+    run_step B-2 run_fio_case B-2
+    run_step B-3 run_fio_case B-3
+    run_step B-4 run_fio_case B-4
+    run_step B-5 run_fio_case B-5
 }
 
 write_summary() {
@@ -431,16 +438,43 @@ write_summary() {
         --fio-size "$FIO_SIZE"
 }
 
+run_step() {
+    local case_id="$1"
+    shift
+    local start_ts end_ts elapsed status
+    start_ts="$(date +%s)"
+    log "case ${case_id} begin"
+    set +e
+    "$@"
+    status=$?
+    set -e
+    end_ts="$(date +%s)"
+    elapsed=$((end_ts - start_ts))
+    if [[ "$status" -eq 0 ]]; then
+        log "case ${case_id} finished, elapsed=${elapsed}s"
+        return 0
+    fi
+
+    log "case ${case_id} failed, status=${status}, elapsed=${elapsed}s"
+    FAILED_CASES+=("${case_id}:${status}")
+    stop_idle_server 2>/dev/null || true
+    if [[ "$case_id" == P-* ]]; then
+        clean_runtime || true
+    fi
+    return 0
+}
+
 run_case() {
     local case_id="$1"
     local mode="$2"
     local threshold="$3"
-    ensure_binary
-    clean_runtime
-    prepare_cache_dirs
-    mkdir -p "$OUT_DIR/python" "$OUT_DIR/work_${case_id}"
-    start_meta "$threshold"
-    start_idle_server "$threshold" "$case_id"
+    local status
+    ensure_binary || return 1
+    clean_runtime || return 1
+    prepare_cache_dirs || return 1
+    mkdir -p "$OUT_DIR/python" "$OUT_DIR/work_${case_id}" || return 1
+    start_meta "$threshold" || return 1
+    start_idle_server "$threshold" "$case_id" || return 1
     log "running ${case_id}: mode=${mode}, clients=${CLIENTS}, files=${FILES}, file_size=${FILE_SIZE}"
     (
         cd "$ROOT_DIR"
@@ -457,7 +491,9 @@ run_case() {
             --python-interface "$PYTHON_INTERFACE" \
             --output "$OUT_DIR/python/${case_id}.json"
     )
+    status=$?
     stop_idle_server
+    return "$status"
 }
 
 run_group() {
@@ -468,11 +504,11 @@ run_group() {
             ;;
         python) run_python_group ;;
         fio) run_fio_group ;;
-        P-1) run_case P-1 write_only "$WRITE_THRESHOLD" ;;
-        P-2) run_case P-2 unlink_only "$WRITE_THRESHOLD" ;;
-        P-3) run_case P-3 create_evict "$EVICT_THRESHOLD" ;;
-        P-5) run_case P-5 concurrent_unlink "$WRITE_THRESHOLD" ;;
-        B-1|B-2|B-3|B-4|B-5) run_fio_case "$1" ;;
+        P-1) run_step P-1 run_case P-1 write_only "$WRITE_THRESHOLD" ;;
+        P-2) run_step P-2 run_case P-2 unlink_only "$WRITE_THRESHOLD" ;;
+        P-3) run_step P-3 run_case P-3 create_evict "$EVICT_THRESHOLD" ;;
+        P-5) run_step P-5 run_case P-5 concurrent_unlink "$WRITE_THRESHOLD" ;;
+        B-1|B-2|B-3|B-4|B-5) run_step "$1" run_fio_case "$1" ;;
         help|-h|--help) usage ;;
         *) usage; exit 1 ;;
     esac
@@ -499,4 +535,8 @@ cleanup_temp_dirs
 write_summary
 log "summary: $OUT_DIR/benchmark_summary.md"
 log "summary log: $OUT_DIR/benchmark_summary.log"
+if (( ${#FAILED_CASES[@]} > 0 )); then
+    log "failed cases: ${FAILED_CASES[*]}"
+    exit 1
+fi
 log "done"

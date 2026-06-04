@@ -105,6 +105,8 @@ FIO_SIZE=2G \
 bash tools/run_pyfalcon_client_benchmark.sh all
 ```
 
+`all/python/fio` 会按 case 独立执行。某个 case 失败时，脚本会记录失败状态并继续执行后续 case，最后生成 summary，并在 `run.log` 末尾列出失败项。
+
 只跑 Python internal 场景或单个场景：
 
 ```bash
