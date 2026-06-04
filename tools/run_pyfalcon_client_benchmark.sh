@@ -3,8 +3,19 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
-OUT_DIR="${OUT_DIR:-/tmp/pyfalcon_client_benchmark_$(date +%Y%m%d_%H%M%S)}"
-CACHE_ROOT="${CACHE_ROOT:-/tmp/falcon_cache}"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+BENCHMARK_ROOT="${BENCHMARK_ROOT:-${PERF_ROOT:-}}"
+if [[ -n "$BENCHMARK_ROOT" ]]; then
+    mkdir -p "$BENCHMARK_ROOT"
+    BENCHMARK_ROOT="$(readlink -f "$BENCHMARK_ROOT")"
+    OUT_DIR="${OUT_DIR:-$BENCHMARK_ROOT/pyfalcon_client_benchmark_$RUN_ID}"
+    CACHE_ROOT="${CACHE_ROOT:-$BENCHMARK_ROOT/falcon_cache}"
+    FIO_DIR="${FIO_DIR:-$BENCHMARK_ROOT/pyfalcon_fio_baseline}"
+else
+    OUT_DIR="${OUT_DIR:-/tmp/pyfalcon_client_benchmark_$RUN_ID}"
+    CACHE_ROOT="${CACHE_ROOT:-/tmp/falcon_cache}"
+    FIO_DIR="${FIO_DIR:-/tmp/pyfalcon_fio_baseline}"
+fi
 MOUNT_DIR="${MOUNT_DIR:-/tmp/falcon_mnt}"
 CONFIG_FILE_PATH="${CONFIG_FILE_PATH:-/usr/local/falconfs/falcon_client/config/config.json}"
 PYTHON_INTERFACE="${PYTHON_INTERFACE:-$ROOT_DIR/python_interface}"
@@ -14,7 +25,7 @@ UNLINK_FILES="${UNLINK_FILES:-6000}"
 FILE_SIZE="${FILE_SIZE:-2097152}"
 WAIT_SEC="${WAIT_SEC:-45}"
 FIO_SIZE="${FIO_SIZE:-2G}"
-FIO_DIR="${FIO_DIR:-/tmp/pyfalcon_fio_baseline}"
+REQUIRE_NVME="${REQUIRE_NVME:-1}"
 WRITE_THRESHOLD="${WRITE_THRESHOLD:-1}"
 EVICT_THRESHOLD="${EVICT_THRESHOLD:-0.72}"
 IDLE_WAIT_SEC="${IDLE_WAIT_SEC:-900}"
@@ -40,6 +51,7 @@ Scenarios:
   B-5    local multi-file delete baseline after fio create.
 
 Environment overrides:
+  BENCHMARK_ROOT=${BENCHMARK_ROOT:-}
   OUT_DIR=${OUT_DIR}
   CLIENTS=${CLIENTS}
   FILES=${FILES}
@@ -48,18 +60,123 @@ Environment overrides:
   WAIT_SEC=${WAIT_SEC}
   FIO_SIZE=${FIO_SIZE}
   FIO_DIR=${FIO_DIR}
+  CACHE_ROOT=${CACHE_ROOT}
+  REQUIRE_NVME=${REQUIRE_NVME}
   WRITE_THRESHOLD=${WRITE_THRESHOLD}
   EVICT_THRESHOLD=${EVICT_THRESHOLD}
   CONFIG_FILE_PATH=${CONFIG_FILE_PATH}
   PYTHON_INTERFACE=${PYTHON_INTERFACE}
 
 Example:
-  OUT_DIR=/tmp/pyfalcon_bench CLIENTS=4 FILES=6000 UNLINK_FILES=6000 FIO_SIZE=2G $0 all
+  BENCHMARK_ROOT=/data4 CLIENTS=4 FILES=6000 UNLINK_FILES=6000 FIO_SIZE=2G $0 all
 EOF
 }
 
 log() {
     printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+metadata_root() {
+    (
+        set +u
+        source "$ROOT_DIR/deploy/meta/falcon_meta_config.sh" >/dev/null 2>&1
+        printf '%s/metadata\n' "$workspace"
+    )
+}
+
+safe_rm_rf() {
+    local path="$1"
+    case "$path" in
+        ""|"/"|"/tmp"|"$HOME")
+            echo "refuse to remove unsafe path: $path" >&2
+            return 1
+            ;;
+    esac
+    if [[ -n "${BENCHMARK_ROOT:-}" && "$path" == "$BENCHMARK_ROOT" ]]; then
+        echo "refuse to remove BENCHMARK_ROOT itself: $path" >&2
+        return 1
+    fi
+    sudo rm -rf "$path"
+}
+
+path_device_info() {
+    local path="$1"
+    local source fstype target
+    target="$(findmnt -T "$path" -no TARGET 2>/dev/null || true)"
+    source="$(findmnt -T "$path" -no SOURCE 2>/dev/null || true)"
+    fstype="$(findmnt -T "$path" -no FSTYPE 2>/dev/null || true)"
+    printf 'path=%s target=%s source=%s fstype=%s\n' "$path" "${target:-N/A}" "${source:-N/A}" "${fstype:-N/A}"
+}
+
+path_is_nvme() {
+    local path="$1"
+    local source
+    source="$(findmnt -T "$path" -no SOURCE 2>/dev/null || true)"
+    [[ -z "$source" ]] && return 1
+    [[ "$source" == /dev/nvme* ]] && return 0
+    lsblk -no NAME,PKNAME "$source" 2>/dev/null | grep -q 'nvme'
+}
+
+check_nvme_path() {
+    local path="$1"
+    local label="$2"
+    mkdir -p "$path"
+    log "storage check ${label}: $(path_device_info "$path")"
+    if [[ "$REQUIRE_NVME" == "1" ]] && ! path_is_nvme "$path"; then
+        echo "${label} is not on an NVMe device: $path" >&2
+        echo "Set BENCHMARK_ROOT=/data4, or set REQUIRE_NVME=0 to allow non-NVMe testing." >&2
+        exit 1
+    fi
+}
+
+scenario_uses_falcon() {
+    [[ "$SCENARIO" != "fio" && "$SCENARIO" != B-* ]]
+}
+
+write_storage_info() {
+    local meta_root
+    {
+        echo "benchmark_root=${BENCHMARK_ROOT:-N/A}"
+        path_device_info "$OUT_DIR"
+        path_device_info "$FIO_DIR"
+        if scenario_uses_falcon; then
+            meta_root="$(metadata_root)"
+            path_device_info "$CACHE_ROOT"
+            path_device_info "$(dirname "$meta_root")"
+            echo "metadata_root=$meta_root"
+        else
+            echo "cache_root=N/A"
+            echo "metadata_root=N/A"
+        fi
+    } > "$OUT_DIR/storage_info.txt"
+}
+
+prepare_storage_targets() {
+    local meta_root
+    check_nvme_path "$OUT_DIR" "OUT_DIR"
+    check_nvme_path "$FIO_DIR" "FIO_DIR"
+    if scenario_uses_falcon; then
+        meta_root="$(metadata_root)"
+        check_nvme_path "$CACHE_ROOT" "CACHE_ROOT"
+        check_nvme_path "$(dirname "$meta_root")" "metadata workspace"
+    fi
+    write_storage_info
+}
+
+cleanup_temp_dirs() {
+    local meta_root
+    rm -rf "$OUT_DIR"/work_* 2>/dev/null || true
+    safe_rm_rf "$FIO_DIR" >/dev/null 2>&1 || true
+    if scenario_uses_falcon; then
+        meta_root="$(metadata_root)"
+        safe_rm_rf "$CACHE_ROOT" >/dev/null 2>&1 || true
+        safe_rm_rf "$meta_root" >/dev/null 2>&1 || true
+    fi
+}
+
+on_exit() {
+    stop_idle_server 2>/dev/null || true
+    cleanup_temp_dirs 2>/dev/null || true
 }
 
 port_listeners() {
@@ -125,7 +242,11 @@ clean_runtime() {
     sudo "$ROOT_DIR/deploy/falcon_stop.sh" >/dev/null 2>&1 || true
     sudo umount -l "$MOUNT_DIR" >/dev/null 2>&1 || true
     release_ports
-    sudo rm -rf "$CACHE_ROOT" "$MOUNT_DIR" "$HOME/metadata"
+    local meta_root
+    meta_root="$(metadata_root)"
+    safe_rm_rf "$CACHE_ROOT" >/dev/null 2>&1 || true
+    sudo rm -rf "$MOUNT_DIR"
+    safe_rm_rf "$meta_root" >/dev/null 2>&1 || true
     sudo rm -f /tmp/.s.PGSQL.55500* /tmp/.s.PGSQL.55510* /tmp/.s.PGSQL.55520* /tmp/.s.PGSQL.55530*
 }
 
@@ -315,7 +436,6 @@ run_case() {
     mkdir -p "$OUT_DIR/python" "$OUT_DIR/work_${case_id}"
     start_meta "$threshold"
     start_idle_server "$threshold" "$case_id"
-    trap stop_idle_server EXIT
     log "running ${case_id}: mode=${mode}, clients=${CLIENTS}, files=${FILES}, file_size=${FILE_SIZE}"
     (
         cd "$ROOT_DIR"
@@ -362,12 +482,15 @@ mkdir -p "$OUT_DIR/python" "$OUT_DIR/fio"
 RUN_LOG="${RUN_LOG:-$OUT_DIR/run.log}"
 : > "$RUN_LOG"
 exec > >(tee -a "$RUN_LOG") 2>&1
+trap on_exit EXIT
 log "output directory: $OUT_DIR"
 log "run log: $RUN_LOG"
+prepare_storage_targets
 run_group "$SCENARIO"
-if [[ "$SCENARIO" != "fio" && "$SCENARIO" != B-* ]]; then
+if scenario_uses_falcon; then
     clean_runtime
 fi
+cleanup_temp_dirs
 write_summary
 log "summary: $OUT_DIR/benchmark_summary.md"
 log "summary log: $OUT_DIR/benchmark_summary.log"

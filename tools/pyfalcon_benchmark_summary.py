@@ -261,6 +261,8 @@ def main():
     for case in FIO_CASES:
         path = fio_dir / f"{case}.json"
         raw_rows.append([case, str(path), "是" if path.exists() else "否"])
+    storage_info = out_dir / "storage_info.txt"
+    raw_rows.append(["storage", str(storage_info), "是" if storage_info.exists() else "否"])
     lines.append(table(["编号", "路径", "是否存在"], raw_rows))
     lines.append("")
 

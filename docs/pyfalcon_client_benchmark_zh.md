@@ -89,12 +89,12 @@ test -x build/internal_perf/falcon_internal_perf
 
 ## 4. 一键执行
 
-完整执行 P-1/P-2/P-3/P-5 和 fio B-1..B-5：
+完整执行 P-1/P-2/P-3/P-5 和 fio B-1..B-5。另一台服务器如果 NVMe 盘挂载在 `/data4`，建议显式设置 `BENCHMARK_ROOT=/data4`：
 
 ```bash
 cd ~/code/falconfs
 
-OUT_DIR=/tmp/pyfalcon_client_benchmark_current \
+BENCHMARK_ROOT=/data4 \
 CLIENTS=4 \
 FILES=6000 \
 UNLINK_FILES=6000 \
@@ -124,14 +124,17 @@ bash tools/run_pyfalcon_client_benchmark.sh B-5
 
 | 参数 | 默认值 | 说明 |
 | --- | ---: | --- |
-| `OUT_DIR` | `/tmp/pyfalcon_client_benchmark_<timestamp>` | 输出目录 |
+| `BENCHMARK_ROOT` | 空 | 测试根目录；设置为 `/data4` 后，默认 `OUT_DIR`、`CACHE_ROOT`、`FIO_DIR` 都在 `/data4` 下 |
+| `OUT_DIR` | `/tmp/pyfalcon_client_benchmark_<timestamp>` 或 `$BENCHMARK_ROOT/pyfalcon_client_benchmark_<timestamp>` | 输出目录，保留最终结果和日志 |
 | `CLIENTS` | 4 | 每组 Python client 进程数 |
 | `FILES` | 6000 | 写入文件数 |
 | `UNLINK_FILES` | 6000 | 删除文件数 |
 | `FILE_SIZE` | 2097152 | 单文件大小，默认 2MiB |
 | `WAIT_SEC` | 45 | P-3 写完后等待 evict 的时间 |
 | `FIO_SIZE` | 2G | B-1/B-2 单文件 fio 基准每个 job 的数据量 |
-| `FIO_DIR` | `/tmp/pyfalcon_fio_baseline` | fio 临时工作目录 |
+| `FIO_DIR` | `/tmp/pyfalcon_fio_baseline` 或 `$BENCHMARK_ROOT/pyfalcon_fio_baseline` | fio 临时工作目录，结束后清理 |
+| `CACHE_ROOT` | `/tmp/falcon_cache` 或 `$BENCHMARK_ROOT/falcon_cache` | Falcon DiskCache 本地 cache 目录，结束后清理 |
+| `REQUIRE_NVME` | 1 | 是否要求 `OUT_DIR/CACHE_ROOT/FIO_DIR/metadata workspace` 都在 NVMe 设备上；临时非 NVMe 测试可设为 0 |
 | `WRITE_THRESHOLD` | 1 | P-1/P-2/P-5 使用的 `STORAGE_THRESHOLD` |
 | `EVICT_THRESHOLD` | 0.72 | P-3 使用的 `STORAGE_THRESHOLD` |
 | `CONFIG_FILE_PATH` | `/usr/local/falconfs/falcon_client/config/config.json` | Python client 使用的配置文件 |
@@ -147,6 +150,7 @@ P-5 的正式阶段总进程数是 `CLIENTS * 2`。例如 `CLIENTS=4` 时，是 
 $OUT_DIR/run.log
 $OUT_DIR/benchmark_summary.md
 $OUT_DIR/benchmark_summary.log
+$OUT_DIR/storage_info.txt
 $OUT_DIR/python/P-1.json
 $OUT_DIR/python/P-2.json
 $OUT_DIR/python/P-3.json
@@ -171,6 +175,7 @@ $OUT_DIR/fio/B-5.json
 | `run.log` | 一键脚本执行过程日志，包含每个场景启动、清理和汇总路径 |
 | `benchmark_summary.md` | 类似性能测试结果文档的最终汇总表，包含 Python internal 和 fio 基准 |
 | `benchmark_summary.log` | 与 `benchmark_summary.md` 内容一致，便于直接归档或 `cat` 查看 |
+| `storage_info.txt` | 记录 `OUT_DIR/CACHE_ROOT/FIO_DIR/metadata workspace` 对应的挂载点、设备和文件系统类型 |
 
 重点字段：
 
@@ -215,22 +220,63 @@ fio 结果字段：
 
 ## 7. 环境清理
 
-脚本每个 case 前都会清理：
+脚本每个 Python internal case 前都会清理：
 
 ```text
-/tmp/falcon_cache
-/tmp/falcon_mnt
-~/metadata
+$CACHE_ROOT
+$MOUNT_DIR
+<falcon_meta_config.sh 中 workspace>/metadata
 55500/55510/55520/55530/56039 默认端口
 ```
 
-脚本结束后也会执行一次清理。手工检查：
+如果 `falcon_meta_config.sh` 中 `workspace=/data4`，实际清理的是 `/data4/metadata`，不是 `$HOME/metadata`。
+
+脚本结束后一定会清理：
+
+```text
+$FIO_DIR
+$OUT_DIR/work_*
+```
+
+如果执行的是 `python`、`P-*` 或 `all` 这类会启动 Falcon 的场景，脚本结束后还会清理：
+
+```text
+$CACHE_ROOT
+<falcon_meta_config.sh 中 workspace>/metadata
+```
+
+如果只执行 `fio` 或 `B-*`，脚本不会清理 Falcon metadata/cache，只会清理 fio 临时工作目录。最终只保留 `$OUT_DIR` 下的结果文件、JSON、`run.log`、`benchmark_summary.md`、`benchmark_summary.log` 和 `storage_info.txt`。
+
+清理函数会拒绝删除 `/`、`/tmp`、`$HOME` 和 `BENCHMARK_ROOT` 本身，只删除这些目录下的专用子目录。手工检查：
 
 ```bash
 ss -ltnp | grep -E ':(55500|55510|55520|55530|56039)([[:space:]]|$)' || true
 ```
 
-## 8. 常见问题
+## 8. NVMe 检查
+
+默认 `REQUIRE_NVME=1`，脚本启动后会用 `findmnt -T` 和 `lsblk` 检查以下路径所在设备：
+
+```text
+OUT_DIR
+CACHE_ROOT
+FIO_DIR
+falcon_meta_config.sh 中 workspace 所在目录
+```
+
+如果任一目录不在 NVMe 设备上，脚本会直接退出，避免把结果误测到系统盘或非目标盘。确认在 `/data4` 上测试时，推荐命令：
+
+```bash
+BENCHMARK_ROOT=/data4 bash tools/run_pyfalcon_client_benchmark.sh all
+```
+
+仅做功能 smoke、不关心磁盘类型时，可以临时关闭检查：
+
+```bash
+REQUIRE_NVME=0 bash tools/run_pyfalcon_client_benchmark.sh B-5
+```
+
+## 9. 常见问题
 
 如果看到：
 
