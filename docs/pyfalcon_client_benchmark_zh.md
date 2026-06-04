@@ -1,0 +1,201 @@
+# Python internal client 并发 benchmark 使用说明
+
+本文说明如何在服务器上通过 Python internal API 调用 Falcon 内部接口做并发性能测试。该 benchmark 不通过 FUSE 挂载点发起业务操作。
+
+## 1. 测试目标
+
+benchmark 覆盖 4 个场景：
+
+| 编号 | 场景 | 并发模型 |
+| --- | --- | --- |
+| P-1 | 纯写 | 4 个 Python 进程，每个进程 1 个 `pyfalconfs.Client` |
+| P-2 | 纯删除 | 先 4 client 预创建文件，再 4 client 并发 `FalconUnlink` |
+| P-3 | 写触发 evict | 4 writer client 并发写，DiskCache 后台 cleanup 删除 cache |
+| P-5 | 边写边删 | 4 writer client + 4 deleter client 同时运行 |
+
+Python client 调用链：
+
+```text
+pyfalconfs.Client
+-> _pyfalconfs_internal.cpp
+-> FalconCreate / FalconWrite / FalconClose / FalconUnlink
+```
+
+## 2. 为什么需要 idle_server
+
+`_pyfalconfs_internal.cpp` 只执行 `GetInit().Init()` 和 `FalconInit()`，不会启动 `RemoteIOServer`。写入路径需要连接配置中的 `falcon_cluster_view`，默认是：
+
+```json
+"falcon_cluster_view": ["127.0.0.1:56039", "0.0.0.0:56039"]
+```
+
+因此 benchmark 会额外启动：
+
+```bash
+build/internal_perf/falcon_internal_perf --mode idle_server
+```
+
+这个进程只负责提供稳定的 `56039` RemoteIOServer。业务操作仍然由 Python 进程通过 internal API 发起，不经过 `/tmp/falcon_mnt`。
+
+## 3. 前置条件
+
+先完成 FalconFS 编译和安装。示例：
+
+```bash
+cd ~/code/falconfs
+
+cd third_party/postgres/
+make distclean || true
+./configure --prefix=/usr/local/pgsql --without-icu --enable-debug
+make -j"$(nproc)"
+sudo make install
+
+cd ~/code/falconfs
+./build.sh clean pg
+./build.sh build pg
+sudo ./build.sh install pg
+sudo ./build.sh clean falcon
+./build.sh build falcon
+sudo ./build.sh install falcon
+```
+
+确认 Python internal 扩展已安装或可从源码目录导入：
+
+```bash
+python3 - <<'PY'
+import sys
+sys.path.insert(0, "/home/hx/code/falconfs/python_interface")
+import pyfalconfs
+print(pyfalconfs.__file__)
+PY
+```
+
+确认 benchmark helper 可构建：
+
+```bash
+ninja -C build falcon_internal_perf
+test -x build/internal_perf/falcon_internal_perf
+```
+
+## 4. 一键执行
+
+完整执行 P-1/P-2/P-3/P-5：
+
+```bash
+cd ~/code/falconfs
+
+OUT_DIR=/tmp/pyfalcon_client_benchmark_current \
+CLIENTS=4 \
+FILES=6000 \
+UNLINK_FILES=6000 \
+FILE_SIZE=2097152 \
+WAIT_SEC=45 \
+EVICT_THRESHOLD=0.72 \
+bash tools/run_pyfalcon_client_benchmark.sh all
+```
+
+只跑单个场景：
+
+```bash
+bash tools/run_pyfalcon_client_benchmark.sh P-1
+bash tools/run_pyfalcon_client_benchmark.sh P-2
+bash tools/run_pyfalcon_client_benchmark.sh P-3
+bash tools/run_pyfalcon_client_benchmark.sh P-5
+```
+
+## 5. 参数说明
+
+| 参数 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `OUT_DIR` | `/tmp/pyfalcon_client_benchmark_<timestamp>` | 输出目录 |
+| `CLIENTS` | 4 | 每组 Python client 进程数 |
+| `FILES` | 6000 | 写入文件数 |
+| `UNLINK_FILES` | 6000 | 删除文件数 |
+| `FILE_SIZE` | 2097152 | 单文件大小，默认 2MiB |
+| `WAIT_SEC` | 45 | P-3 写完后等待 evict 的时间 |
+| `WRITE_THRESHOLD` | 1 | P-1/P-2/P-5 使用的 `STORAGE_THRESHOLD` |
+| `EVICT_THRESHOLD` | 0.72 | P-3 使用的 `STORAGE_THRESHOLD` |
+| `CONFIG_FILE_PATH` | `/usr/local/falconfs/falcon_client/config/config.json` | Python client 使用的配置文件 |
+| `PYTHON_INTERFACE` | `$ROOT_DIR/python_interface` | `pyfalconfs` Python 包路径 |
+
+P-5 的正式阶段总进程数是 `CLIENTS * 2`。例如 `CLIENTS=4` 时，是 4 个 writer client 加 4 个 deleter client。
+
+## 6. 输出文件
+
+完整执行后会生成：
+
+```text
+$OUT_DIR/python/P-1.json
+$OUT_DIR/python/P-2.json
+$OUT_DIR/python/P-3.json
+$OUT_DIR/python/P-5.json
+$OUT_DIR/python/P-1-idle.log
+$OUT_DIR/python/P-2-idle.log
+$OUT_DIR/python/P-3-idle.log
+$OUT_DIR/python/P-5-idle.log
+```
+
+重点字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `files_per_sec` | 文件吞吐 |
+| `mib_per_sec` | 按文件大小折算的数据吞吐 |
+| `latency_p50_sec` | 单次操作 p50 延迟 |
+| `latency_p95_sec` | 单次操作 p95 延迟 |
+| `latency_p99_sec` | 单次操作 p99 延迟 |
+| `error_count` | 错误数，正常应为 0 |
+| `per_client` | 每个 Python client 的文件数、耗时和错误 |
+
+P-2 的删除结果在：
+
+```text
+unlink.files_per_sec
+unlink.mib_per_sec
+unlink.latency_p99_sec
+```
+
+P-5 的写入和删除结果分别在：
+
+```text
+writer.files_per_sec
+writer.mib_per_sec
+deleter.files_per_sec
+deleter.mib_per_sec
+```
+
+P-3 的 evict 删除明细需要结合 Falcon 日志中的 `DiskCache::Cleanup()` 聚合。
+
+## 7. 环境清理
+
+脚本每个 case 前都会清理：
+
+```text
+/tmp/falcon_cache
+/tmp/falcon_mnt
+~/metadata
+55500/55510/55520/55530/56039 默认端口
+```
+
+脚本结束后也会执行一次清理。手工检查：
+
+```bash
+ss -ltnp | rg ':(55500|55510|55520|55530|56039)\b' || true
+```
+
+## 8. 常见问题
+
+如果看到：
+
+```text
+Not connected to 127.0.0.1:56039
+```
+
+说明 `idle_server` 没有启动成功，或 56039 被其他进程占用。检查：
+
+```bash
+ss -ltnp | rg ':(56039)\b' || true
+cat "$OUT_DIR"/python/*-idle.log
+```
+
+如果 P-3 在 `WAIT_SEC=45` 内没有清完所有 cache，这是当前 evict 后台调度和水位推进的表现，不代表 benchmark 失败。以 JSON 的写入结果和 Falcon `DiskCache::Cleanup()` 日志共同判断。
