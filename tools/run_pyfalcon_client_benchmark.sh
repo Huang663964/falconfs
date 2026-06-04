@@ -68,7 +68,7 @@ Environment overrides:
   PYTHON_INTERFACE=${PYTHON_INTERFACE}
 
 Example:
-  BENCHMARK_ROOT=/data4 CLIENTS=4 FILES=6000 UNLINK_FILES=6000 FIO_SIZE=2G $0 all
+  BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 UNLINK_FILES=6000 FIO_SIZE=2G $0 all
 EOF
 }
 
@@ -124,7 +124,7 @@ check_nvme_path() {
     log "storage check ${label}: $(path_device_info "$path")"
     if [[ "$REQUIRE_NVME" == "1" ]] && ! path_is_nvme "$path"; then
         echo "${label} is not on an NVMe device: $path" >&2
-        echo "Set BENCHMARK_ROOT=/data4, or set REQUIRE_NVME=0 to allow non-NVMe testing." >&2
+        echo "Set BENCHMARK_ROOT=/data4/hxing, or set REQUIRE_NVME=0 to allow non-NVMe testing." >&2
         exit 1
     fi
 }

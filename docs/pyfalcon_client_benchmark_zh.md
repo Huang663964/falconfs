@@ -89,12 +89,12 @@ test -x build/internal_perf/falcon_internal_perf
 
 ## 4. 一键执行
 
-完整执行 P-1/P-2/P-3/P-5 和 fio B-1..B-5。另一台服务器如果 NVMe 盘挂载在 `/data4`，建议显式设置 `BENCHMARK_ROOT=/data4`：
+完整执行 P-1/P-2/P-3/P-5 和 fio B-1..B-5。另一台服务器如果 NVMe 盘挂载在 `/data4/hxing`，建议显式设置 `BENCHMARK_ROOT=/data4/hxing`：
 
 ```bash
 cd ~/code/falconfs
 
-BENCHMARK_ROOT=/data4 \
+BENCHMARK_ROOT=/data4/hxing \
 CLIENTS=4 \
 FILES=6000 \
 UNLINK_FILES=6000 \
@@ -124,7 +124,7 @@ bash tools/run_pyfalcon_client_benchmark.sh B-5
 
 | 参数 | 默认值 | 说明 |
 | --- | ---: | --- |
-| `BENCHMARK_ROOT` | 空 | 测试根目录；设置为 `/data4` 后，默认 `OUT_DIR`、`CACHE_ROOT`、`FIO_DIR` 都在 `/data4` 下 |
+| `BENCHMARK_ROOT` | 空 | 测试根目录；设置为 `/data4/hxing` 后，默认 `OUT_DIR`、`CACHE_ROOT`、`FIO_DIR` 都在 `/data4/hxing` 下 |
 | `OUT_DIR` | `/tmp/pyfalcon_client_benchmark_<timestamp>` 或 `$BENCHMARK_ROOT/pyfalcon_client_benchmark_<timestamp>` | 输出目录，保留最终结果和日志 |
 | `CLIENTS` | 4 | 每组 Python client 进程数 |
 | `FILES` | 6000 | 写入文件数 |
@@ -229,7 +229,7 @@ $MOUNT_DIR
 55500/55510/55520/55530/56039 默认端口
 ```
 
-如果 `falcon_meta_config.sh` 中 `workspace=/data4`，实际清理的是 `/data4/metadata`，不是 `$HOME/metadata`。
+如果 `falcon_meta_config.sh` 中 `workspace=/data4/hxing`，实际清理的是 `/data4/hxing/metadata`，不是 `$HOME/metadata`。
 
 脚本结束后一定会清理：
 
@@ -264,10 +264,10 @@ FIO_DIR
 falcon_meta_config.sh 中 workspace 所在目录
 ```
 
-如果任一目录不在 NVMe 设备上，脚本会直接退出，避免把结果误测到系统盘或非目标盘。确认在 `/data4` 上测试时，推荐命令：
+如果任一目录不在 NVMe 设备上，脚本会直接退出，避免把结果误测到系统盘或非目标盘。确认在 `/data4/hxing` 上测试时，推荐命令：
 
 ```bash
-BENCHMARK_ROOT=/data4 bash tools/run_pyfalcon_client_benchmark.sh all
+BENCHMARK_ROOT=/data4/hxing bash tools/run_pyfalcon_client_benchmark.sh all
 ```
 
 仅做功能 smoke、不关心磁盘类型时，可以临时关闭检查：
