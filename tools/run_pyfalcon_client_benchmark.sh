@@ -472,18 +472,23 @@ if max_write > 0:
 
 desired_write = max(requested_write, soft_target)
 used_ratio = used / total
+block_avail_ratio = avail / total
+block_start_used_ratio = 1.0 - block_avail_ratio
+inode_avail_ratio = inodes_avail / inodes_total
 inode_used_ratio = inodes_used / inodes_total
-startup_used_ratio = max(used_ratio, inode_used_ratio)
+inode_start_used_ratio = 1.0 - inode_avail_ratio
+startup_used_ratio = max(block_start_used_ratio, inode_start_used_ratio)
 minimum_start_threshold = startup_used_ratio + 0.100001
 if minimum_start_threshold >= max_threshold:
     raise SystemExit(
-        "auto evict cannot satisfy Falcon startup check: max(block_used_ratio, inode_used_ratio)=%.6f, "
+        "auto evict cannot satisfy Falcon startup check: max(block_start_used_ratio, inode_start_used_ratio)=%.6f, "
         "minimum threshold is %.6f, but AUTO_EVICT_MAX_THRESHOLD is %.6f"
         % (startup_used_ratio, minimum_start_threshold, max_threshold)
     )
+start_used_bytes = int(total * startup_used_ratio)
 start_floor_ratio = min(max_threshold, startup_used_ratio + start_margin_ratio)
 start_floor_bytes = int(total * start_floor_ratio)
-required_to_cross_start_floor = max(0, start_floor_bytes - used)
+required_to_cross_start_floor = max(0, start_floor_bytes - start_used_bytes)
 required_write_for_threshold = int(math.ceil(required_to_cross_start_floor / trigger_ratio)) if required_to_cross_start_floor > 0 else 0
 desired_write = max(desired_write, required_write_for_threshold)
 
@@ -505,27 +510,27 @@ if safe_auto_write > 0 and desired_write > safe_auto_write:
 auto_files = max(files, int(math.ceil(desired_write / file_size)))
 write_bytes = auto_files * file_size
 margin = max(init_margin, file_size * 4)
-low = max(used + margin, start_floor_bytes)
-high = used + write_bytes - margin
+low = max(start_used_bytes + margin, start_floor_bytes)
+high = start_used_bytes + write_bytes - margin
 if high <= low:
-    needed = int(math.ceil(((low - used) + margin) / file_size))
+    needed = int(math.ceil(((low - start_used_bytes) + margin) / file_size))
     auto_files = max(auto_files, needed)
     write_bytes = auto_files * file_size
-    high = used + write_bytes - margin
+    high = start_used_bytes + write_bytes - margin
 if high <= low:
     raise SystemExit("not enough write bytes to place an evict threshold safely")
 
-threshold_bytes = used + int(write_bytes * trigger_ratio)
+threshold_bytes = start_used_bytes + int(write_bytes * trigger_ratio)
 threshold_bytes = max(threshold_bytes, low)
 threshold_bytes = min(threshold_bytes, high)
 max_threshold_bytes = int(total * max_threshold)
 if threshold_bytes > max_threshold_bytes:
     threshold_bytes = max_threshold_bytes
-if threshold_bytes <= used or threshold_bytes >= used + write_bytes:
+if threshold_bytes <= start_used_bytes or threshold_bytes >= start_used_bytes + write_bytes:
     raise SystemExit("cannot compute threshold between current usage and planned final usage")
 
 threshold = threshold_bytes / total
-final_ratio = (used + write_bytes) / total
+final_ratio = (start_used_bytes + write_bytes) / total
 write_ratio_actual = write_bytes / total
 print(f"threshold={threshold:.6f}")
 print(f"files={auto_files}")
@@ -539,8 +544,13 @@ print(f"write_bytes={write_bytes}")
 print(f"requested_files={files}")
 print(f"requested_write_bytes={requested_write}")
 print(f"used_ratio={used_ratio:.6f}")
+print(f"block_avail_ratio={block_avail_ratio:.6f}")
+print(f"block_start_used_ratio={block_start_used_ratio:.6f}")
 print(f"inode_used_ratio={inode_used_ratio:.6f}")
+print(f"inode_avail_ratio={inode_avail_ratio:.6f}")
+print(f"inode_start_used_ratio={inode_start_used_ratio:.6f}")
 print(f"startup_used_ratio={startup_used_ratio:.6f}")
+print(f"start_used_bytes={start_used_bytes}")
 print(f"minimum_start_threshold={minimum_start_threshold:.6f}")
 print(f"final_ratio={final_ratio:.6f}")
 print(f"write_ratio={write_ratio_actual:.6f}")
