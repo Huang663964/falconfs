@@ -22,6 +22,7 @@ else
 fi
 MOUNT_DIR="${MOUNT_DIR:-/tmp/falcon_mnt}"
 CONFIG_FILE_PATH="${CONFIG_FILE_PATH:-/usr/local/falconfs/falcon_client/config/config.json}"
+BENCHMARK_CLUSTER_VIEW="${BENCHMARK_CLUSTER_VIEW:-127.0.0.1:56039}"
 PYTHON_INTERFACE="${PYTHON_INTERFACE:-$ROOT_DIR/python_interface}"
 CLIENTS="${CLIENTS:-4}"
 FILES="${FILES:-6000}"
@@ -89,6 +90,7 @@ Environment overrides:
   AUTO_EVICT_START_MARGIN_RATIO=${AUTO_EVICT_START_MARGIN_RATIO}
   AUTO_EVICT_MAX_THRESHOLD=${AUTO_EVICT_MAX_THRESHOLD}
   CONFIG_FILE_PATH=${CONFIG_FILE_PATH}
+  BENCHMARK_CLUSTER_VIEW=${BENCHMARK_CLUSTER_VIEW}
   PYTHON_INTERFACE=${PYTHON_INTERFACE}
 
 Example:
@@ -304,14 +306,48 @@ start_meta() {
     sleep 3
 }
 
+create_case_config() {
+    local case_id="$1"
+    local case_config="$OUT_DIR/python/${case_id}-config.json"
+    mkdir -p "$OUT_DIR/python"
+    BASE_CONFIG="$CONFIG_FILE_PATH" \
+    CASE_CONFIG="$case_config" \
+    CACHE_ROOT_VALUE="$CACHE_ROOT" \
+    BENCHMARK_CLUSTER_VIEW_VALUE="$BENCHMARK_CLUSTER_VIEW" \
+    CASE_LOG_DIR="$OUT_DIR/python/${case_id}-falcon-log" \
+    python3 - <<'PYCONFIG'
+import json
+import os
+
+base = os.environ["BASE_CONFIG"]
+out = os.environ["CASE_CONFIG"]
+cluster_view = [item.strip() for item in os.environ["BENCHMARK_CLUSTER_VIEW_VALUE"].split(",") if item.strip()]
+if not cluster_view:
+    raise SystemExit("BENCHMARK_CLUSTER_VIEW cannot be empty")
+with open(base, "r", encoding="utf-8") as src:
+    config = json.load(src)
+main = config.setdefault("main", {})
+main["falcon_cache_root"] = os.environ["CACHE_ROOT_VALUE"]
+main["falcon_cluster_view"] = cluster_view
+main["falcon_log_dir"] = os.environ["CASE_LOG_DIR"]
+os.makedirs(os.path.dirname(out), exist_ok=True)
+os.makedirs(main["falcon_log_dir"], exist_ok=True)
+with open(out, "w", encoding="utf-8") as dst:
+    json.dump(config, dst, indent=4, ensure_ascii=False)
+    dst.write("\n")
+PYCONFIG
+    printf "%s\n" "$case_config"
+}
+
 start_idle_server() {
     local threshold="$1"
     local case_id="$2"
+    local case_config="$3"
     log "starting idle RemoteIOServer for ${case_id}"
     (
         cd "$ROOT_DIR"
         source_falcon_env
-        STORAGE_THRESHOLD="$threshold" "$BUILD_DIR/internal_perf/falcon_internal_perf" \
+        CONFIG_FILE="$case_config" STORAGE_THRESHOLD="$threshold" "$BUILD_DIR/internal_perf/falcon_internal_perf" \
             --mode idle_server \
             --dir "/py_idle_${case_id}" \
             --output "$OUT_DIR/python/${case_id}-idle.json" \
@@ -759,7 +795,7 @@ run_case() {
     local case_id="$1"
     local mode="$2"
     local threshold="$3"
-    local status case_files case_threshold
+    local status case_files case_threshold case_config
     case_files="$FILES"
     case_threshold="$threshold"
     ensure_binary || return 1
@@ -771,8 +807,10 @@ run_case() {
     fi
     prepare_cache_dirs || return 1
     mkdir -p "$OUT_DIR/python" "$OUT_DIR/work_${case_id}" || return 1
+    case_config="$(create_case_config "$case_id")" || return 1
+    log "case ${case_id} config: ${case_config}, cache_root=${CACHE_ROOT}, cluster_view=${BENCHMARK_CLUSTER_VIEW}"
     start_meta "$case_threshold" "$case_id" || return 1
-    start_idle_server "$case_threshold" "$case_id" || return 1
+    start_idle_server "$case_threshold" "$case_id" "$case_config" || return 1
     log "running ${case_id}: mode=${mode}, clients=${CLIENTS}, files=${case_files}, file_size=${FILE_SIZE}, threshold=${case_threshold}"
     (
         cd "$ROOT_DIR"
@@ -785,7 +823,7 @@ run_case() {
             --wait-sec "$WAIT_SEC" \
             --dir "/py_${case_id}" \
             --workspace "$OUT_DIR/work_${case_id}" \
-            --config "$CONFIG_FILE_PATH" \
+            --config "$case_config" \
             --python-interface "$PYTHON_INTERFACE" \
             --output "$OUT_DIR/python/${case_id}.json"
     ) >"$OUT_DIR/python/${case_id}.log" 2>&1

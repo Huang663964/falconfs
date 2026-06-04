@@ -148,7 +148,8 @@ bash tools/run_pyfalcon_client_benchmark.sh B-5
 | `AUTO_EVICT_INIT_MARGIN_BYTES` | 1073741824 | 自动模式给 Falcon metadata 初始化预留的空间余量 |
 | `AUTO_EVICT_START_MARGIN_RATIO` | 0.12 | 自动模式为满足 Falcon 启动空闲空间检查，在当前已用比例上额外预留的比例 |
 | `AUTO_EVICT_MAX_THRESHOLD` | 0.98 | 自动模式计算出的水位线上限 |
-| `CONFIG_FILE_PATH` | `/usr/local/falconfs/falcon_client/config/config.json` | Python client 使用的配置文件 |
+| `CONFIG_FILE_PATH` | `/usr/local/falconfs/falcon_client/config/config.json` | benchmark 读取的基础配置文件；每个 P case 会在 `$OUT_DIR/python` 下生成覆盖后的运行配置 |
+| `BENCHMARK_CLUSTER_VIEW` | `127.0.0.1:56039` | benchmark 专用 store 节点列表，默认单节点，避免基础配置中多个逻辑节点但只启动一个 RemoteIOServer 导致写入落到错误节点 |
 | `PYTHON_INTERFACE` | `$ROOT_DIR/python_interface` | `pyfalconfs` Python 包路径 |
 
 P-5 的正式阶段总进程数是 `CLIENTS * 2`。例如 `CLIENTS=4` 时，是 4 个 writer client 加 4 个 deleter client。
@@ -228,6 +229,7 @@ $OUT_DIR/fio/B-5.json
 | `benchmark_summary.log` | 与 `benchmark_summary.md` 内容一致，便于直接归档或 `cat` 查看 |
 | `storage_info.txt` | 记录 `OUT_DIR/CACHE_ROOT/FIO_DIR/metadata workspace` 对应的挂载点、设备和文件系统类型 |
 | `evict_config.txt` | 记录 P-3 自动计算出的 `threshold`、实际 `files`、磁盘总量/已用量/计划写入量 |
+| `python/P-*-config.json` | 每个 Python internal case 实际使用的运行配置，会覆盖 `falcon_cache_root`、`falcon_cluster_view` 和 `falcon_log_dir` |
 | `python/P-*.log` | 记录对应 Python internal case 的 stdout/stderr，case 失败时会自动打印尾部到 `run.log` |
 | `python/P-*-meta.log` | 记录对应 case 启动 Falcon meta service 的输出，case 失败时会自动打印尾部到 `run.log` |
 
