@@ -50,7 +50,7 @@ def mkdir(client, path):
 def describe_path_state(client, path):
     try:
         stat_result = client.Stat(path)
-        return f"stat_ret={stat_result.ret}, stat={stat_result.stat}"
+        return f"stat_ret={stat_result.ret}, stat={stat_result.stat_dict}"
     except Exception as exc:
         return f"stat_error={exc}"
 
