@@ -47,19 +47,27 @@ def mkdir(client, path):
         raise RuntimeError(f"Mkdir {path} failed: {ret}")
 
 
+def describe_path_state(client, path):
+    try:
+        stat_result = client.Stat(path)
+        return f"stat_ret={stat_result.ret}, stat={stat_result.stat}"
+    except Exception as exc:
+        return f"stat_error={exc}"
+
+
 def create_write_close(client, path, payload):
     ret, fd = client.Create(path, os.O_CREAT | os.O_RDWR)
     if ret != 0:
-        raise RuntimeError(f"Create {path} failed: {ret}")
+        raise RuntimeError(f"Create {path} failed: {ret}, fd={fd}, {describe_path_state(client, path)}")
     ret = client.Write(path, fd, payload, len(payload), 0)
     if ret != 0:
-        raise RuntimeError(f"Write {path} failed: {ret}")
+        raise RuntimeError(f"Write {path} failed: {ret}, fd={fd}, {describe_path_state(client, path)}")
     ret = client.Flush(path, fd)
     if ret != 0:
-        raise RuntimeError(f"Flush {path} failed: {ret}")
+        raise RuntimeError(f"Flush {path} failed: {ret}, fd={fd}, {describe_path_state(client, path)}")
     ret = client.Close(path, fd)
     if ret != 0:
-        raise RuntimeError(f"Close {path} failed: {ret}")
+        raise RuntimeError(f"Close {path} failed: {ret}, fd={fd}, {describe_path_state(client, path)}")
 
 
 def worker_write(args, role, client_id, base_dir, files, start_event, ready_q, result_q):
