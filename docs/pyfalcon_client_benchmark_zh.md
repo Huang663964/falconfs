@@ -164,7 +164,7 @@ used_bytes
 avail_bytes
 ```
 
-然后根据 `FILES * FILE_SIZE`、磁盘总容量比例和最小写入量计算 P-3 的实际写入文件数。基础目标写入量为：
+然后根据 `FILES * FILE_SIZE`、磁盘总容量比例、inode 使用率和最小写入量计算 P-3 的实际写入文件数。基础目标写入量为：
 
 ```text
 max(FILES * FILE_SIZE, total_bytes * AUTO_EVICT_WRITE_RATIO, AUTO_EVICT_MIN_WRITE_BYTES)
@@ -174,10 +174,10 @@ max(FILES * FILE_SIZE, total_bytes * AUTO_EVICT_WRITE_RATIO, AUTO_EVICT_MIN_WRIT
 
 如果实际需要写入的数据量超过当前可用空间的 `AUTO_EVICT_MAX_AVAIL_RATIO`，脚本会失败并提示需要更多可用空间，避免为了触发 evict 写满盘。
 
-Falcon 启动阶段还要求当前空闲比例高于 `bgFreeRatio = 1.1 - STORAGE_THRESHOLD`。因此自动模式会保证水位线至少高于当前已用比例 `AUTO_EVICT_START_MARGIN_RATIO`，默认是 12 个百分点。水位线会放在计划写入量靠后的阶段：
+Falcon 启动阶段还要求当前 block 空闲比例和 inode 空闲比例都高于 `bgFreeRatio = 1.1 - STORAGE_THRESHOLD`。因此自动模式会保证水位线至少高于 `max(block_used_ratio, inode_used_ratio) + AUTO_EVICT_START_MARGIN_RATIO`，默认额外预留 12 个百分点。水位线会放在计划写入量靠后的阶段：
 
 ```text
-threshold >= used_ratio + AUTO_EVICT_START_MARGIN_RATIO
+threshold >= max(block_used_ratio, inode_used_ratio) + AUTO_EVICT_START_MARGIN_RATIO
 threshold ~= (used_bytes + planned_write_bytes * AUTO_EVICT_TRIGGER_RATIO) / total_bytes
 ```
 
@@ -228,7 +228,7 @@ $OUT_DIR/fio/B-5.json
 | `benchmark_summary.md` | 类似性能测试结果文档的最终汇总表，包含 Python internal 和 fio 基准 |
 | `benchmark_summary.log` | 与 `benchmark_summary.md` 内容一致，便于直接归档或 `cat` 查看 |
 | `storage_info.txt` | 记录 `OUT_DIR/CACHE_ROOT/FIO_DIR/metadata workspace` 对应的挂载点、设备和文件系统类型 |
-| `evict_config.txt` | 记录 P-3 自动计算出的 `threshold`、实际 `files`、磁盘总量/已用量/计划写入量 |
+| `evict_config.txt` | 记录 P-3 自动计算出的 `threshold`、实际 `files`、磁盘总量/已用量、inode 总量/已用量、计划写入量；失败后 cache root 被清理时也以这里为准 |
 | `python/P-*-config.json` | 每个 Python internal case 实际使用的运行配置，会覆盖 `falcon_cache_root`、`falcon_cluster_view` 和 `falcon_log_dir` |
 | `python/P-*.log` | 记录对应 Python internal case 的 stdout/stderr，case 失败时会自动打印尾部到 `run.log` |
 | `python/P-*-meta.log` | 记录对应 case 启动 Falcon meta service 的输出，case 失败时会自动打印尾部到 `run.log` |

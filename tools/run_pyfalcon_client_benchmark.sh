@@ -384,7 +384,7 @@ bytes_to_mib() {
 
 configure_auto_evict_case() {
     local current_threshold="$1"
-    local total used avail
+    local total used avail inodes_total inodes_used inodes_avail
     local plan_file="$OUT_DIR/evict_config.txt"
     local plan_error_file="$OUT_DIR/evict_config.err"
 
@@ -403,7 +403,8 @@ configure_auto_evict_case() {
 
     mkdir -p "$CACHE_ROOT"
     read -r total used avail < <(df -B1 --output=size,used,avail "$CACHE_ROOT" | awk 'NR==2 {print $1, $2, $3}')
-    if [[ -z "${total:-}" || -z "${used:-}" || -z "${avail:-}" ]]; then
+    read -r inodes_total inodes_used inodes_avail < <(df -Pi "$CACHE_ROOT" | awk 'NR==2 {print $2, $3, $4}')
+    if [[ -z "${total:-}" || -z "${used:-}" || -z "${avail:-}" || -z "${inodes_total:-}" || -z "${inodes_used:-}" || -z "${inodes_avail:-}" ]]; then
         echo "failed to read filesystem space for CACHE_ROOT=$CACHE_ROOT" >&2
         {
             echo "auto_evict_config=1"
@@ -418,6 +419,9 @@ configure_auto_evict_case() {
         TOTAL_BYTES="$total" \
         USED_BYTES="$used" \
         AVAIL_BYTES="$avail" \
+        INODES_TOTAL="$inodes_total" \
+        INODES_USED="$inodes_used" \
+        INODES_AVAIL="$inodes_avail" \
         FILES_VALUE="$FILES" \
         FILE_SIZE_VALUE="$FILE_SIZE" \
         AUTO_EVICT_WRITE_RATIO_VALUE="$AUTO_EVICT_WRITE_RATIO" \
@@ -435,6 +439,9 @@ import os
 total = int(os.environ["TOTAL_BYTES"])
 used = int(os.environ["USED_BYTES"])
 avail = int(os.environ["AVAIL_BYTES"])
+inodes_total = int(os.environ["INODES_TOTAL"])
+inodes_used = int(os.environ["INODES_USED"])
+inodes_avail = int(os.environ["INODES_AVAIL"])
 files = int(os.environ["FILES_VALUE"])
 file_size = int(os.environ["FILE_SIZE_VALUE"])
 write_ratio = float(os.environ["AUTO_EVICT_WRITE_RATIO_VALUE"])
@@ -446,8 +453,8 @@ init_margin = int(os.environ["AUTO_EVICT_INIT_MARGIN_BYTES_VALUE"])
 start_margin_ratio = float(os.environ["AUTO_EVICT_START_MARGIN_RATIO_VALUE"])
 max_threshold = float(os.environ["AUTO_EVICT_MAX_THRESHOLD_VALUE"])
 
-if total <= 0 or file_size <= 0:
-    raise SystemExit("invalid total bytes or file size")
+if total <= 0 or file_size <= 0 or inodes_total <= 0:
+    raise SystemExit("invalid total bytes, inode count, or file size")
 if not (0.0 < trigger_ratio < 1.0):
     raise SystemExit("AUTO_EVICT_TRIGGER_RATIO must be in (0, 1)")
 if not (0.0 < max_avail_ratio <= 1.0):
@@ -465,7 +472,16 @@ if max_write > 0:
 
 desired_write = max(requested_write, soft_target)
 used_ratio = used / total
-start_floor_ratio = min(max_threshold, used_ratio + start_margin_ratio)
+inode_used_ratio = inodes_used / inodes_total
+startup_used_ratio = max(used_ratio, inode_used_ratio)
+minimum_start_threshold = startup_used_ratio + 0.100001
+if minimum_start_threshold >= max_threshold:
+    raise SystemExit(
+        "auto evict cannot satisfy Falcon startup check: max(block_used_ratio, inode_used_ratio)=%.6f, "
+        "minimum threshold is %.6f, but AUTO_EVICT_MAX_THRESHOLD is %.6f"
+        % (startup_used_ratio, minimum_start_threshold, max_threshold)
+    )
+start_floor_ratio = min(max_threshold, startup_used_ratio + start_margin_ratio)
 start_floor_bytes = int(total * start_floor_ratio)
 required_to_cross_start_floor = max(0, start_floor_bytes - used)
 required_write_for_threshold = int(math.ceil(required_to_cross_start_floor / trigger_ratio)) if required_to_cross_start_floor > 0 else 0
@@ -516,10 +532,16 @@ print(f"files={auto_files}")
 print(f"total_bytes={total}")
 print(f"used_bytes={used}")
 print(f"avail_bytes={avail}")
+print(f"inodes_total={inodes_total}")
+print(f"inodes_used={inodes_used}")
+print(f"inodes_avail={inodes_avail}")
 print(f"write_bytes={write_bytes}")
 print(f"requested_files={files}")
 print(f"requested_write_bytes={requested_write}")
 print(f"used_ratio={used_ratio:.6f}")
+print(f"inode_used_ratio={inode_used_ratio:.6f}")
+print(f"startup_used_ratio={startup_used_ratio:.6f}")
+print(f"minimum_start_threshold={minimum_start_threshold:.6f}")
 print(f"final_ratio={final_ratio:.6f}")
 print(f"write_ratio={write_ratio_actual:.6f}")
 print(f"trigger_ratio={trigger_ratio:.6f}")
@@ -535,6 +557,9 @@ PYAUTO
             echo "total_bytes=$total"
             echo "used_bytes=$used"
             echo "avail_bytes=$avail"
+            echo "inodes_total=$inodes_total"
+            echo "inodes_used=$inodes_used"
+            echo "inodes_avail=$inodes_avail"
             printf 'reason='
             tr '\n' ' ' < "$plan_error_file"
             printf '\n'
