@@ -13,6 +13,8 @@ FILES="${FILES:-6000}"
 UNLINK_FILES="${UNLINK_FILES:-6000}"
 FILE_SIZE="${FILE_SIZE:-2097152}"
 WAIT_SEC="${WAIT_SEC:-45}"
+FIO_SIZE="${FIO_SIZE:-2G}"
+FIO_DIR="${FIO_DIR:-/tmp/pyfalcon_fio_baseline}"
 WRITE_THRESHOLD="${WRITE_THRESHOLD:-1}"
 EVICT_THRESHOLD="${EVICT_THRESHOLD:-0.72}"
 IDLE_WAIT_SEC="${IDLE_WAIT_SEC:-900}"
@@ -24,11 +26,18 @@ Usage:
   $0 <scenario>
 
 Scenarios:
-  all   Run P-1, P-2, P-3 and P-5.
-  P-1   Python internal 4-client write-only benchmark.
-  P-2   Python internal 4-client unlink-only benchmark.
-  P-3   Python internal 4-client write-triggered DiskCache evict benchmark.
-  P-5   Python internal concurrent write + unlink benchmark.
+  all    Run Python internal P-1/P-2/P-3/P-5 and fio B-1..B-5.
+  python Run P-1, P-2, P-3 and P-5 only.
+  fio    Run fio/local baseline B-1..B-5 only.
+  P-1    Python internal 4-client write-only benchmark.
+  P-2    Python internal 4-client unlink-only benchmark.
+  P-3    Python internal 4-client write-triggered DiskCache evict benchmark.
+  P-5    Python internal concurrent write + unlink benchmark.
+  B-1    fio single-file direct write baseline.
+  B-2    fio single-file direct read baseline.
+  B-3    fio multi-file direct write baseline.
+  B-4    fio multi-file direct read baseline.
+  B-5    local multi-file delete baseline after fio create.
 
 Environment overrides:
   OUT_DIR=${OUT_DIR}
@@ -37,13 +46,15 @@ Environment overrides:
   UNLINK_FILES=${UNLINK_FILES}
   FILE_SIZE=${FILE_SIZE}
   WAIT_SEC=${WAIT_SEC}
+  FIO_SIZE=${FIO_SIZE}
+  FIO_DIR=${FIO_DIR}
   WRITE_THRESHOLD=${WRITE_THRESHOLD}
   EVICT_THRESHOLD=${EVICT_THRESHOLD}
   CONFIG_FILE_PATH=${CONFIG_FILE_PATH}
   PYTHON_INTERFACE=${PYTHON_INTERFACE}
 
 Example:
-  OUT_DIR=/tmp/pyfalcon_bench CLIENTS=4 FILES=6000 UNLINK_FILES=6000 $0 all
+  OUT_DIR=/tmp/pyfalcon_bench CLIENTS=4 FILES=6000 UNLINK_FILES=6000 FIO_SIZE=2G $0 all
 EOF
 }
 
@@ -72,6 +83,13 @@ falcon_port_listeners() {
 
 idle_server_port_listeners() {
     port_listeners ':(56039)([[:space:]]|$)'
+}
+
+require_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "missing command: $1" >&2
+        exit 1
+    fi
 }
 
 source_falcon_env() {
@@ -165,6 +183,128 @@ stop_idle_server() {
     fi
 }
 
+run_fio_case() {
+    local case_id="$1"
+    local fio_files_per_job=$(( (FILES + CLIENTS - 1) / CLIENTS ))
+    local fio_unlink_files_per_job=$(( (UNLINK_FILES + CLIENTS - 1) / CLIENTS ))
+    require_cmd fio
+    mkdir -p "$OUT_DIR/fio"
+    case "$case_id" in
+        B-1)
+            log "running B-1: fio single-file direct write, jobs=${CLIENTS}, size=${FIO_SIZE}"
+            rm -rf "$FIO_DIR/single_write"
+            mkdir -p "$FIO_DIR/single_write"
+            fio --output="$OUT_DIR/fio/B-1.json" --output-format=json \
+                --name=pyfalcon_fio_single_write --directory="$FIO_DIR/single_write" \
+                --nrfiles=1 --rw=write --size="$FIO_SIZE" --bs=2M \
+                --iodepth=1 --numjobs="$CLIENTS" --direct=1 --group_reporting=1
+            rm -rf "$FIO_DIR/single_write"
+            ;;
+        B-2)
+            log "running B-2: fio single-file direct read, jobs=${CLIENTS}, size=${FIO_SIZE}"
+            rm -rf "$FIO_DIR/single_read"
+            mkdir -p "$FIO_DIR/single_read"
+            fio --output="$OUT_DIR/fio/B-2-prepare.json" --output-format=json \
+                --name=pyfalcon_fio_single_read_prepare --directory="$FIO_DIR/single_read" \
+                --nrfiles=1 --rw=write --size="$FIO_SIZE" --bs=2M \
+                --iodepth=1 --numjobs="$CLIENTS" --direct=1 --group_reporting=1
+            fio --output="$OUT_DIR/fio/B-2.json" --output-format=json \
+                --name=pyfalcon_fio_single_read --directory="$FIO_DIR/single_read" \
+                --nrfiles=1 --rw=read --size="$FIO_SIZE" --bs=2M \
+                --iodepth=1 --numjobs="$CLIENTS" --direct=1 --group_reporting=1
+            rm -rf "$FIO_DIR/single_read"
+            ;;
+        B-3)
+            log "running B-3: fio multi-file direct write, jobs=${CLIENTS}, files=${FILES}, file_size=${FILE_SIZE}"
+            rm -rf "$FIO_DIR/multi"
+            mkdir -p "$FIO_DIR/multi"
+            fio --output="$OUT_DIR/fio/B-3.json" --output-format=json \
+                --name=pyfalcon_fio_multi_write --directory="$FIO_DIR/multi" \
+                --nrfiles="$fio_files_per_job" --filesize="$FILE_SIZE" \
+                --rw=write --bs=2M --iodepth=1 --numjobs="$CLIENTS" --direct=1 \
+                --openfiles=1 --file_service_type=sequential --group_reporting=1 --unlink=0
+            ;;
+        B-4)
+            log "running B-4: fio multi-file direct read, jobs=${CLIENTS}, files=${FILES}, file_size=${FILE_SIZE}"
+            if [[ ! -d "$FIO_DIR/multi" ]] || [[ "$(find "$FIO_DIR/multi" -type f | wc -l)" -eq 0 ]]; then
+                run_fio_case B-3
+            fi
+            fio --output="$OUT_DIR/fio/B-4.json" --output-format=json \
+                --name=pyfalcon_fio_multi_read --directory="$FIO_DIR/multi" \
+                --nrfiles="$fio_files_per_job" --filesize="$FILE_SIZE" \
+                --rw=read --bs=2M --iodepth=1 --numjobs="$CLIENTS" --direct=1 \
+                --openfiles=1 --file_service_type=sequential --group_reporting=1 --unlink=0
+            rm -rf "$FIO_DIR/multi"
+            ;;
+        B-5)
+            log "running B-5: local multi-file delete baseline, jobs=${CLIENTS}, unlink_files=${UNLINK_FILES}, file_size=${FILE_SIZE}"
+            rm -rf "$FIO_DIR/delete"
+            mkdir -p "$FIO_DIR/delete"
+            fio --output="$OUT_DIR/fio/B-5-create.json" --output-format=json \
+                --name=pyfalcon_fio_delete_prepare --directory="$FIO_DIR/delete" \
+                --nrfiles="$fio_unlink_files_per_job" --filesize="$FILE_SIZE" \
+                --rw=write --bs=2M --iodepth=1 --numjobs="$CLIENTS" --direct=1 \
+                --openfiles=1 --file_service_type=sequential --group_reporting=1 --unlink=0
+            local count_before start_ns end_ns elapsed_ns count_after
+            count_before="$(find "$FIO_DIR/delete" -type f | wc -l)"
+            start_ns="$(date +%s%N)"
+            find "$FIO_DIR/delete" -type f -print0 | xargs -0 -n 100 -P "$CLIENTS" rm -f
+            end_ns="$(date +%s%N)"
+            count_after="$(find "$FIO_DIR/delete" -type f | wc -l)"
+            elapsed_ns=$((end_ns - start_ns))
+            python3 - "$OUT_DIR/fio/B-5.json" "$count_before" "$count_after" "$elapsed_ns" "$FILE_SIZE" <<'PY2'
+import json
+import sys
+out, before, after, elapsed_ns, size = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+elapsed = elapsed_ns / 1_000_000_000
+deleted = before - after
+result = {
+    "mode": "local_delete",
+    "created_files": before,
+    "remaining_files": after,
+    "deleted_files": deleted,
+    "file_size_bytes": size,
+    "delete_elapsed_sec": elapsed,
+    "delete_files_per_sec": deleted / elapsed if elapsed > 0 else 0.0,
+    "delete_mib_per_sec": deleted * size / elapsed / 1048576.0 if elapsed > 0 else 0.0,
+}
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(result, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY2
+            rm -rf "$FIO_DIR/delete"
+            ;;
+        *) echo "unknown fio case: ${case_id}" >&2; exit 1 ;;
+    esac
+}
+
+run_python_group() {
+    run_case P-1 write_only "$WRITE_THRESHOLD"
+    run_case P-2 unlink_only "$WRITE_THRESHOLD"
+    run_case P-3 create_evict "$EVICT_THRESHOLD"
+    run_case P-5 concurrent_unlink "$WRITE_THRESHOLD"
+}
+
+run_fio_group() {
+    run_fio_case B-1
+    run_fio_case B-2
+    run_fio_case B-3
+    run_fio_case B-4
+    run_fio_case B-5
+}
+
+write_summary() {
+    python3 "$ROOT_DIR/tools/pyfalcon_benchmark_summary.py" \
+        --out-dir "$OUT_DIR" \
+        --scenario "$SCENARIO" \
+        --clients "$CLIENTS" \
+        --files "$FILES" \
+        --unlink-files "$UNLINK_FILES" \
+        --file-size "$FILE_SIZE" \
+        --wait-sec "$WAIT_SEC" \
+        --fio-size "$FIO_SIZE"
+}
+
 run_case() {
     local case_id="$1"
     local mode="$2"
@@ -198,15 +338,16 @@ run_case() {
 run_group() {
     case "$1" in
         all)
-            run_case P-1 write_only "$WRITE_THRESHOLD"
-            run_case P-2 unlink_only "$WRITE_THRESHOLD"
-            run_case P-3 create_evict "$EVICT_THRESHOLD"
-            run_case P-5 concurrent_unlink "$WRITE_THRESHOLD"
+            run_python_group
+            run_fio_group
             ;;
+        python) run_python_group ;;
+        fio) run_fio_group ;;
         P-1) run_case P-1 write_only "$WRITE_THRESHOLD" ;;
         P-2) run_case P-2 unlink_only "$WRITE_THRESHOLD" ;;
         P-3) run_case P-3 create_evict "$EVICT_THRESHOLD" ;;
         P-5) run_case P-5 concurrent_unlink "$WRITE_THRESHOLD" ;;
+        B-1|B-2|B-3|B-4|B-5) run_fio_case "$1" ;;
         help|-h|--help) usage ;;
         *) usage; exit 1 ;;
     esac
@@ -217,8 +358,17 @@ if [[ "$SCENARIO" == "help" || "$SCENARIO" == "-h" || "$SCENARIO" == "--help" ]]
     exit 0
 fi
 
-mkdir -p "$OUT_DIR/python"
+mkdir -p "$OUT_DIR/python" "$OUT_DIR/fio"
+RUN_LOG="${RUN_LOG:-$OUT_DIR/run.log}"
+: > "$RUN_LOG"
+exec > >(tee -a "$RUN_LOG") 2>&1
 log "output directory: $OUT_DIR"
+log "run log: $RUN_LOG"
 run_group "$SCENARIO"
-clean_runtime
+if [[ "$SCENARIO" != "fio" && "$SCENARIO" != B-* ]]; then
+    clean_runtime
+fi
+write_summary
+log "summary: $OUT_DIR/benchmark_summary.md"
+log "summary log: $OUT_DIR/benchmark_summary.log"
 log "done"

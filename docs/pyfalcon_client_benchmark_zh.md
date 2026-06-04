@@ -4,7 +4,7 @@
 
 ## 1. 测试目标
 
-benchmark 覆盖 4 个场景：
+benchmark 覆盖 Python internal API 和 fio 本地基准两类场景。Python internal API 覆盖 4 个场景：
 
 | 编号 | 场景 | 并发模型 |
 | --- | --- | --- |
@@ -12,6 +12,16 @@ benchmark 覆盖 4 个场景：
 | P-2 | 纯删除 | 先 4 client 预创建文件，再 4 client 并发 `FalconUnlink` |
 | P-3 | 写触发 evict | 4 writer client 并发写，DiskCache 后台 cleanup 删除 cache |
 | P-5 | 边写边删 | 4 writer client + 4 deleter client 同时运行 |
+
+fio 本地基准覆盖 5 个场景：
+
+| 编号 | 场景 | 说明 |
+| --- | --- | --- |
+| B-1 | 单文件 direct 顺序写 | `fio --rw=write`，`numjobs=CLIENTS` |
+| B-2 | 单文件 direct 顺序读 | 先预写，再 `fio --rw=read` |
+| B-3 | 多文件 direct 顺序写 | 按 `FILES/CLIENTS` 拆分多文件 |
+| B-4 | 多文件 direct 顺序读 | 读取 B-3 创建的多文件 |
+| B-5 | 本地多文件删除 | 按 `UNLINK_FILES/CLIENTS` 先用 fio 创建待删文件，再用并发 `rm -f` 删除 |
 
 Python client 调用链：
 
@@ -79,7 +89,7 @@ test -x build/internal_perf/falcon_internal_perf
 
 ## 4. 一键执行
 
-完整执行 P-1/P-2/P-3/P-5：
+完整执行 P-1/P-2/P-3/P-5 和 fio B-1..B-5：
 
 ```bash
 cd ~/code/falconfs
@@ -91,16 +101,23 @@ UNLINK_FILES=6000 \
 FILE_SIZE=2097152 \
 WAIT_SEC=45 \
 EVICT_THRESHOLD=0.72 \
+FIO_SIZE=2G \
 bash tools/run_pyfalcon_client_benchmark.sh all
 ```
 
-只跑单个场景：
+只跑 Python internal 场景或单个场景：
 
 ```bash
+bash tools/run_pyfalcon_client_benchmark.sh python
 bash tools/run_pyfalcon_client_benchmark.sh P-1
 bash tools/run_pyfalcon_client_benchmark.sh P-2
 bash tools/run_pyfalcon_client_benchmark.sh P-3
 bash tools/run_pyfalcon_client_benchmark.sh P-5
+
+# 只跑 fio 基准
+bash tools/run_pyfalcon_client_benchmark.sh fio
+bash tools/run_pyfalcon_client_benchmark.sh B-1
+bash tools/run_pyfalcon_client_benchmark.sh B-5
 ```
 
 ## 5. 参数说明
@@ -113,6 +130,8 @@ bash tools/run_pyfalcon_client_benchmark.sh P-5
 | `UNLINK_FILES` | 6000 | 删除文件数 |
 | `FILE_SIZE` | 2097152 | 单文件大小，默认 2MiB |
 | `WAIT_SEC` | 45 | P-3 写完后等待 evict 的时间 |
+| `FIO_SIZE` | 2G | B-1/B-2 单文件 fio 基准每个 job 的数据量 |
+| `FIO_DIR` | `/tmp/pyfalcon_fio_baseline` | fio 临时工作目录 |
 | `WRITE_THRESHOLD` | 1 | P-1/P-2/P-5 使用的 `STORAGE_THRESHOLD` |
 | `EVICT_THRESHOLD` | 0.72 | P-3 使用的 `STORAGE_THRESHOLD` |
 | `CONFIG_FILE_PATH` | `/usr/local/falconfs/falcon_client/config/config.json` | Python client 使用的配置文件 |
@@ -125,6 +144,9 @@ P-5 的正式阶段总进程数是 `CLIENTS * 2`。例如 `CLIENTS=4` 时，是 
 完整执行后会生成：
 
 ```text
+$OUT_DIR/run.log
+$OUT_DIR/benchmark_summary.md
+$OUT_DIR/benchmark_summary.log
 $OUT_DIR/python/P-1.json
 $OUT_DIR/python/P-2.json
 $OUT_DIR/python/P-3.json
@@ -133,7 +155,22 @@ $OUT_DIR/python/P-1-idle.log
 $OUT_DIR/python/P-2-idle.log
 $OUT_DIR/python/P-3-idle.log
 $OUT_DIR/python/P-5-idle.log
+$OUT_DIR/fio/B-1.json
+$OUT_DIR/fio/B-2.json
+$OUT_DIR/fio/B-2-prepare.json
+$OUT_DIR/fio/B-3.json
+$OUT_DIR/fio/B-4.json
+$OUT_DIR/fio/B-5-create.json
+$OUT_DIR/fio/B-5.json
 ```
+
+其中：
+
+| 文件 | 说明 |
+| --- | --- |
+| `run.log` | 一键脚本执行过程日志，包含每个场景启动、清理和汇总路径 |
+| `benchmark_summary.md` | 类似性能测试结果文档的最终汇总表，包含 Python internal 和 fio 基准 |
+| `benchmark_summary.log` | 与 `benchmark_summary.md` 内容一致，便于直接归档或 `cat` 查看 |
 
 重点字段：
 
@@ -166,6 +203,16 @@ deleter.mib_per_sec
 
 P-3 的 evict 删除明细需要结合 Falcon 日志中的 `DiskCache::Cleanup()` 聚合。
 
+fio 结果字段：
+
+| 文件 | 说明 |
+| --- | --- |
+| `B-1.json` | 单文件 direct 写基准 |
+| `B-2.json` | 单文件 direct 读基准 |
+| `B-3.json` | 多文件 direct 写基准 |
+| `B-4.json` | 多文件 direct 读基准 |
+| `B-5.json` | 本地多文件删除基准，字段包含 `delete_files_per_sec` 和 `delete_mib_per_sec` |
+
 ## 7. 环境清理
 
 脚本每个 case 前都会清理：
@@ -180,7 +227,7 @@ P-3 的 evict 删除明细需要结合 Falcon 日志中的 `DiskCache::Cleanup()
 脚本结束后也会执行一次清理。手工检查：
 
 ```bash
-ss -ltnp | rg ':(55500|55510|55520|55530|56039)\b' || true
+ss -ltnp | grep -E ':(55500|55510|55520|55530|56039)([[:space:]]|$)' || true
 ```
 
 ## 8. 常见问题
@@ -194,7 +241,7 @@ Not connected to 127.0.0.1:56039
 说明 `idle_server` 没有启动成功，或 56039 被其他进程占用。检查：
 
 ```bash
-ss -ltnp | rg ':(56039)\b' || true
+ss -ltnp | grep -E ':(56039)([[:space:]]|$)' || true
 cat "$OUT_DIR"/python/*-idle.log
 ```
 
