@@ -43,6 +43,9 @@ AUTO_EVICT_INIT_MARGIN_BYTES="${AUTO_EVICT_INIT_MARGIN_BYTES:-1073741824}"
 AUTO_EVICT_START_MARGIN_RATIO="${AUTO_EVICT_START_MARGIN_RATIO:-0.12}"
 AUTO_EVICT_MAX_THRESHOLD="${AUTO_EVICT_MAX_THRESHOLD:-0.98}"
 IDLE_WAIT_SEC="${IDLE_WAIT_SEC:-900}"
+P3_MONITOR="${P3_MONITOR:-1}"
+P3_MONITOR_INTERVAL="${P3_MONITOR_INTERVAL:-30}"
+P3_STALL_SECONDS="${P3_STALL_SECONDS:-180}"
 SCENARIO="${1:-all}"
 FAILED_CASES=()
 
@@ -89,6 +92,9 @@ Environment overrides:
   AUTO_EVICT_INIT_MARGIN_BYTES=${AUTO_EVICT_INIT_MARGIN_BYTES}
   AUTO_EVICT_START_MARGIN_RATIO=${AUTO_EVICT_START_MARGIN_RATIO}
   AUTO_EVICT_MAX_THRESHOLD=${AUTO_EVICT_MAX_THRESHOLD}
+  P3_MONITOR=${P3_MONITOR}
+  P3_MONITOR_INTERVAL=${P3_MONITOR_INTERVAL}
+  P3_STALL_SECONDS=${P3_STALL_SECONDS}
   CONFIG_FILE_PATH=${CONFIG_FILE_PATH}
   BENCHMARK_CLUSTER_VIEW=${BENCHMARK_CLUSTER_VIEW}
   PYTHON_INTERFACE=${PYTHON_INTERFACE}
@@ -380,6 +386,107 @@ stop_idle_server() {
 
 bytes_to_mib() {
     awk -v bytes="$1" 'BEGIN { printf "%.2f", bytes / 1048576.0 }'
+}
+
+collect_proc_tree() {
+    local root="$1"
+    local child
+    [[ -d "/proc/$root" ]] || return 0
+    printf '%s\n' "$root"
+    for child in $(ps -o pid= --ppid "$root" 2>/dev/null || true); do
+        collect_proc_tree "$child"
+    done
+}
+
+sum_proc_io_field() {
+    local field="$1"
+    shift
+    local pid value total=0
+    for pid in "$@"; do
+        [[ -r "/proc/$pid/io" ]] || continue
+        value="$(awk -v key="${field}:" '$1 == key {print $2}' "/proc/$pid/io" 2>/dev/null || true)"
+        [[ -n "$value" ]] || value=0
+        total=$((total + value))
+    done
+    printf '%s\n' "$total"
+}
+
+cache_size_bytes() {
+    if [[ -d "$CACHE_ROOT" ]]; then
+        du -sb "$CACHE_ROOT" 2>/dev/null | awk '{print $1}'
+    else
+        printf '0\n'
+    fi
+}
+
+print_case_monitor_sample() {
+    local case_id="$1"
+    local root_pid="$2"
+    local case_log="$3"
+    local monitor_log="$4"
+    local last_progress_value="$5"
+    local last_change_ts="$6"
+    local now elapsed_since_change read_bytes write_bytes syscr syscw cache_bytes cache_mib progress_value
+    local pid state wchan cmd
+    local pids=()
+    now="$(date +%s)"
+    mapfile -t pids < <(collect_proc_tree "$root_pid")
+    if (( ${#pids[@]} == 0 )); then
+        return 1
+    fi
+
+    read_bytes="$(sum_proc_io_field read_bytes "${pids[@]}")"
+    write_bytes="$(sum_proc_io_field write_bytes "${pids[@]}")"
+    syscr="$(sum_proc_io_field syscr "${pids[@]}")"
+    syscw="$(sum_proc_io_field syscw "${pids[@]}")"
+    cache_bytes="$(cache_size_bytes)"
+    cache_mib="$(bytes_to_mib "$cache_bytes")"
+
+    progress_value="${write_bytes}:${syscw}:${cache_bytes}"
+    if [[ "$progress_value" != "$last_progress_value" ]]; then
+        last_change_ts="$now"
+    fi
+    elapsed_since_change=$((now - last_change_ts))
+
+    {
+        printf '[%s] monitor %s: pids=%s read_bytes=%s write_bytes=%s syscr=%s syscw=%s cache=%sMiB unchanged_write_sec=%s\n' \
+            "$(date '+%F %T')" "$case_id" "${pids[*]}" "$read_bytes" "$write_bytes" "$syscr" "$syscw" "$cache_mib" "$elapsed_since_change"
+        for pid in "${pids[@]}"; do
+            [[ -d "/proc/$pid" ]] || continue
+            state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+            wchan="$(cat "/proc/$pid/wchan" 2>/dev/null || true)"
+            cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//')"
+            printf '  pid=%s state=%s wchan=%s cmd=%s\n' "$pid" "${state:-N/A}" "${wchan:-N/A}" "${cmd:-N/A}"
+        done
+        if (( elapsed_since_change >= P3_STALL_SECONDS )); then
+            printf '  possible stall: write_bytes/syscw/cache size have not changed for %ss, inspect %s and Falcon logs under %s/python/%s-falcon-log\n' \
+                "$elapsed_since_change" "$case_log" "$OUT_DIR" "$case_id"
+        fi
+        if [[ -f "$case_log" ]]; then
+            printf '  latest benchmark log:\n'
+            tail -n 5 "$case_log" | sed 's/^/    /'
+        fi
+    } | tee -a "$monitor_log"
+
+    P3_MONITOR_LAST_PROGRESS_VALUE="$progress_value"
+    P3_MONITOR_LAST_CHANGE_TS="$last_change_ts"
+    return 0
+}
+
+monitor_p3_case() {
+    local case_id="$1"
+    local root_pid="$2"
+    local case_log="$3"
+    local monitor_log="$4"
+    P3_MONITOR_LAST_PROGRESS_VALUE="-1"
+    P3_MONITOR_LAST_CHANGE_TS="$(date +%s)"
+    : > "$monitor_log"
+    log "P-3 monitor enabled: interval=${P3_MONITOR_INTERVAL}s, stall_seconds=${P3_STALL_SECONDS}, log=${monitor_log}"
+    while [[ -d "/proc/$root_pid" ]]; do
+        print_case_monitor_sample "$case_id" "$root_pid" "$case_log" "$monitor_log" \
+            "$P3_MONITOR_LAST_PROGRESS_VALUE" "$P3_MONITOR_LAST_CHANGE_TS" || break
+        sleep "$P3_MONITOR_INTERVAL"
+    done
 }
 
 configure_auto_evict_case() {
@@ -830,7 +937,7 @@ run_case() {
     local case_id="$1"
     local mode="$2"
     local threshold="$3"
-    local status case_files case_threshold case_config
+    local status case_files case_threshold case_config case_log monitor_log bench_pid monitor_pid
     case_files="$FILES"
     case_threshold="$threshold"
     ensure_binary || return 1
@@ -843,6 +950,8 @@ run_case() {
     prepare_cache_dirs || return 1
     mkdir -p "$OUT_DIR/python" "$OUT_DIR/work_${case_id}" || return 1
     case_config="$(create_case_config "$case_id")" || return 1
+    case_log="$OUT_DIR/python/${case_id}.log"
+    monitor_log="$OUT_DIR/python/${case_id}-monitor.log"
     log "case ${case_id} config: ${case_config}, cache_root=${CACHE_ROOT}, cluster_view=${BENCHMARK_CLUSTER_VIEW}"
     start_meta "$case_threshold" "$case_id" || return 1
     start_idle_server "$case_threshold" "$case_id" "$case_config" || return 1
@@ -861,8 +970,24 @@ run_case() {
             --config "$case_config" \
             --python-interface "$PYTHON_INTERFACE" \
             --output "$OUT_DIR/python/${case_id}.json"
-    ) >"$OUT_DIR/python/${case_id}.log" 2>&1
+    ) >"$case_log" 2>&1 &
+    bench_pid=$!
+
+    monitor_pid=""
+    if [[ "$mode" == "create_evict" && "$P3_MONITOR" == "1" ]]; then
+        monitor_p3_case "$case_id" "$bench_pid" "$case_log" "$monitor_log" &
+        monitor_pid=$!
+    fi
+
+    set +e
+    wait "$bench_pid"
     status=$?
+    set -e
+
+    if [[ -n "$monitor_pid" ]]; then
+        kill "$monitor_pid" 2>/dev/null || true
+        wait "$monitor_pid" 2>/dev/null || true
+    fi
     stop_idle_server
     return "$status"
 }
