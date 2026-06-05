@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -83,30 +84,53 @@ class FalconEvictUnlinkListener : public DiskCacheEvictListener {
 
     void Start()
     {
-        workerCount = GetEvictUnlinkWorkerCount();
-        workers.reserve(workerCount);
-        for (std::size_t i = 0; i < workerCount; ++i) {
-            workers.emplace_back(&FalconEvictUnlinkListener::Run, this, i);
+        auto localState = state;
+        localState->workerCount = GetEvictUnlinkWorkerCount();
+        localState->activeWorkers.store(localState->workerCount);
+        workers.reserve(localState->workerCount);
+        for (std::size_t i = 0; i < localState->workerCount; ++i) {
+            workers.emplace_back(&FalconEvictUnlinkListener::Run, localState, i);
         }
-        FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener started with " << workerCount << " worker(s)";
+        FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener started with " << localState->workerCount
+                                << " worker(s)";
     }
 
     void Stop()
     {
+        auto localState = state;
         {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (stopped) {
+            std::lock_guard<std::mutex> lock(localState->mutex);
+            if (localState->stopped) {
                 return;
             }
-            stopped = true;
+            localState->stopped = true;
         }
-        cv.notify_all();
+        localState->cv.notify_all();
+
+        int timeoutMs = GetStopTimeoutMs();
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        while (localState->activeWorkers.load() > 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        bool timedOut = localState->activeWorkers.load() > 0;
+        if (timedOut) {
+            FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener stop timed out after " << timeoutMs
+                                    << " ms, active workers = " << localState->activeWorkers.load()
+                                    << ". Detached workers may still be blocked in metadata unlink RPC.";
+        }
+
         for (auto &worker : workers) {
-            if (worker.joinable()) {
+            if (!worker.joinable()) {
+                continue;
+            }
+            if (timedOut) {
+                worker.detach();
+            } else {
                 worker.join();
             }
         }
-        LogStats();
+        LogStats(localState);
     }
 
     void OnEvicted(const EvictedItem &item) override
@@ -115,45 +139,84 @@ class FalconEvictUnlinkListener : public DiskCacheEvictListener {
             FALCON_LOG(LOG_WARNING) << "Skip evicted inode " << item.inode << " without logical path";
             return;
         }
+        auto localState = state;
         {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (stopped) {
+            std::lock_guard<std::mutex> lock(localState->mutex);
+            if (localState->stopped) {
                 return;
             }
             constexpr std::size_t kMaxPendingEvictions = 10000;
             constexpr std::size_t kHighWatermark = static_cast<std::size_t>(kMaxPendingEvictions * 8 / 10);
-            if (pending.size() >= kMaxPendingEvictions) {
-                droppedItems.fetch_add(1);
+            if (localState->pending.size() >= kMaxPendingEvictions) {
+                localState->droppedItems.fetch_add(1);
                 FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener pending queue at capacity ("
                                         << kMaxPendingEvictions << "), dropping eviction for inode " << item.inode
                                         << " path " << item.path;
                 return;
             }
 
-            pending.push(item);
-            enqueuedItems.fetch_add(1);
-            UpdateAtomicMax(maxPendingItems, static_cast<uint64_t>(pending.size()));
-            if (pending.size() == kHighWatermark) {
+            localState->pending.push(item);
+            localState->enqueuedItems.fetch_add(1);
+            UpdateAtomicMax(localState->maxPendingItems, static_cast<uint64_t>(localState->pending.size()));
+            if (localState->pending.size() == kHighWatermark) {
                 FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener pending queue reached high watermark: "
-                                        << pending.size() << " items; max capacity is " << kMaxPendingEvictions;
+                                        << localState->pending.size() << " items; max capacity is "
+                                        << kMaxPendingEvictions;
             }
         }
-        cv.notify_one();
+        localState->cv.notify_one();
     }
 
   private:
-    void Run(std::size_t workerId)
+    struct SharedState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::queue<EvictedItem> pending;
+        bool stopped{false};
+        std::size_t workerCount{1};
+        std::atomic<uint64_t> activeWorkers{0};
+        std::atomic<uint64_t> enqueuedItems{0};
+        std::atomic<uint64_t> processedItems{0};
+        std::atomic<uint64_t> succeededItems{0};
+        std::atomic<uint64_t> failedItems{0};
+        std::atomic<uint64_t> droppedItems{0};
+        std::atomic<uint64_t> maxPendingItems{0};
+        std::atomic<uint64_t> totalUnlinkLatencyUs{0};
+        std::atomic<uint64_t> maxUnlinkLatencyUs{0};
+        std::mutex statsMutex;
+        std::vector<uint64_t> unlinkLatencySamples;
+    };
+
+    static int GetStopTimeoutMs()
+    {
+        constexpr int kDefaultStopTimeoutMs = 10000;
+        const char *timeout = std::getenv("EVICT_UNLINK_STOP_TIMEOUT_MS");
+        if (timeout == nullptr) {
+            return kDefaultStopTimeoutMs;
+        }
+        char *end = nullptr;
+        long value = std::strtol(timeout, &end, 10);
+        if (end == timeout || value < 0) {
+            FALCON_LOG(LOG_WARNING) << "Invalid EVICT_UNLINK_STOP_TIMEOUT_MS value: " << timeout
+                                    << ", use " << kDefaultStopTimeoutMs;
+            return kDefaultStopTimeoutMs;
+        }
+        return static_cast<int>(value);
+    }
+
+    static void Run(std::shared_ptr<SharedState> localState, std::size_t workerId)
     {
         while (true) {
             EvictedItem item;
             {
-                std::unique_lock<std::mutex> lock(mutex);
-                cv.wait(lock, [this]() { return stopped || !pending.empty(); });
-                if (stopped && pending.empty()) {
+                std::unique_lock<std::mutex> lock(localState->mutex);
+                localState->cv.wait(lock, [&localState]() { return localState->stopped || !localState->pending.empty(); });
+                if (localState->stopped && localState->pending.empty()) {
+                    localState->activeWorkers.fetch_sub(1);
                     return;
                 }
-                item = pending.front();
-                pending.pop();
+                item = localState->pending.front();
+                localState->pending.pop();
             }
 
             auto start = std::chrono::steady_clock::now();
@@ -161,61 +224,47 @@ class FalconEvictUnlinkListener : public DiskCacheEvictListener {
             uint64_t elapsedUs = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start)
                     .count());
-            processedItems.fetch_add(1);
-            totalUnlinkLatencyUs.fetch_add(elapsedUs);
-            UpdateAtomicMax(maxUnlinkLatencyUs, elapsedUs);
+            localState->processedItems.fetch_add(1);
+            localState->totalUnlinkLatencyUs.fetch_add(elapsedUs);
+            UpdateAtomicMax(localState->maxUnlinkLatencyUs, elapsedUs);
             {
-                std::lock_guard<std::mutex> lock(statsMutex);
-                unlinkLatencySamples.push_back(elapsedUs);
+                std::lock_guard<std::mutex> lock(localState->statsMutex);
+                localState->unlinkLatencySamples.push_back(elapsedUs);
             }
             if (ret != SUCCESS) {
-                failedItems.fetch_add(1);
+                localState->failedItems.fetch_add(1);
                 FALCON_LOG(LOG_WARNING) << "Evict unlink failed for path " << item.path << ", worker " << workerId
                                         << ", error code: " << ret;
             } else {
-                succeededItems.fetch_add(1);
+                localState->succeededItems.fetch_add(1);
             }
         }
     }
 
-    void LogStats()
+    static void LogStats(const std::shared_ptr<SharedState> &localState)
     {
-        uint64_t processed = processedItems.load();
-        uint64_t avgLatencyUs = processed == 0 ? 0 : totalUnlinkLatencyUs.load() / processed;
+        uint64_t processed = localState->processedItems.load();
+        uint64_t avgLatencyUs = processed == 0 ? 0 : localState->totalUnlinkLatencyUs.load() / processed;
         std::vector<uint64_t> latencySamples;
         {
-            std::lock_guard<std::mutex> lock(statsMutex);
-            latencySamples = unlinkLatencySamples;
+            std::lock_guard<std::mutex> lock(localState->statsMutex);
+            latencySamples = localState->unlinkLatencySamples;
         }
-        FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener stopped, workers = " << workerCount
-                                << ", enqueued = " << enqueuedItems.load()
+        FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener stopped, workers = " << localState->workerCount
+                                << ", enqueued = " << localState->enqueuedItems.load()
                                 << ", processed = " << processed
-                                << ", succeeded = " << succeededItems.load()
-                                << ", failed = " << failedItems.load()
-                                << ", dropped = " << droppedItems.load()
-                                << ", max pending = " << maxPendingItems.load()
+                                << ", succeeded = " << localState->succeededItems.load()
+                                << ", failed = " << localState->failedItems.load()
+                                << ", dropped = " << localState->droppedItems.load()
+                                << ", max pending = " << localState->maxPendingItems.load()
                                 << ", avg unlink latency us = " << avgLatencyUs
                                 << ", p95 unlink latency us = " << Percentile(latencySamples, 0.95)
                                 << ", p99 unlink latency us = " << Percentile(latencySamples, 0.99)
-                                << ", max unlink latency us = " << maxUnlinkLatencyUs.load();
+                                << ", max unlink latency us = " << localState->maxUnlinkLatencyUs.load();
     }
 
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::queue<EvictedItem> pending;
-    bool stopped{false};
+    std::shared_ptr<SharedState> state{std::make_shared<SharedState>()};
     std::vector<std::thread> workers;
-    std::size_t workerCount{1};
-    std::atomic<uint64_t> enqueuedItems{0};
-    std::atomic<uint64_t> processedItems{0};
-    std::atomic<uint64_t> succeededItems{0};
-    std::atomic<uint64_t> failedItems{0};
-    std::atomic<uint64_t> droppedItems{0};
-    std::atomic<uint64_t> maxPendingItems{0};
-    std::atomic<uint64_t> totalUnlinkLatencyUs{0};
-    std::atomic<uint64_t> maxUnlinkLatencyUs{0};
-    std::mutex statsMutex;
-    std::vector<uint64_t> unlinkLatencySamples;
 };
 
 std::unique_ptr<FalconEvictUnlinkListener> evictUnlinkListener;
