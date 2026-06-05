@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 from pathlib import Path
 
 
@@ -19,6 +20,286 @@ FIO_CASES = {
     "B-5": "本地多文件删除基准",
 }
 
+
+
+CLEANUP_RE = re.compile(
+    r"DiskCache::(?P<kind>CleanupForEvict|Cleanup)\(\): Evicted (?P<files>\d+) files, all size is (?P<size>\d+)"
+    r", failed files = (?P<failed>\d+), scanned files = (?P<scanned>\d+), cleanup elapsed us = (?P<cleanup_us>\d+)"
+    r", remove elapsed us = (?P<remove_us>\d+)"
+)
+NOTIFY_RE = re.compile(r"DiskCache::(?P<kind>Evict|Cleanup)\(\): NotifyEvicted (?P<items>\d+) items, elapsed us = (?P<elapsed_us>\d+)")
+UNLINK_STATS_RE = re.compile(
+    r"FalconEvictUnlinkListener stopped, workers = (?P<workers>\d+), enqueued = (?P<enqueued>\d+), "
+    r"processed = (?P<processed>\d+), succeeded = (?P<succeeded>\d+), failed = (?P<failed>\d+), "
+    r"dropped = (?P<dropped>\d+), max pending = (?P<max_pending>\d+), avg unlink latency us = (?P<avg_us>\d+), "
+    r"p95 unlink latency us = (?P<p95_us>\d+), p99 unlink latency us = (?P<p99_us>\d+), max unlink latency us = (?P<max_us>\d+)"
+)
+
+
+def percentile(values, q):
+    if not values:
+        return None
+    values = sorted(values)
+    idx = int(len(values) * q)
+    if idx >= len(values):
+        idx = len(values) - 1
+    return values[idx]
+
+
+def fmt_mib(bytes_value):
+    if bytes_value is None:
+        return "N/A"
+    return f"{bytes_value / 1048576.0:.2f} MiB"
+
+
+def fmt_duration_us(value):
+    if value is None:
+        return "N/A"
+    value = float(value)
+    if value >= 1_000_000:
+        return f"{value / 1_000_000.0:.3f}s"
+    return f"{value / 1000.0:.2f}ms"
+
+
+def rate_mib_per_sec(bytes_value, elapsed_us):
+    if not bytes_value or not elapsed_us:
+        return None
+    return bytes_value / 1048576.0 / (elapsed_us / 1_000_000.0)
+
+
+def rate_files_per_sec(files, elapsed_us):
+    if not files or not elapsed_us:
+        return None
+    return files / (elapsed_us / 1_000_000.0)
+
+
+def empty_cleanup_bucket():
+    return {
+        "rounds": 0,
+        "files": 0,
+        "bytes": 0,
+        "failed": 0,
+        "scanned": 0,
+        "cleanup_us": 0,
+        "remove_us": 0,
+        "cleanup_samples_us": [],
+        "remove_samples_us": [],
+    }
+
+
+def add_cleanup(bucket, files, size, failed, scanned, cleanup_us, remove_us):
+    bucket["rounds"] += 1
+    bucket["files"] += files
+    bucket["bytes"] += size
+    bucket["failed"] += failed
+    bucket["scanned"] += scanned
+    bucket["cleanup_us"] += cleanup_us
+    bucket["remove_us"] += remove_us
+    bucket["cleanup_samples_us"].append(cleanup_us)
+    bucket["remove_samples_us"].append(remove_us)
+
+
+def iter_text_files(root):
+    if not root.exists():
+        return
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        name = path.name
+        if name.endswith((".json", ".err", ".txt", ".log")) or "falcon." in name:
+            yield path
+
+
+def parse_evict_stats(out_dir):
+    stats = {
+        "cleanup_for_evict": empty_cleanup_bucket(),
+        "cleanup": empty_cleanup_bucket(),
+        "combined": empty_cleanup_bucket(),
+        "notify_items": 0,
+        "notify_us": 0,
+        "notify_samples_us": [],
+        "unlink_stats": [],
+        "matched_files": set(),
+    }
+    seen_cleanup_lines = set()
+    seen_notify_lines = set()
+    seen_unlink_lines = set()
+    for path in iter_text_files(out_dir):
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    cleanup_match = CLEANUP_RE.search(line)
+                    if cleanup_match:
+                        line_key = line.strip()
+                        if line_key in seen_cleanup_lines:
+                            continue
+                        seen_cleanup_lines.add(line_key)
+                        values = {k: int(v) if k != "kind" else v for k, v in cleanup_match.groupdict().items()}
+                        key = "cleanup_for_evict" if values["kind"] == "CleanupForEvict" else "cleanup"
+                        add_cleanup(
+                            stats[key],
+                            values["files"],
+                            values["size"],
+                            values["failed"],
+                            values["scanned"],
+                            values["cleanup_us"],
+                            values["remove_us"],
+                        )
+                        add_cleanup(
+                            stats["combined"],
+                            values["files"],
+                            values["size"],
+                            values["failed"],
+                            values["scanned"],
+                            values["cleanup_us"],
+                            values["remove_us"],
+                        )
+                        stats["matched_files"].add(str(path))
+                        continue
+
+                    notify_match = NOTIFY_RE.search(line)
+                    if notify_match:
+                        line_key = line.strip()
+                        if line_key in seen_notify_lines:
+                            continue
+                        seen_notify_lines.add(line_key)
+                        items = int(notify_match.group("items"))
+                        elapsed_us = int(notify_match.group("elapsed_us"))
+                        stats["notify_items"] += items
+                        stats["notify_us"] += elapsed_us
+                        stats["notify_samples_us"].append(elapsed_us)
+                        stats["matched_files"].add(str(path))
+                        continue
+
+                    unlink_match = UNLINK_STATS_RE.search(line)
+                    if unlink_match:
+                        line_key = line.strip()
+                        if line_key in seen_unlink_lines:
+                            continue
+                        seen_unlink_lines.add(line_key)
+                        item = {k: int(v) for k, v in unlink_match.groupdict().items()}
+                        if item["enqueued"] or item["processed"] or item["failed"] or item["dropped"]:
+                            stats["unlink_stats"].append(item)
+                            stats["matched_files"].add(str(path))
+        except OSError:
+            continue
+    return stats
+
+
+def cleanup_summary_row(name, bucket):
+    return [
+        name,
+        bucket["rounds"],
+        bucket["files"],
+        fmt_mib(bucket["bytes"]),
+        fmt_duration_us(bucket["cleanup_us"]),
+        fmt_duration_us(bucket["remove_us"]),
+        fmt_rate(rate_files_per_sec(bucket["files"], bucket["cleanup_us"]), rate_mib_per_sec(bucket["bytes"], bucket["cleanup_us"])),
+        fmt_rate(rate_files_per_sec(bucket["files"], bucket["remove_us"]), rate_mib_per_sec(bucket["bytes"], bucket["remove_us"])),
+        f"{bucket['failed']}/{bucket['scanned']}",
+    ]
+
+
+def latency_rows_for_bucket(name, bucket):
+    return [
+        [name, "cleanup round p50/p95/p99/max", ", ".join(fmt_duration_us(v) for v in [
+            percentile(bucket["cleanup_samples_us"], 0.50),
+            percentile(bucket["cleanup_samples_us"], 0.95),
+            percentile(bucket["cleanup_samples_us"], 0.99),
+            max(bucket["cleanup_samples_us"]) if bucket["cleanup_samples_us"] else None,
+        ])],
+        [name, "remove round p50/p95/p99/max", ", ".join(fmt_duration_us(v) for v in [
+            percentile(bucket["remove_samples_us"], 0.50),
+            percentile(bucket["remove_samples_us"], 0.95),
+            percentile(bucket["remove_samples_us"], 0.99),
+            max(bucket["remove_samples_us"]) if bucket["remove_samples_us"] else None,
+        ])],
+    ]
+
+
+def evict_overview_value(evict_stats):
+    bucket = evict_stats["combined"]
+    if bucket["files"] == 0:
+        return "未采集到 evict 日志"
+    cleanup_rate = fmt_rate(
+        rate_files_per_sec(bucket["files"], bucket["cleanup_us"]),
+        rate_mib_per_sec(bucket["bytes"], bucket["cleanup_us"]),
+    )
+    remove_rate = fmt_rate(
+        rate_files_per_sec(bucket["files"], bucket["remove_us"]),
+        rate_mib_per_sec(bucket["bytes"], bucket["remove_us"]),
+    )
+    return f"cleanup {cleanup_rate}; remove {remove_rate}"
+
+
+def append_evict_section(lines, evict_stats):
+    lines.append("")
+    lines.append("## DiskCache evict 删除性能与时延")
+    lines.append("")
+    if evict_stats["combined"]["files"] == 0 and not evict_stats["unlink_stats"]:
+        lines.append("未在输出目录中采集到 `DiskCache::CleanupForEvict()` / `DiskCache::Cleanup()` / `FalconEvictUnlinkListener stopped` 日志。")
+        lines.append("")
+        lines.append("说明：Python internal API 会把 client 侧 Falcon 日志写到 `$OUT_DIR/work_*` 下；summary 必须在清理 `work_*` 之前生成，才能统计 evict 删除吞吐。")
+        return
+
+    lines.append(table(
+        ["范围", "轮次", "删除文件", "删除大小", "cleanup总耗时", "remove总耗时", "cleanup吞吐", "remove吞吐", "失败/扫描"],
+        [
+            cleanup_summary_row("前台 CleanupForEvict", evict_stats["cleanup_for_evict"]),
+            cleanup_summary_row("后台 Cleanup", evict_stats["cleanup"]),
+            cleanup_summary_row("合计", evict_stats["combined"]),
+        ],
+    ))
+    lines.append("")
+
+    latency_rows = []
+    if evict_stats["cleanup_for_evict"]["rounds"]:
+        latency_rows.extend(latency_rows_for_bucket("前台 CleanupForEvict", evict_stats["cleanup_for_evict"]))
+    if evict_stats["cleanup"]["rounds"]:
+        latency_rows.extend(latency_rows_for_bucket("后台 Cleanup", evict_stats["cleanup"]))
+    if evict_stats["notify_samples_us"]:
+        latency_rows.append(["NotifyEvicted", "p50/p95/p99/max", ", ".join(fmt_duration_us(v) for v in [
+            percentile(evict_stats["notify_samples_us"], 0.50),
+            percentile(evict_stats["notify_samples_us"], 0.95),
+            percentile(evict_stats["notify_samples_us"], 0.99),
+            max(evict_stats["notify_samples_us"]),
+        ])])
+    if latency_rows:
+        lines.append(table(["范围", "指标", "值"], latency_rows))
+        lines.append("")
+
+    if evict_stats["unlink_stats"]:
+        rows = []
+        for item in evict_stats["unlink_stats"]:
+            rows.append([
+                item["workers"],
+                item["enqueued"],
+                item["processed"],
+                item["succeeded"],
+                item["failed"],
+                item["dropped"],
+                item["max_pending"],
+                fmt_duration_us(item["avg_us"]),
+                fmt_duration_us(item["p95_us"]),
+                fmt_duration_us(item["p99_us"]),
+                fmt_duration_us(item["max_us"]),
+            ])
+        lines.append("### Evict 后异步元数据 unlink")
+        lines.append("")
+        lines.append(table(
+            ["workers", "enqueued", "processed", "succeeded", "failed", "dropped", "max pending", "avg", "p95", "p99", "max"],
+            rows,
+        ))
+        lines.append("")
+
+    matched = sorted(evict_stats["matched_files"])
+    if matched:
+        lines.append("### Evict 日志来源")
+        lines.append("")
+        lines.append(table(["文件"], [[path] for path in matched[:20]]))
+        if len(matched) > 20:
+            lines.append("")
+            lines.append(f"仅展示前 20 个日志文件，实际匹配 {len(matched)} 个文件。")
 
 def load_json(path):
     if not path.exists():
@@ -57,7 +338,7 @@ def fmt_rate(files_per_sec, mib_per_sec):
     return f"{fmt_num(files_per_sec)} files/s, {fmt_num(mib_per_sec)} MiB/s"
 
 
-def python_row(case_id, data):
+def python_row(case_id, data, evict_stats=None):
     if data is None:
         return [case_id, PYTHON_CASES[case_id], "N/A", "N/A", "N/A", "N/A", "缺失"]
     if data.get("_load_error"):
@@ -92,7 +373,7 @@ def python_row(case_id, data):
         PYTHON_CASES[case_id],
         str(data.get("clients", data.get("writer_clients", "N/A"))),
         fmt_rate(data.get("files_per_sec"), data.get("mib_per_sec")),
-        "DiskCache evict" if case_id == "P-3" else "N/A",
+        evict_overview_value(evict_stats) if case_id == "P-3" and evict_stats is not None else ("DiskCache evict" if case_id == "P-3" else "N/A"),
         fmt_sec(data.get("elapsed_sec")),
         str(error),
     ]
@@ -218,6 +499,7 @@ def main():
 
     python_data = {case: load_json(python_dir / f"{case}.json") for case in PYTHON_CASES}
     fio_data = {case: load_json(fio_dir / f"{case}.json") for case in FIO_CASES}
+    evict_stats = parse_evict_stats(out_dir)
 
     lines = []
     lines.append("# PyFalcon internal client benchmark 测试结果")
@@ -239,7 +521,7 @@ def main():
     lines.append("")
     lines.append(table(
         ["编号", "场景", "并发", "写吞吐", "删除/evict 吞吐", "主要耗时", "错误"],
-        [python_row(case, python_data[case]) for case in PYTHON_CASES],
+        [python_row(case, python_data[case], evict_stats if case == "P-3" else None) for case in PYTHON_CASES],
     ))
     detail_rows = []
     for case in PYTHON_CASES:
@@ -249,6 +531,9 @@ def main():
         lines.append("## Python JSON 明细")
         lines.append("")
         lines.append(table(["编号", "指标", "值"], detail_rows))
+
+    lines.append("")
+    append_evict_section(lines, evict_stats)
 
     lines.append("")
     lines.append("## fio 本地基准")

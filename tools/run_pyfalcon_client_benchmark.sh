@@ -1027,10 +1027,10 @@ run_group "$SCENARIO"
 if scenario_uses_falcon; then
     clean_runtime
 fi
-cleanup_temp_dirs
 write_summary
 log "summary: $OUT_DIR/benchmark_summary.md"
 log "summary log: $OUT_DIR/benchmark_summary.log"
+cleanup_temp_dirs
 if (( ${#FAILED_CASES[@]} > 0 )); then
     log "failed cases: ${FAILED_CASES[*]}"
     exit 1
