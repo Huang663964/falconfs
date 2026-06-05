@@ -30,6 +30,8 @@ UNLINK_FILES="${UNLINK_FILES:-6000}"
 FILE_SIZE="${FILE_SIZE:-2097152}"
 WAIT_SEC="${WAIT_SEC:-45}"
 FIO_SIZE="${FIO_SIZE:-2G}"
+FIO_LARGE_SIZE="${FIO_LARGE_SIZE:-10G}"
+FIO_LARGE_RUNTIME="${FIO_LARGE_RUNTIME:-10}"
 REQUIRE_NVME="${REQUIRE_NVME:-1}"
 WRITE_THRESHOLD="${WRITE_THRESHOLD:-1}"
 EVICT_THRESHOLD="${EVICT_THRESHOLD:-0.72}"
@@ -55,9 +57,9 @@ Usage:
   $0 <scenario>
 
 Scenarios:
-  all    Run Python internal P-1/P-2/P-3/P-5 and fio B-1..B-5.
+  all    Run Python internal P-1/P-2/P-3/P-5 and fio B-1..B-6.
   python Run P-1, P-2, P-3 and P-5 only.
-  fio    Run fio/local baseline B-1..B-5 only.
+  fio    Run fio/local baseline B-1..B-6 only.
   P-1    Python internal 4-client write-only benchmark.
   P-2    Python internal 4-client unlink-only benchmark.
   P-3    Python internal 4-client write-triggered DiskCache evict benchmark.
@@ -67,6 +69,7 @@ Scenarios:
   B-3    fio multi-file direct write baseline.
   B-4    fio multi-file direct read baseline.
   B-5    local multi-file delete baseline after fio create.
+  B-6    fio large-file 2MiB psync sequential write baseline.
 
 Environment overrides:
   DEFAULT_BENCHMARK_ROOT=${DEFAULT_BENCHMARK_ROOT}
@@ -78,6 +81,8 @@ Environment overrides:
   FILE_SIZE=${FILE_SIZE}
   WAIT_SEC=${WAIT_SEC}
   FIO_SIZE=${FIO_SIZE}
+  FIO_LARGE_SIZE=${FIO_LARGE_SIZE}
+  FIO_LARGE_RUNTIME=${FIO_LARGE_RUNTIME}
   FIO_DIR=${FIO_DIR}
   CACHE_ROOT=${CACHE_ROOT}
   REQUIRE_NVME=${REQUIRE_NVME}
@@ -100,7 +105,7 @@ Environment overrides:
   PYTHON_INTERFACE=${PYTHON_INTERFACE}
 
 Example:
-  BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 UNLINK_FILES=6000 FIO_SIZE=2G $0 all
+  BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 UNLINK_FILES=6000 FIO_SIZE=2G FIO_LARGE_SIZE=10G FIO_LARGE_RUNTIME=10 $0 all
 EOF
 }
 
@@ -804,6 +809,17 @@ with open(out, "w", encoding="utf-8") as f:
 PY2
             rm -rf "$FIO_DIR/delete"
             ;;
+        B-6)
+            log "running B-6: fio large-file psync sequential write, bs=2M, jobs=1, size=${FIO_LARGE_SIZE}, runtime=${FIO_LARGE_RUNTIME}s"
+            rm -rf "$FIO_DIR/large_write_2m"
+            mkdir -p "$FIO_DIR/large_write_2m"
+            fio --output="$OUT_DIR/fio/B-6.json" --output-format=json \
+                --name=write_2m --directory="$FIO_DIR/large_write_2m" \
+                --direct=1 --iodepth=1 --thread --rw=write --ioengine=psync \
+                --bs=2M --numjobs=1 --size="$FIO_LARGE_SIZE" --group_reporting=1 \
+                --time_based --runtime="$FIO_LARGE_RUNTIME" || return 1
+            rm -rf "$FIO_DIR/large_write_2m"
+            ;;
         *) echo "unknown fio case: ${case_id}" >&2; exit 1 ;;
     esac
 }
@@ -821,6 +837,7 @@ run_fio_group() {
     run_step B-3 run_fio_case B-3
     run_step B-4 run_fio_case B-4
     run_step B-5 run_fio_case B-5
+    run_step B-6 run_fio_case B-6
 }
 
 write_summary() {
@@ -832,7 +849,9 @@ write_summary() {
         --unlink-files "$UNLINK_FILES" \
         --file-size "$FILE_SIZE" \
         --wait-sec "$WAIT_SEC" \
-        --fio-size "$FIO_SIZE"
+        --fio-size "$FIO_SIZE" \
+        --fio-large-size "$FIO_LARGE_SIZE" \
+        --fio-large-runtime "$FIO_LARGE_RUNTIME"
 }
 
 print_python_case_diagnostics() {
@@ -1004,7 +1023,7 @@ run_group() {
         P-2) run_step P-2 run_case P-2 unlink_only "$WRITE_THRESHOLD" ;;
         P-3) run_step P-3 run_case P-3 create_evict "$EVICT_THRESHOLD" ;;
         P-5) run_step P-5 run_case P-5 concurrent_unlink "$WRITE_THRESHOLD" ;;
-        B-1|B-2|B-3|B-4|B-5) run_step "$1" run_fio_case "$1" ;;
+        B-1|B-2|B-3|B-4|B-5|B-6) run_step "$1" run_fio_case "$1" ;;
         help|-h|--help) usage ;;
         *) usage; exit 1 ;;
     esac

@@ -18,6 +18,7 @@ FIO_CASES = {
     "B-3": "fio 多文件 direct 顺序写",
     "B-4": "fio 多文件 direct 顺序读",
     "B-5": "本地多文件删除基准",
+    "B-6": "fio 大文件 2MiB psync 连续写",
 }
 
 
@@ -488,6 +489,8 @@ def main():
     parser.add_argument("--file-size", default="")
     parser.add_argument("--wait-sec", default="")
     parser.add_argument("--fio-size", default="")
+    parser.add_argument("--fio-large-size", default="")
+    parser.add_argument("--fio-large-runtime", default="")
     parser.add_argument("--scenario", default="")
     args = parser.parse_args()
 
@@ -515,6 +518,8 @@ def main():
         ["FILE_SIZE bytes", args.file_size or "N/A"],
         ["WAIT_SEC", args.wait_sec or "N/A"],
         ["FIO_SIZE", args.fio_size or "N/A"],
+        ["FIO_LARGE_SIZE", args.fio_large_size or "N/A"],
+        ["FIO_LARGE_RUNTIME", args.fio_large_runtime or "N/A"],
     ]))
     lines.append("")
     lines.append("## Python internal API 结果总览")
