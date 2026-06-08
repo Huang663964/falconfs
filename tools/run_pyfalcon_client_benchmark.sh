@@ -32,6 +32,7 @@ FILE_SIZE="${FILE_SIZE:-2097152}"
 WAIT_SEC="${WAIT_SEC:-45}"
 MIXED_DURATION_SEC="${MIXED_DURATION_SEC:-120}"
 HOT_READ_WINDOW="${HOT_READ_WINDOW:-1024}"
+HOT_READ_LAG="${HOT_READ_LAG:-128}"
 FIO_SIZE="${FIO_SIZE:-2G}"
 FIO_LARGE_SIZE="${FIO_LARGE_SIZE:-10G}"
 FIO_LARGE_RUNTIME="${FIO_LARGE_RUNTIME:-10}"
@@ -96,6 +97,7 @@ Environment overrides:
   WAIT_SEC=${WAIT_SEC}
   MIXED_DURATION_SEC=${MIXED_DURATION_SEC}
   HOT_READ_WINDOW=${HOT_READ_WINDOW}
+  HOT_READ_LAG=${HOT_READ_LAG}
   FIO_SIZE=${FIO_SIZE}
   FIO_LARGE_SIZE=${FIO_LARGE_SIZE}
   FIO_LARGE_RUNTIME=${FIO_LARGE_RUNTIME}
@@ -197,6 +199,7 @@ write_storage_info() {
         echo "read_files=$READ_FILES"
         echo "mixed_duration_sec=$MIXED_DURATION_SEC"
         echo "hot_read_window=$HOT_READ_WINDOW"
+        echo "hot_read_lag=$HOT_READ_LAG"
         echo "fio_numjobs_list=$FIO_NUMJOBS_LIST"
         echo "fio_matrix_size=$FIO_MATRIX_SIZE"
         echo "fio_unaligned_size=$FIO_UNALIGNED_SIZE"
@@ -1217,6 +1220,7 @@ run_case() {
             --wait-sec "$WAIT_SEC" \
             --duration-sec "$MIXED_DURATION_SEC" \
             --hot-read-window "$HOT_READ_WINDOW" \
+            --hot-read-lag "$HOT_READ_LAG" \
             --dir "/py_${case_id}" \
             --workspace "$OUT_DIR/work_${case_id}" \
             --config "$case_config" \

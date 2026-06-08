@@ -299,11 +299,12 @@ def worker_read_hot_timed(args, role, client_id, writer_prefix, writer_clients, 
         while not stop_event.is_set() and time.monotonic() < deadline:
             writer_id = (client_id + i) % writer_clients
             count = counters[writer_id]
-            if count <= 0:
+            readable_count = count - max(args.hot_read_lag, 0)
+            if readable_count <= 0:
                 time.sleep(args.hot_read_retry_sleep_sec)
                 continue
-            window = min(count, max(args.hot_read_window, 1))
-            index = count - 1 - (i % window)
+            window = min(readable_count, max(args.hot_read_window, 1))
+            index = readable_count - 1 - (i % window)
             path = f"{args.dir}_{writer_prefix}_{writer_id}/f_{index:08d}"
             op_begin = time.monotonic()
             try:
@@ -327,6 +328,7 @@ def worker_read_hot_timed(args, role, client_id, writer_prefix, writer_clients, 
             "latencies": latencies,
             "operation_error_count": max(0, i - len(latencies)),
             "operation_errors": operation_errors,
+            "hot_read_lag": args.hot_read_lag,
             "stop_reason": "duration" if not fatal_error else "error",
             "error": fatal_error,
         })
@@ -655,6 +657,7 @@ def run_read_write(args):
         "duration_sec": args.duration_sec,
         "read_pattern": read_pattern,
         "hot_read_window": args.hot_read_window if timed else 0,
+        "hot_read_lag": args.hot_read_lag if timed else 0,
         "reader_clients": args.clients,
         "writer_clients": args.clients,
         "total_processes": args.clients * 2,
@@ -772,9 +775,11 @@ def main():
     parser.add_argument("--duration-sec", type=float, default=0.0,
                         help="Run read_write/read_write_evict for a fixed duration; 0 keeps fixed-file mode.")
     parser.add_argument("--hot-read-window", type=int, default=1024,
-                        help="For timed read/write cases, readers loop over the newest N files per writer.")
+                        help="For timed read/write cases, readers loop over a completed writer-file window.")
+    parser.add_argument("--hot-read-lag", type=int, default=128,
+                        help="For timed read/write cases, readers skip this many newest completed files per writer.")
     parser.add_argument("--hot-read-retry-sleep-sec", type=float, default=0.001,
-                        help="Sleep between hot-read retries after missing a writer file.")
+                        help="Sleep between hot-read retries while waiting for enough writer files or after a read error.")
     parser.add_argument("--dir", required=True)
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--config", default="/usr/local/falconfs/falcon_client/config/config.json")
