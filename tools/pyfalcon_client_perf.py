@@ -80,15 +80,22 @@ def open_read_close(client, path, size):
     ret, fd = client.Open(path, os.O_RDONLY)
     if ret != 0:
         raise RuntimeError(f"Open {path} failed: {ret}, fd={fd}, {describe_path_state(client, path)}")
+    primary_error = None
     try:
         buf = bytearray(size)
         ret = client.Read(path, fd, buf, size, 0)
         if ret != size:
             raise RuntimeError(f"Read {path} failed: ret={ret}, expected={size}, fd={fd}, {describe_path_state(client, path)}")
+    except Exception as exc:
+        primary_error = exc
+        raise
     finally:
         close_ret = client.Close(path, fd)
         if close_ret != 0:
-            raise RuntimeError(f"Close {path} failed: {close_ret}, fd={fd}, {describe_path_state(client, path)}")
+            close_error = f"Close {path} failed: {close_ret}, fd={fd}, {describe_path_state(client, path)}"
+            if primary_error is not None:
+                raise RuntimeError(f"{primary_error}; additionally {close_error}") from primary_error
+            raise RuntimeError(close_error)
 
 
 def worker_write(args, role, client_id, base_dir, files, start_event, ready_q, result_q):
@@ -300,7 +307,7 @@ def worker_read_hot_timed(args, role, client_id, writer_prefix, writer_clients, 
             writer_id = (client_id + i) % writer_clients
             count = counters[writer_id]
             readable_count = count - max(args.hot_read_lag, 0)
-            if readable_count <= 0:
+            if readable_count < max(args.hot_read_min_files, 1):
                 time.sleep(args.hot_read_retry_sleep_sec)
                 continue
             window = min(readable_count, max(args.hot_read_window, 1))
@@ -329,6 +336,7 @@ def worker_read_hot_timed(args, role, client_id, writer_prefix, writer_clients, 
             "operation_error_count": max(0, i - len(latencies)),
             "operation_errors": operation_errors,
             "hot_read_lag": args.hot_read_lag,
+            "hot_read_min_files": args.hot_read_min_files,
             "stop_reason": "duration" if not fatal_error else "error",
             "error": fatal_error,
         })
@@ -658,6 +666,7 @@ def run_read_write(args):
         "read_pattern": read_pattern,
         "hot_read_window": args.hot_read_window if timed else 0,
         "hot_read_lag": args.hot_read_lag if timed else 0,
+        "hot_read_min_files": args.hot_read_min_files if timed else 0,
         "reader_clients": args.clients,
         "writer_clients": args.clients,
         "total_processes": args.clients * 2,
@@ -778,6 +787,8 @@ def main():
                         help="For timed read/write cases, readers loop over a completed writer-file window.")
     parser.add_argument("--hot-read-lag", type=int, default=128,
                         help="For timed read/write cases, readers skip this many newest completed files per writer.")
+    parser.add_argument("--hot-read-min-files", type=int, default=0,
+                        help="Readers wait until each writer has at least this many readable files after lag; 0 uses hot-read-window.")
     parser.add_argument("--hot-read-retry-sleep-sec", type=float, default=0.001,
                         help="Sleep between hot-read retries while waiting for enough writer files or after a read error.")
     parser.add_argument("--dir", required=True)
@@ -788,6 +799,8 @@ def main():
     args = parser.parse_args()
     if args.read_files is None:
         args.read_files = args.files
+    if args.hot_read_min_files <= 0:
+        args.hot_read_min_files = max(args.hot_read_window, 1)
 
     Path(args.workspace).mkdir(parents=True, exist_ok=True)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)

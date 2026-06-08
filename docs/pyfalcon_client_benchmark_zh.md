@@ -147,6 +147,7 @@ bash tools/run_pyfalcon_client_benchmark.sh B-DIO
 | `MIXED_DURATION_SEC` | `120` | P-RW/P-RWE 固定时长持续读写窗口 |
 | `HOT_READ_WINDOW` | `1024` | P-RW/P-RWE reader 在每个 writer 的可读热窗口内循环读取 |
 | `HOT_READ_LAG` | `128` | P-RW/P-RWE reader 跳过每个 writer 最新完成的 N 个文件，避免读取刚 close 的文件 |
+| `HOT_READ_MIN_FILES` | `$HOT_READ_WINDOW` | P-RW/P-RWE reader 等每个 writer 在 lag 之后至少有一个完整可读窗口后再开始读，避免启动阶段读到最老文件 |
 | `UNLINK_FILES` | 6000 | 删除文件数 |
 | `FILE_SIZE` | 2097152 | 单文件大小，默认 2MiB |
 | `WAIT_SEC` | 45 | P-3 写完后等待 evict 的时间 |
