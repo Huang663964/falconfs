@@ -418,6 +418,16 @@ def python_row(case_id, data, evict_stats=None):
         str(error),
     ]
 
+
+def stop_reasons(group):
+    counts = {}
+    for item in group.get("per_client") or []:
+        reason = item.get("stop_reason") or "N/A"
+        counts[reason] = counts.get(reason, 0) + 1
+    if not counts:
+        return "N/A"
+    return ", ".join(f"{key}:{counts[key]}" for key in sorted(counts))
+
 def python_detail_rows(case_id, data):
     if data is None:
         return []
@@ -468,6 +478,8 @@ def python_detail_rows(case_id, data):
         reader = data.get("reader", {})
         writer = data.get("writer", {})
         rows.extend([
+            [case_id, "timed", str(data.get("timed", False))],
+            [case_id, "duration_sec", fmt_num(data.get("duration_sec"), 6)],
             [case_id, "mixed_elapsed_sec", fmt_num(data.get("mixed_elapsed_sec"), 6)],
             [case_id, "reader.files_per_sec", fmt_num(reader.get("files_per_sec"), 6)],
             [case_id, "reader.mib_per_sec", fmt_num(reader.get("mib_per_sec"), 6)],
@@ -475,6 +487,10 @@ def python_detail_rows(case_id, data):
             [case_id, "writer.mib_per_sec", fmt_num(writer.get("mib_per_sec"), 6)],
             [case_id, "reader.latency_p99", fmt_ms(reader.get("latency_p99_sec"))],
             [case_id, "writer.latency_p99", fmt_ms(writer.get("latency_p99_sec"))],
+            [case_id, "reader.max_worker_elapsed_sec", fmt_num(reader.get("max_worker_elapsed_sec"), 6)],
+            [case_id, "writer.max_worker_elapsed_sec", fmt_num(writer.get("max_worker_elapsed_sec"), 6)],
+            [case_id, "reader.stop_reasons", stop_reasons(reader)],
+            [case_id, "writer.stop_reasons", stop_reasons(writer)],
         ])
         if case_id == "P-RWE":
             rows.append([case_id, "wait_sec", fmt_num(data.get("wait_sec"), 0)])
@@ -587,6 +603,7 @@ def main():
     parser.add_argument("--unlink-files", default="")
     parser.add_argument("--file-size", default="")
     parser.add_argument("--wait-sec", default="")
+    parser.add_argument("--mixed-duration-sec", default="")
     parser.add_argument("--fio-size", default="")
     parser.add_argument("--fio-large-size", default="")
     parser.add_argument("--fio-large-runtime", default="")
@@ -621,6 +638,7 @@ def main():
         ["UNLINK_FILES", args.unlink_files or "N/A"],
         ["FILE_SIZE bytes", args.file_size or "N/A"],
         ["WAIT_SEC", args.wait_sec or "N/A"],
+        ["MIXED_DURATION_SEC", args.mixed_duration_sec or "N/A"],
         ["FIO_SIZE", args.fio_size or "N/A"],
         ["FIO_LARGE_SIZE", args.fio_large_size or "N/A"],
         ["FIO_LARGE_RUNTIME", args.fio_large_runtime or "N/A"],

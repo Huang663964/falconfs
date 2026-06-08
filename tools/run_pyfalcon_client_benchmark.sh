@@ -30,6 +30,7 @@ READ_FILES="${READ_FILES:-$FILES}"
 UNLINK_FILES="${UNLINK_FILES:-6000}"
 FILE_SIZE="${FILE_SIZE:-2097152}"
 WAIT_SEC="${WAIT_SEC:-45}"
+MIXED_DURATION_SEC="${MIXED_DURATION_SEC:-120}"
 FIO_SIZE="${FIO_SIZE:-2G}"
 FIO_LARGE_SIZE="${FIO_LARGE_SIZE:-10G}"
 FIO_LARGE_RUNTIME="${FIO_LARGE_RUNTIME:-10}"
@@ -92,6 +93,7 @@ Environment overrides:
   UNLINK_FILES=${UNLINK_FILES}
   FILE_SIZE=${FILE_SIZE}
   WAIT_SEC=${WAIT_SEC}
+  MIXED_DURATION_SEC=${MIXED_DURATION_SEC}
   FIO_SIZE=${FIO_SIZE}
   FIO_LARGE_SIZE=${FIO_LARGE_SIZE}
   FIO_LARGE_RUNTIME=${FIO_LARGE_RUNTIME}
@@ -191,6 +193,7 @@ write_storage_info() {
         echo "benchmark_root=${BENCHMARK_ROOT:-N/A}"
         echo "auto_evict_config=$AUTO_EVICT_CONFIG"
         echo "read_files=$READ_FILES"
+        echo "mixed_duration_sec=$MIXED_DURATION_SEC"
         echo "fio_numjobs_list=$FIO_NUMJOBS_LIST"
         echo "fio_matrix_size=$FIO_MATRIX_SIZE"
         echo "fio_unaligned_size=$FIO_UNALIGNED_SIZE"
@@ -1050,6 +1053,7 @@ write_summary() {
         --unlink-files "$UNLINK_FILES" \
         --file-size "$FILE_SIZE" \
         --wait-sec "$WAIT_SEC" \
+        --mixed-duration-sec "$MIXED_DURATION_SEC" \
         --fio-size "$FIO_SIZE" \
         --fio-large-size "$FIO_LARGE_SIZE" \
         --fio-large-runtime "$FIO_LARGE_RUNTIME"
@@ -1166,6 +1170,11 @@ run_case() {
         configure_auto_evict_case "$threshold" || return 1
         case_threshold="$AUTO_EVICT_CASE_THRESHOLD"
         case_files="$AUTO_EVICT_CASE_FILES"
+    elif [[ "$mode" == "read_write" && "$MIXED_DURATION_SEC" != "0" && "$MIXED_DURATION_SEC" != "0.0" && "$AUTO_EVICT_CONFIG" == "1" ]]; then
+        configure_auto_evict_case "$threshold" || return 1
+        case_threshold="$threshold"
+        case_files="$AUTO_EVICT_CASE_FILES"
+        log "auto mixed write plan: keep threshold=${case_threshold}, files=${case_files}, write=$(bytes_to_mib $((case_files * FILE_SIZE)))MiB"
     fi
     prepare_cache_dirs || return 1
     safe_rm_rf "$OUT_DIR/work_${case_id}" >/dev/null 2>&1 || true
@@ -1187,6 +1196,7 @@ run_case() {
             --unlink-files "$UNLINK_FILES" \
             --file-size "$FILE_SIZE" \
             --wait-sec "$WAIT_SEC" \
+            --duration-sec "$MIXED_DURATION_SEC" \
             --dir "/py_${case_id}" \
             --workspace "$OUT_DIR/work_${case_id}" \
             --config "$case_config" \
