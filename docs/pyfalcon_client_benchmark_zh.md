@@ -13,8 +13,8 @@ benchmark 覆盖 Python internal API 和 fio 本地基准两类场景。Python i
 | P-3 | 写触发 evict | 4 writer client 并发写，DiskCache 后台 cleanup 删除 cache |
 | P-5 | 边写边删 | 4 writer client + 4 deleter client 同时运行 |
 | P-R1 | 纯读 | 先预创建读数据集，再 4 reader client 并发 `FalconOpen/FalconRead/FalconClose` |
-| P-RW | 读 + 写 | 先预创建读数据集，再 4 reader client 循环读、4 writer client 持续写，运行 `MIXED_DURATION_SEC` 秒，不触发 evict |
-| P-RWE | 读 + 写 + evict | 4 reader client 循环读、4 writer client 持续写，运行 `MIXED_DURATION_SEC` 秒，并通过自动水位触发后台 `DiskCache::Cleanup()` |
+| P-RW | 读 + 写 | 4 reader client 循环读 writer 新写出的热数据窗口，4 writer client 持续写，运行 `MIXED_DURATION_SEC` 秒，不触发 evict |
+| P-RWE | 读 + 写 + evict | 4 reader client 循环读 writer 新写出的热数据窗口、4 writer client 持续写，运行 `MIXED_DURATION_SEC` 秒，并通过自动水位触发后台 `DiskCache::Cleanup()` |
 | P-DIO | O_DIRECT 对齐探测 | 通过 Python internal API 测试对齐写、长度未对齐、offset 未对齐、buffer 未对齐 |
 
 fio 本地基准覆盖基础场景、并发矩阵和 direct I/O 未对齐探测：
@@ -143,8 +143,9 @@ bash tools/run_pyfalcon_client_benchmark.sh B-DIO
 | `OUT_DIR` | `/tmp/pyfalcon_client_benchmark_<timestamp>` 或 `$BENCHMARK_ROOT/pyfalcon_client_benchmark_<timestamp>` | 输出目录，保留最终结果和日志 |
 | `CLIENTS` | 4 | 每组 Python client 进程数 |
 | `FILES` | 6000 | 写入文件数 |
-| `READ_FILES` | `$FILES` | P-R1/P-RW/P-RWE 的读数据集文件数；P-RW/P-RWE 中 reader 会循环读该数据集 |
+| `READ_FILES` | `$FILES` | P-R1/P-RW/P-RWE 的读数据集文件数；P-R1 会读取该数据集；P-RW/P-RWE 的 reader 改为读取 writer 新写出的热数据窗口 |
 | `MIXED_DURATION_SEC` | `120` | P-RW/P-RWE 固定时长持续读写窗口 |
+| `HOT_READ_WINDOW` | `1024` | P-RW/P-RWE reader 在每个 writer 最新 N 个文件范围内循环读取 |
 | `UNLINK_FILES` | 6000 | 删除文件数 |
 | `FILE_SIZE` | 2097152 | 单文件大小，默认 2MiB |
 | `WAIT_SEC` | 45 | P-3 写完后等待 evict 的时间 |

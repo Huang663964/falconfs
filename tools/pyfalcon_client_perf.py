@@ -239,6 +239,111 @@ def worker_read_timed(args, role, client_id, base_dir, files, start_event, stop_
         })
 
 
+
+
+def worker_write_timed_publish(args, role, client_id, base_dir, max_files, counters, start_event, stop_event, ready_q, result_q):
+    try:
+        client = make_client(args, role, client_id)
+        mkdir(client, base_dir)
+        payload = bytearray(b"a" * args.file_size)
+        ready_q.put({"role": role, "client_id": client_id, "ready": True})
+        start_event.wait()
+        begin = time.monotonic()
+        deadline = begin + args.duration_sec
+        latencies = []
+        i = 0
+        while not stop_event.is_set() and time.monotonic() < deadline and (max_files <= 0 or i < max_files):
+            path = f"{base_dir}/f_{i:08d}"
+            op_begin = time.monotonic()
+            create_write_close(client, path, payload)
+            latencies.append(time.monotonic() - op_begin)
+            i += 1
+            counters[client_id] = i
+        elapsed = time.monotonic() - begin
+        result_q.put({
+            "role": role,
+            "client_id": client_id,
+            "files": len(latencies),
+            "elapsed_sec": elapsed,
+            "latencies": latencies,
+            "operation_error_count": 0,
+            "operation_errors": [],
+            "stop_reason": "max_files" if max_files > 0 and i >= max_files else "duration",
+            "error": "",
+        })
+    except Exception as exc:
+        ready_q.put({"role": role, "client_id": client_id, "ready": False, "error": str(exc)})
+        result_q.put({
+            "role": role,
+            "client_id": client_id,
+            "files": 0,
+            "elapsed_sec": 0.0,
+            "latencies": [],
+            "operation_error_count": 0,
+            "operation_errors": [],
+            "stop_reason": "error",
+            "error": str(exc),
+        })
+
+
+def worker_read_hot_timed(args, role, client_id, writer_prefix, writer_clients, counters, start_event, stop_event, ready_q, result_q):
+    try:
+        client = make_client(args, role, client_id)
+        ready_q.put({"role": role, "client_id": client_id, "ready": True})
+        start_event.wait()
+        begin = time.monotonic()
+        deadline = begin + args.duration_sec
+        latencies = []
+        operation_errors = []
+        i = 0
+        while not stop_event.is_set() and time.monotonic() < deadline:
+            writer_id = (client_id + i) % writer_clients
+            count = counters[writer_id]
+            if count <= 0:
+                time.sleep(args.hot_read_retry_sleep_sec)
+                continue
+            window = min(count, max(args.hot_read_window, 1))
+            index = count - 1 - (i % window)
+            path = f"{args.dir}_{writer_prefix}_{writer_id}/f_{index:08d}"
+            op_begin = time.monotonic()
+            try:
+                open_read_close(client, path, args.file_size)
+                latencies.append(time.monotonic() - op_begin)
+                i += 1
+            except Exception as exc:
+                if len(operation_errors) < 20:
+                    operation_errors.append(str(exc))
+                i += 1
+                time.sleep(args.hot_read_retry_sleep_sec)
+        elapsed = time.monotonic() - begin
+        fatal_error = ""
+        if not latencies and operation_errors:
+            fatal_error = f"hot reader completed 0 reads; first_error={operation_errors[0]}"
+        result_q.put({
+            "role": role,
+            "client_id": client_id,
+            "files": len(latencies),
+            "elapsed_sec": elapsed,
+            "latencies": latencies,
+            "operation_error_count": max(0, i - len(latencies)),
+            "operation_errors": operation_errors,
+            "stop_reason": "duration" if not fatal_error else "error",
+            "error": fatal_error,
+        })
+    except Exception as exc:
+        ready_q.put({"role": role, "client_id": client_id, "ready": False, "error": str(exc)})
+        result_q.put({
+            "role": role,
+            "client_id": client_id,
+            "files": 0,
+            "elapsed_sec": 0.0,
+            "latencies": [],
+            "operation_error_count": 0,
+            "operation_errors": [],
+            "stop_reason": "error",
+            "error": str(exc),
+        })
+
 def worker_unlink(args, role, client_id, base_dir, files, start_event, ready_q, result_q):
     try:
         client = make_client(args, role, client_id)
@@ -323,15 +428,51 @@ def run_processes_timed(jobs, duration_sec):
     return elapsed, results
 
 
+
+
+def run_processes_timed_hot(read_jobs, write_jobs, duration_sec):
+    start_event = mp.Event()
+    stop_event = mp.Event()
+    ready_q = mp.Queue()
+    result_q = mp.Queue()
+    counters = mp.Array('q', len(write_jobs))
+    procs = []
+    for target, params in write_jobs:
+        proc = mp.Process(target=target, args=(*params, counters, start_event, stop_event, ready_q, result_q))
+        proc.start()
+        procs.append(proc)
+    for target, params in read_jobs:
+        proc = mp.Process(target=target, args=(*params, counters, start_event, stop_event, ready_q, result_q))
+        proc.start()
+        procs.append(proc)
+
+    for _ in procs:
+        ready_q.get()
+
+    begin = time.monotonic()
+    start_event.set()
+    time.sleep(duration_sec)
+    stop_event.set()
+    results = [result_q.get() for _ in procs]
+    elapsed = time.monotonic() - begin
+
+    for proc in procs:
+        proc.join()
+    return elapsed, results
+
 def summarize_group(results, elapsed, file_size):
     latencies = []
     files = 0
     errors = []
+    operation_error_count = 0
+    operation_errors = []
     max_worker_elapsed = 0.0
     for result in results:
         latencies.extend(result["latencies"])
         files += result["files"]
         max_worker_elapsed = max(max_worker_elapsed, result["elapsed_sec"])
+        operation_error_count += result.get("operation_error_count", 0)
+        operation_errors.extend(result.get("operation_errors", [])[:10])
         if result["error"]:
             errors.append(result)
     stats = latency_stats(latencies)
@@ -348,6 +489,8 @@ def summarize_group(results, elapsed, file_size):
         "latency_max_sec": stats["max_sec"],
         "error_count": len(errors),
         "errors": errors,
+        "operation_error_count": operation_error_count,
+        "operation_errors": operation_errors[:20],
         "per_client": [
             {
                 "role": r["role"],
@@ -355,6 +498,7 @@ def summarize_group(results, elapsed, file_size):
                 "files": r["files"],
                 "elapsed_sec": r["elapsed_sec"],
                 "stop_reason": r.get("stop_reason", ""),
+                "operation_error_count": r.get("operation_error_count", 0),
                 "error": r["error"],
             }
             for r in sorted(results, key=lambda x: (x["role"], x["client_id"]))
@@ -392,6 +536,14 @@ def build_timed_write_jobs(args, role, base_prefix, total_files, clients):
 
 def build_timed_read_jobs(args, role, base_prefix, total_files, clients):
     return build_jobs(args, worker_read_timed, role, base_prefix, total_files, clients)
+
+
+def build_hot_write_jobs(args, role, base_prefix, total_files, clients):
+    return build_jobs(args, worker_write_timed_publish, role, base_prefix, total_files, clients)
+
+
+def build_hot_read_jobs(args, role, writer_prefix, clients):
+    return [(worker_read_hot_timed, (args, role, client_id, writer_prefix, clients)) for client_id in range(clients)]
 
 
 def run_write_only(args):
@@ -477,27 +629,32 @@ def run_concurrent_unlink(args):
 
 
 def run_read_write(args):
-    prepare_elapsed, prepare_results = run_processes(
-        build_write_jobs(args, "prepare_read", "read", args.read_files, args.clients)
-    )
     timed = args.duration_sec > 0
     if timed:
-        read_jobs = build_timed_read_jobs(args, "reader", "read", args.read_files, args.clients)
-        write_jobs = build_timed_write_jobs(args, "writer", "write", args.files, args.clients)
-        mixed_elapsed, mixed_results = run_processes_timed(read_jobs + write_jobs, args.duration_sec)
+        read_jobs = build_hot_read_jobs(args, "reader", "write", args.clients)
+        write_jobs = build_hot_write_jobs(args, "writer", "write", args.files, args.clients)
+        mixed_elapsed, mixed_results = run_processes_timed_hot(read_jobs, write_jobs, args.duration_sec)
+        prepare = {"files": 0, "error_count": 0, "errors": [], "operation_error_count": 0, "operation_errors": []}
+        read_pattern = "writer_hot_window"
     else:
+        prepare_elapsed, prepare_results = run_processes(
+            build_write_jobs(args, "prepare_read", "read", args.read_files, args.clients)
+        )
         read_jobs = build_read_jobs(args, "reader", "read", args.read_files, args.clients)
         write_jobs = build_write_jobs(args, "writer", "write", args.files, args.clients)
         mixed_elapsed, mixed_results = run_processes(read_jobs + write_jobs)
+        prepare = summarize_group(prepare_results, prepare_elapsed, args.file_size)
+        read_pattern = "prepared_read_dataset"
     reader_results = [r for r in mixed_results if r["role"] == "reader"]
     writer_results = [r for r in mixed_results if r["role"] == "writer"]
-    prepare = summarize_group(prepare_results, prepare_elapsed, args.file_size)
     reader = summarize_group(reader_results, mixed_elapsed, args.file_size)
     writer = summarize_group(writer_results, mixed_elapsed, args.file_size)
     result = {
         "mode": args.mode,
         "timed": timed,
         "duration_sec": args.duration_sec,
+        "read_pattern": read_pattern,
+        "hot_read_window": args.hot_read_window if timed else 0,
         "reader_clients": args.clients,
         "writer_clients": args.clients,
         "total_processes": args.clients * 2,
@@ -614,6 +771,10 @@ def main():
     parser.add_argument("--wait-sec", type=int, default=45)
     parser.add_argument("--duration-sec", type=float, default=0.0,
                         help="Run read_write/read_write_evict for a fixed duration; 0 keeps fixed-file mode.")
+    parser.add_argument("--hot-read-window", type=int, default=1024,
+                        help="For timed read/write cases, readers loop over the newest N files per writer.")
+    parser.add_argument("--hot-read-retry-sleep-sec", type=float, default=0.001,
+                        help="Sleep between hot-read retries after missing a writer file.")
     parser.add_argument("--dir", required=True)
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--config", default="/usr/local/falconfs/falcon_client/config/config.json")

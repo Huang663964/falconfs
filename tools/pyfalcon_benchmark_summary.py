@@ -480,6 +480,8 @@ def python_detail_rows(case_id, data):
         rows.extend([
             [case_id, "timed", str(data.get("timed", False))],
             [case_id, "duration_sec", fmt_num(data.get("duration_sec"), 6)],
+            [case_id, "read_pattern", str(data.get("read_pattern", "N/A"))],
+            [case_id, "hot_read_window", fmt_num(data.get("hot_read_window"), 0)],
             [case_id, "mixed_elapsed_sec", fmt_num(data.get("mixed_elapsed_sec"), 6)],
             [case_id, "reader.files_per_sec", fmt_num(reader.get("files_per_sec"), 6)],
             [case_id, "reader.mib_per_sec", fmt_num(reader.get("mib_per_sec"), 6)],
@@ -487,6 +489,8 @@ def python_detail_rows(case_id, data):
             [case_id, "writer.mib_per_sec", fmt_num(writer.get("mib_per_sec"), 6)],
             [case_id, "reader.latency_p99", fmt_ms(reader.get("latency_p99_sec"))],
             [case_id, "writer.latency_p99", fmt_ms(writer.get("latency_p99_sec"))],
+            [case_id, "reader.operation_error_count", fmt_num(reader.get("operation_error_count"), 0)],
+            [case_id, "writer.operation_error_count", fmt_num(writer.get("operation_error_count"), 0)],
             [case_id, "reader.max_worker_elapsed_sec", fmt_num(reader.get("max_worker_elapsed_sec"), 6)],
             [case_id, "writer.max_worker_elapsed_sec", fmt_num(writer.get("max_worker_elapsed_sec"), 6)],
             [case_id, "reader.stop_reasons", stop_reasons(reader)],
