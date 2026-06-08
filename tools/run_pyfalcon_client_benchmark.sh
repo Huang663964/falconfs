@@ -951,6 +951,95 @@ run_fio_group() {
     run_step B-DIO run_fio_direct_unaligned
 }
 
+
+write_final_report() {
+    local report="$OUT_DIR/final_report.log"
+    {
+        echo "# PyFalcon benchmark final report"
+        echo "generated_at=$(date '+%F %T')"
+        echo "out_dir=$OUT_DIR"
+        echo "scenario=$SCENARIO"
+        echo "clients=$CLIENTS"
+        echo "files=$FILES"
+        echo "read_files=$READ_FILES"
+        echo "unlink_files=$UNLINK_FILES"
+        echo "file_size=$FILE_SIZE"
+        echo "wait_sec=$WAIT_SEC"
+        echo "fio_size=$FIO_SIZE"
+        echo "fio_large_size=$FIO_LARGE_SIZE"
+        echo "fio_large_runtime=$FIO_LARGE_RUNTIME"
+        echo "fio_numjobs_list=$FIO_NUMJOBS_LIST"
+        echo
+
+        echo "## benchmark_summary.md"
+        if [[ -f "$OUT_DIR/benchmark_summary.md" ]]; then
+            cat "$OUT_DIR/benchmark_summary.md"
+        else
+            echo "missing: $OUT_DIR/benchmark_summary.md"
+        fi
+        echo
+
+        echo "## storage_info.txt"
+        if [[ -f "$OUT_DIR/storage_info.txt" ]]; then
+            cat "$OUT_DIR/storage_info.txt"
+        else
+            echo "missing: $OUT_DIR/storage_info.txt"
+        fi
+        echo
+
+        echo "## evict_config.txt"
+        if [[ -f "$OUT_DIR/evict_config.txt" ]]; then
+            cat "$OUT_DIR/evict_config.txt"
+        else
+            echo "missing: $OUT_DIR/evict_config.txt"
+        fi
+        echo
+
+        echo "## run logs"
+        for file in "$OUT_DIR"/run*.log; do
+            [[ -f "$file" ]] || continue
+            echo "### $file"
+            tail -n 240 "$file"
+            echo
+        done
+
+        echo "## python monitor logs"
+        for file in "$OUT_DIR/python/P-3-monitor.log" "$OUT_DIR/python/P-RWE-monitor.log"; do
+            if [[ -f "$file" ]]; then
+                echo "### $file"
+                cat "$file"
+                echo
+            fi
+        done
+
+        echo "## key python json"
+        for file in "$OUT_DIR/python/P-3.json" "$OUT_DIR/python/P-RWE.json" "$OUT_DIR/python/P-DIO.json"; do
+            if [[ -f "$file" ]]; then
+                echo "### $file"
+                cat "$file"
+                echo
+            fi
+        done
+
+        echo "## direct I/O fio probe"
+        for file in "$OUT_DIR/fio/B-DIO-status.json" "$OUT_DIR/fio/B-DIO.stderr" "$OUT_DIR/fio/B-DIO.stdout"; do
+            if [[ -f "$file" ]]; then
+                echo "### $file"
+                cat "$file"
+                echo
+            fi
+        done
+
+        echo "## fio json inventory"
+        find "$OUT_DIR/fio" -maxdepth 1 -type f -name '*.json' -printf '%f\n' 2>/dev/null | sort || true
+        echo
+
+        echo "## output inventory"
+        find "$OUT_DIR" -maxdepth 2 -type f -printf '%P %s bytes\n' 2>/dev/null | sort || true
+    } > "$report"
+    log "final report: $report"
+}
+
 write_summary() {
     python3 "$ROOT_DIR/tools/pyfalcon_benchmark_summary.py" \
         --out-dir "$OUT_DIR" \
@@ -1168,6 +1257,7 @@ fi
 write_summary
 log "summary: $OUT_DIR/benchmark_summary.md"
 log "summary log: $OUT_DIR/benchmark_summary.log"
+write_final_report
 cleanup_temp_dirs
 if (( ${#FAILED_CASES[@]} > 0 )); then
     log "failed cases: ${FAILED_CASES[*]}"

@@ -384,3 +384,34 @@ BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 READ_FILES=6000 UNLINK_FILES=60
 
 P-DIO 和 B-DIO 不把未对齐写失败当成脚本失败。它们会记录实际返回值：fio 看 `B-DIO-status.json` 和 `B-DIO.stderr`，Falcon internal 看 `python/P-DIO.json` 中每个 probe 的 `create_ret/write_ret/flush_ret/close_ret/error`。
 
+## 12. 最终整合日志
+
+一键脚本执行结束后会自动生成：
+
+```text
+$OUT_DIR/final_report.log
+```
+
+这个文件用于跨服务器传递结果，内容已经整合以下信息：
+
+| 内容 | 来源 |
+| --- | --- |
+| 总览结果 | `$OUT_DIR/benchmark_summary.md` |
+| 存储设备信息 | `$OUT_DIR/storage_info.txt` |
+| evict 自动水位配置 | `$OUT_DIR/evict_config.txt` |
+| 执行过程 | `$OUT_DIR/run*.log` 的尾部 |
+| P-3/P-RWE 运行监控 | `$OUT_DIR/python/P-3-monitor.log`、`$OUT_DIR/python/P-RWE-monitor.log` |
+| 关键 Python JSON | `$OUT_DIR/python/P-3.json`、`$OUT_DIR/python/P-RWE.json`、`$OUT_DIR/python/P-DIO.json` |
+| direct I/O fio 探测 | `$OUT_DIR/fio/B-DIO-status.json`、`B-DIO.stderr`、`B-DIO.stdout` |
+| 文件清单 | `$OUT_DIR/fio/*.json` 和 `$OUT_DIR` 下主要结果文件 |
+
+因此在另一台服务器完成 NVMe 测试后，只需要把 `$OUT_DIR/final_report.log` 发回来即可，不需要分别复制 summary、storage、evict config 和各个 JSON 文件。
+
+脚本结束时会打印：
+
+```text
+final report: <OUT_DIR>/final_report.log
+```
+
+如果需要手动重新生成 summary 后再重新生成 final report，直接重新跑对应场景或重新执行一键脚本即可；`final_report.log` 会被覆盖为最新内容。
+
