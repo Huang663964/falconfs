@@ -1084,35 +1084,49 @@ def show_group(name, group):
     if not isinstance(group, dict):
         return
     errors = group.get("errors") or []
+    per_client = group.get("per_client") or []
     if group.get("error_count", 0) or errors:
         print(f"{name}.error_count={group.get('error_count', 0)}")
+    print(
+        "%s summary files=%s elapsed=%s max_worker_elapsed=%s files_per_sec=%s mib_per_sec=%s"
+        % (
+            name,
+            group.get("files", "N/A"),
+            group.get("elapsed_sec", "N/A"),
+            group.get("max_worker_elapsed_sec", "N/A"),
+            group.get("files_per_sec", "N/A"),
+            group.get("mib_per_sec", "N/A"),
+        )
+    )
     for item in errors[:10]:
         print(
-            "%s error role=%s client=%s files=%s elapsed=%s msg=%s"
+            "%s error role=%s client=%s files=%s elapsed=%s stop_reason=%s msg=%s"
             % (
                 name,
                 item.get("role", "N/A"),
                 item.get("client_id", "N/A"),
                 item.get("files", "N/A"),
                 item.get("elapsed_sec", "N/A"),
+                item.get("stop_reason", "N/A"),
                 item.get("error", ""),
             )
         )
-    for item in (group.get("per_client") or []):
-        if item.get("error"):
+    for item in per_client:
+        if item.get("error") or item.get("stop_reason") == "max_files":
             print(
-                "%s per_client error role=%s client=%s files=%s elapsed=%s msg=%s"
+                "%s per_client role=%s client=%s files=%s elapsed=%s stop_reason=%s msg=%s"
                 % (
                     name,
                     item.get("role", "N/A"),
                     item.get("client_id", "N/A"),
                     item.get("files", "N/A"),
                     item.get("elapsed_sec", "N/A"),
+                    item.get("stop_reason", "N/A"),
                     item.get("error", ""),
                 )
             )
 
-for name in ("create", "unlink", "prepare", "writer", "deleter"):
+for name in ("create", "unlink", "prepare", "read", "reader", "writer", "deleter"):
     show_group(name, data.get(name))
 
 for item in (data.get("errors") or [])[:10]:
