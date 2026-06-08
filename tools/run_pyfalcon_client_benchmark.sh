@@ -1149,11 +1149,13 @@ run_step() {
 
     log "case ${case_id} failed, status=${status}, elapsed=${elapsed}s"
     FAILED_CASES+=("${case_id}:${status}")
+    set +e
     print_python_case_diagnostics "$case_id"
-    stop_idle_server 2>/dev/null || true
+    stop_idle_server 2>/dev/null
     if [[ "$case_id" == P-* ]]; then
-        clean_runtime || true
+        clean_runtime
     fi
+    set -e
     return 0
 }
 
@@ -1215,12 +1217,13 @@ run_case() {
     wait "$bench_pid"
     status=$?
     set -e
+    log "case ${case_id} benchmark process exited, status=${status}"
 
     if [[ -n "$monitor_pid" ]]; then
         kill "$monitor_pid" 2>/dev/null || true
         wait "$monitor_pid" 2>/dev/null || true
     fi
-    stop_idle_server
+    stop_idle_server || true
     return "$status"
 }
 
@@ -1262,13 +1265,13 @@ log "run log: $RUN_LOG"
 prepare_storage_targets
 run_group "$SCENARIO"
 if scenario_uses_falcon; then
-    clean_runtime
+    clean_runtime || log "warning: final clean_runtime failed"
 fi
-write_summary
+write_summary || log "warning: write_summary failed"
 log "summary: $OUT_DIR/benchmark_summary.md"
 log "summary log: $OUT_DIR/benchmark_summary.log"
-write_final_report
-cleanup_temp_dirs
+write_final_report || log "warning: write_final_report failed"
+cleanup_temp_dirs || log "warning: cleanup_temp_dirs failed"
 if (( ${#FAILED_CASES[@]} > 0 )); then
     log "failed cases: ${FAILED_CASES[*]}"
     exit 1
