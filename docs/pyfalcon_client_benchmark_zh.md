@@ -13,8 +13,8 @@ benchmark 覆盖 Python internal API 和 fio 本地基准两类场景。Python i
 | P-3 | 写触发 evict | 4 writer client 并发写，DiskCache 后台 cleanup 删除 cache |
 | P-5 | 边写边删 | 4 writer client + 4 deleter client 同时运行 |
 | P-R1 | 纯读 | 先预创建读数据集，再 4 reader client 并发 `FalconOpen/FalconRead/FalconClose` |
-| P-RW | 读 + 写 | 4 reader client 循环读 writer 已完成一段时间的热数据窗口，4 writer client 持续写，运行 `MIXED_DURATION_SEC` 秒，不触发 evict |
-| P-RWE | 读 + 写 + evict | 4 reader client 循环读 writer 已完成一段时间的热数据窗口、4 writer client 持续写，运行 `MIXED_DURATION_SEC` 秒，并通过自动水位触发后台 `DiskCache::Cleanup()` |
+| P-RW | 读 + 写 | 先预创建并打开固定读热集，4 reader client 循环读已 pin 的热集，4 writer client 持续写，运行 `MIXED_DURATION_SEC` 秒，不触发 evict |
+| P-RWE | 读 + 写 + evict | 先预创建并打开固定读热集，4 reader client 循环读已 pin 的热集，4 writer client 持续写，运行 `MIXED_DURATION_SEC` 秒，并通过 writer 写入推动后台 `DiskCache::Cleanup()` |
 | P-DIO | O_DIRECT 对齐探测 | 通过 Python internal API 测试对齐写、长度未对齐、offset 未对齐、buffer 未对齐 |
 
 fio 本地基准覆盖基础场景、并发矩阵和 direct I/O 未对齐探测：
@@ -143,11 +143,12 @@ bash tools/run_pyfalcon_client_benchmark.sh B-DIO
 | `OUT_DIR` | `/tmp/pyfalcon_client_benchmark_<timestamp>` 或 `$BENCHMARK_ROOT/pyfalcon_client_benchmark_<timestamp>` | 输出目录，保留最终结果和日志 |
 | `CLIENTS` | 4 | 每组 Python client 进程数 |
 | `FILES` | 6000 | 写入文件数 |
-| `READ_FILES` | `$FILES` | P-R1/P-RW/P-RWE 的读数据集文件数；P-R1 会读取该数据集；P-RW/P-RWE 的 reader 改为读取 writer 已完成一段时间的热数据窗口 |
+| `READ_FILES` | `$FILES` | P-R1 的读数据集文件数 |
+| `PINNED_READ_FILES` | `256` | P-RW/P-RWE 每个 reader 预打开并 pin 住的读热集文件数 |
 | `MIXED_DURATION_SEC` | `120` | P-RW/P-RWE 固定时长持续读写窗口 |
-| `HOT_READ_WINDOW` | `1024` | P-RW/P-RWE reader 在每个 writer 的可读热窗口内循环读取 |
-| `HOT_READ_LAG` | `128` | P-RW/P-RWE reader 跳过每个 writer 最新完成的 N 个文件，避免读取刚 close 的文件 |
-| `HOT_READ_MIN_FILES` | `$HOT_READ_WINDOW` | P-RW/P-RWE reader 等每个 writer 在 lag 之后至少有一个完整可读窗口后再开始读，避免启动阶段读到最老文件 |
+| `HOT_READ_WINDOW` | `1024` | 保留给历史 hot-window 风险验证；正式 P-RW/P-RWE 不使用 |
+| `HOT_READ_LAG` | `128` | 保留给历史 hot-window 风险验证；正式 P-RW/P-RWE 不使用 |
+| `HOT_READ_MIN_FILES` | `$HOT_READ_WINDOW` | 保留给历史 hot-window 风险验证；正式 P-RW/P-RWE 不使用 |
 | `UNLINK_FILES` | 6000 | 删除文件数 |
 | `FILE_SIZE` | 2097152 | 单文件大小，默认 2MiB |
 | `WAIT_SEC` | 45 | P-3 写完后等待 evict 的时间 |
@@ -384,7 +385,7 @@ REQUIRE_NVME=0 BENCHMARK_ROOT=/tmp/falconfs_local_benchmark CLIENTS=2 FILES=64 R
 BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 READ_FILES=6000 UNLINK_FILES=6000 WAIT_SEC=45 MIXED_DURATION_SEC=120 FIO_SIZE=2G FIO_LARGE_SIZE=10G FIO_LARGE_RUNTIME=10 FIO_NUMJOBS_LIST="1 4 8 16" bash tools/run_pyfalcon_client_benchmark.sh all
 ```
 
-混合场景判断顺序：先看 fio 多并发读写上限，再看 P-R1/P-1 的 Falcon 纯读纯写，再看固定时长 P-RW 的读写混合基线，最后用固定时长 P-RWE 对比 P-RW，评估 evict 对读写混合的额外影响。P-RW/P-RWE 的 JSON 中必须确认 `timed=true`。
+混合场景判断顺序：先看 fio 多并发读写上限，再看 P-R1/P-1 的 Falcon 纯读纯写，再看固定时长 P-RW 的 pinned-read + write 基线，最后用固定时长 P-RWE 对比 P-RW，评估 evict 对已打开读热集和持续写入的额外影响。P-RW/P-RWE 的 JSON 中必须确认 `timed=true`、`read_pattern=pinned_read_set`。
 
 P-DIO 和 B-DIO 不把未对齐写失败当成脚本失败。它们会记录实际返回值：fio 看 `B-DIO-status.json` 和 `B-DIO.stderr`，Falcon internal 看 `python/P-DIO.json` 中每个 probe 的 `create_ret/write_ret/flush_ret/close_ret/error`。
 

@@ -27,6 +27,7 @@ PYTHON_INTERFACE="${PYTHON_INTERFACE:-$ROOT_DIR/python_interface}"
 CLIENTS="${CLIENTS:-4}"
 FILES="${FILES:-6000}"
 READ_FILES="${READ_FILES:-$FILES}"
+PINNED_READ_FILES="${PINNED_READ_FILES:-256}"
 UNLINK_FILES="${UNLINK_FILES:-6000}"
 FILE_SIZE="${FILE_SIZE:-2097152}"
 WAIT_SEC="${WAIT_SEC:-45}"
@@ -93,6 +94,7 @@ Environment overrides:
   CLIENTS=${CLIENTS}
   FILES=${FILES}
   READ_FILES=${READ_FILES}
+  PINNED_READ_FILES=${PINNED_READ_FILES}
   UNLINK_FILES=${UNLINK_FILES}
   FILE_SIZE=${FILE_SIZE}
   WAIT_SEC=${WAIT_SEC}
@@ -199,6 +201,7 @@ write_storage_info() {
         echo "benchmark_root=${BENCHMARK_ROOT:-N/A}"
         echo "auto_evict_config=$AUTO_EVICT_CONFIG"
         echo "read_files=$READ_FILES"
+        echo "pinned_read_files=$PINNED_READ_FILES"
         echo "mixed_duration_sec=$MIXED_DURATION_SEC"
         echo "hot_read_window=$HOT_READ_WINDOW"
         echo "hot_read_lag=$HOT_READ_LAG"
@@ -974,6 +977,7 @@ write_final_report() {
         echo "clients=$CLIENTS"
         echo "files=$FILES"
         echo "read_files=$READ_FILES"
+        echo "pinned_read_files=$PINNED_READ_FILES"
         echo "unlink_files=$UNLINK_FILES"
         echo "file_size=$FILE_SIZE"
         echo "wait_sec=$WAIT_SEC"
@@ -1218,6 +1222,7 @@ run_case() {
             --clients "$CLIENTS" \
             --files "$case_files" \
             --read-files "$READ_FILES" \
+            --pinned-read-files "$PINNED_READ_FILES" \
             --unlink-files "$UNLINK_FILES" \
             --file-size "$FILE_SIZE" \
             --wait-sec "$WAIT_SEC" \
