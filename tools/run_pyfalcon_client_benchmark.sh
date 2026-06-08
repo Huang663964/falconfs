@@ -26,12 +26,16 @@ BENCHMARK_CLUSTER_VIEW="${BENCHMARK_CLUSTER_VIEW:-127.0.0.1:56039}"
 PYTHON_INTERFACE="${PYTHON_INTERFACE:-$ROOT_DIR/python_interface}"
 CLIENTS="${CLIENTS:-4}"
 FILES="${FILES:-6000}"
+READ_FILES="${READ_FILES:-$FILES}"
 UNLINK_FILES="${UNLINK_FILES:-6000}"
 FILE_SIZE="${FILE_SIZE:-2097152}"
 WAIT_SEC="${WAIT_SEC:-45}"
 FIO_SIZE="${FIO_SIZE:-2G}"
 FIO_LARGE_SIZE="${FIO_LARGE_SIZE:-10G}"
 FIO_LARGE_RUNTIME="${FIO_LARGE_RUNTIME:-10}"
+FIO_NUMJOBS_LIST="${FIO_NUMJOBS_LIST:-1 4 8 16}"
+FIO_MATRIX_SIZE="${FIO_MATRIX_SIZE:-$FIO_SIZE}"
+FIO_UNALIGNED_SIZE="${FIO_UNALIGNED_SIZE:-64M}"
 REQUIRE_NVME="${REQUIRE_NVME:-1}"
 WRITE_THRESHOLD="${WRITE_THRESHOLD:-1}"
 EVICT_THRESHOLD="${EVICT_THRESHOLD:-0.72}"
@@ -48,6 +52,7 @@ IDLE_WAIT_SEC="${IDLE_WAIT_SEC:-900}"
 P3_MONITOR="${P3_MONITOR:-1}"
 P3_MONITOR_INTERVAL="${P3_MONITOR_INTERVAL:-30}"
 P3_STALL_SECONDS="${P3_STALL_SECONDS:-180}"
+KEEP_WORK_DIRS="${KEEP_WORK_DIRS:-1}"
 SCENARIO="${1:-all}"
 FAILED_CASES=()
 
@@ -57,19 +62,25 @@ Usage:
   $0 <scenario>
 
 Scenarios:
-  all    Run Python internal P-1/P-2/P-3/P-5 and fio B-1..B-6.
-  python Run P-1, P-2, P-3 and P-5 only.
-  fio    Run fio/local baseline B-1..B-6 only.
+  all    Run Python internal P-1/P-2/P-3/P-5/P-R1/P-RW/P-RWE/P-DIO and fio B-1..B-6 plus fio matrix/direct probes.
+  python Run Python internal cases only.
+  fio    Run fio/local baseline B-1..B-6, fio numjobs matrix, and fio direct-unaligned probe.
   P-1    Python internal 4-client write-only benchmark.
   P-2    Python internal 4-client unlink-only benchmark.
   P-3    Python internal 4-client write-triggered DiskCache evict benchmark.
   P-5    Python internal concurrent write + unlink benchmark.
+  P-R1   Python internal read-only benchmark.
+  P-RW   Python internal concurrent read + write benchmark without evict.
+  P-RWE  Python internal concurrent read + write + DiskCache evict benchmark.
+  P-DIO  Python internal O_DIRECT alignment probe.
   B-1    fio single-file direct write baseline.
   B-2    fio single-file direct read baseline.
   B-3    fio multi-file direct write baseline.
   B-4    fio multi-file direct read baseline.
   B-5    local multi-file delete baseline after fio create.
   B-6    fio large-file 2MiB psync sequential write baseline.
+  B-MATRIX fio numjobs matrix for write/read/rw, using FIO_NUMJOBS_LIST.
+  B-DIO  fio direct I/O unaligned-write probe.
 
 Environment overrides:
   DEFAULT_BENCHMARK_ROOT=${DEFAULT_BENCHMARK_ROOT}
@@ -77,12 +88,16 @@ Environment overrides:
   OUT_DIR=${OUT_DIR}
   CLIENTS=${CLIENTS}
   FILES=${FILES}
+  READ_FILES=${READ_FILES}
   UNLINK_FILES=${UNLINK_FILES}
   FILE_SIZE=${FILE_SIZE}
   WAIT_SEC=${WAIT_SEC}
   FIO_SIZE=${FIO_SIZE}
   FIO_LARGE_SIZE=${FIO_LARGE_SIZE}
   FIO_LARGE_RUNTIME=${FIO_LARGE_RUNTIME}
+  FIO_NUMJOBS_LIST=${FIO_NUMJOBS_LIST}
+  FIO_MATRIX_SIZE=${FIO_MATRIX_SIZE}
+  FIO_UNALIGNED_SIZE=${FIO_UNALIGNED_SIZE}
   FIO_DIR=${FIO_DIR}
   CACHE_ROOT=${CACHE_ROOT}
   REQUIRE_NVME=${REQUIRE_NVME}
@@ -167,7 +182,7 @@ check_nvme_path() {
 }
 
 scenario_uses_falcon() {
-    [[ "$SCENARIO" != "fio" && "$SCENARIO" != B-* ]]
+    [[ "$SCENARIO" != "fio" && "$SCENARIO" != "fio-matrix" && "$SCENARIO" != B-* ]]
 }
 
 write_storage_info() {
@@ -175,6 +190,10 @@ write_storage_info() {
     {
         echo "benchmark_root=${BENCHMARK_ROOT:-N/A}"
         echo "auto_evict_config=$AUTO_EVICT_CONFIG"
+        echo "read_files=$READ_FILES"
+        echo "fio_numjobs_list=$FIO_NUMJOBS_LIST"
+        echo "fio_matrix_size=$FIO_MATRIX_SIZE"
+        echo "fio_unaligned_size=$FIO_UNALIGNED_SIZE"
         echo "auto_evict_write_ratio=$AUTO_EVICT_WRITE_RATIO"
         echo "auto_evict_min_write_bytes=$AUTO_EVICT_MIN_WRITE_BYTES"
         echo "auto_evict_max_write_bytes=$AUTO_EVICT_MAX_WRITE_BYTES"
@@ -208,7 +227,9 @@ prepare_storage_targets() {
 
 cleanup_temp_dirs() {
     local meta_root
-    rm -rf "$OUT_DIR"/work_* 2>/dev/null || true
+    if [[ "$KEEP_WORK_DIRS" != "1" ]]; then
+        rm -rf "$OUT_DIR"/work_* 2>/dev/null || true
+    fi
     safe_rm_rf "$FIO_DIR" >/dev/null 2>&1 || true
     if scenario_uses_falcon; then
         meta_root="$(metadata_root)"
@@ -820,8 +841,92 @@ PY2
                 --time_based --runtime="$FIO_LARGE_RUNTIME" || return 1
             rm -rf "$FIO_DIR/large_write_2m"
             ;;
+        B-DIO)
+            run_fio_direct_unaligned
+            ;;
+        B-MATRIX)
+            run_fio_matrix
+            ;;
         *) echo "unknown fio case: ${case_id}" >&2; exit 1 ;;
     esac
+}
+
+
+run_fio_matrix_one() {
+    local kind="$1"
+    local jobs="$2"
+    local out_name="B-${kind}-N${jobs}"
+    local work_dir="$FIO_DIR/matrix/${kind}_${jobs}"
+    rm -rf "$work_dir"
+    mkdir -p "$work_dir"
+    case "$kind" in
+        W)
+            log "running ${out_name}: fio write matrix, jobs=${jobs}, size=${FIO_MATRIX_SIZE}"
+            fio --output="$OUT_DIR/fio/${out_name}.json" --output-format=json \
+                --name="write_2m_jobs${jobs}" --directory="$work_dir" \
+                --direct=1 --iodepth=1 --thread --rw=write --ioengine=psync \
+                --bs=2M --numjobs="$jobs" --size="$FIO_MATRIX_SIZE" --group_reporting=1 || return 1
+            ;;
+        R)
+            log "running ${out_name}: fio read matrix, jobs=${jobs}, size=${FIO_MATRIX_SIZE}"
+            fio --output="$OUT_DIR/fio/${out_name}-prepare.json" --output-format=json \
+                --name="read_2m_jobs${jobs}_prepare" --directory="$work_dir" \
+                --direct=1 --iodepth=1 --thread --rw=write --ioengine=psync \
+                --bs=2M --numjobs="$jobs" --size="$FIO_MATRIX_SIZE" --group_reporting=1 || return 1
+            fio --output="$OUT_DIR/fio/${out_name}.json" --output-format=json \
+                --name="read_2m_jobs${jobs}" --directory="$work_dir" \
+                --direct=1 --iodepth=1 --thread --rw=read --ioengine=psync \
+                --bs=2M --numjobs="$jobs" --size="$FIO_MATRIX_SIZE" --group_reporting=1 || return 1
+            ;;
+        RW)
+            log "running ${out_name}: fio rw matrix, jobs=${jobs}, size=${FIO_MATRIX_SIZE}"
+            fio --output="$OUT_DIR/fio/${out_name}.json" --output-format=json \
+                --name="rw_2m_jobs${jobs}" --directory="$work_dir" \
+                --direct=1 --iodepth=1 --thread --rw=rw --rwmixread=50 --ioengine=psync \
+                --bs=2M --numjobs="$jobs" --size="$FIO_MATRIX_SIZE" --group_reporting=1 || return 1
+            ;;
+        *) echo "unknown fio matrix kind: $kind" >&2; return 1 ;;
+    esac
+    rm -rf "$work_dir"
+}
+
+run_fio_matrix() {
+    require_cmd fio
+    mkdir -p "$OUT_DIR/fio"
+    local jobs kind
+    for jobs in $FIO_NUMJOBS_LIST; do
+        for kind in W R RW; do
+            run_fio_matrix_one "$kind" "$jobs" || return 1
+        done
+    done
+}
+
+run_fio_direct_unaligned() {
+    require_cmd fio
+    mkdir -p "$OUT_DIR/fio"
+    rm -rf "$FIO_DIR/direct_unaligned"
+    mkdir -p "$FIO_DIR/direct_unaligned"
+    log "running B-DIO: fio direct I/O unaligned write probe, bs=4097, size=${FIO_UNALIGNED_SIZE}"
+    set +e
+    fio --output="$OUT_DIR/fio/B-DIO.json" --output-format=json \
+        --name=direct_unaligned_len --directory="$FIO_DIR/direct_unaligned" \
+        --direct=1 --iodepth=1 --thread --rw=write --ioengine=psync \
+        --bs=4097 --numjobs=1 --size="$FIO_UNALIGNED_SIZE" --group_reporting=1 \
+        >"$OUT_DIR/fio/B-DIO.stdout" 2>"$OUT_DIR/fio/B-DIO.stderr"
+    local status=$?
+    set -e
+    python3 - "$OUT_DIR/fio/B-DIO-status.json" "$OUT_DIR/fio/B-DIO.json" "$status" <<'PYDIO'
+import json
+import sys
+status_out, json_out, status = sys.argv[1], sys.argv[2], int(sys.argv[3])
+result = {"mode": "fio_direct_unaligned", "exit_status": status, "expected_may_fail": True}
+for out in (status_out, json_out):
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, sort_keys=True)
+        f.write("\n")
+PYDIO
+    rm -rf "$FIO_DIR/direct_unaligned"
+    return 0
 }
 
 run_python_group() {
@@ -829,6 +934,10 @@ run_python_group() {
     run_step P-2 run_case P-2 unlink_only "$WRITE_THRESHOLD"
     run_step P-3 run_case P-3 create_evict "$EVICT_THRESHOLD"
     run_step P-5 run_case P-5 concurrent_unlink "$WRITE_THRESHOLD"
+    run_step P-R1 run_case P-R1 read_only "$WRITE_THRESHOLD"
+    run_step P-RW run_case P-RW read_write "$WRITE_THRESHOLD"
+    run_step P-RWE run_case P-RWE read_write_evict "$EVICT_THRESHOLD"
+    run_step P-DIO run_case P-DIO direct_unaligned "$WRITE_THRESHOLD"
 }
 
 run_fio_group() {
@@ -838,6 +947,8 @@ run_fio_group() {
     run_step B-4 run_fio_case B-4
     run_step B-5 run_fio_case B-5
     run_step B-6 run_fio_case B-6
+    run_step B-MATRIX run_fio_matrix
+    run_step B-DIO run_fio_direct_unaligned
 }
 
 write_summary() {
@@ -846,6 +957,7 @@ write_summary() {
         --scenario "$SCENARIO" \
         --clients "$CLIENTS" \
         --files "$FILES" \
+        --read-files "$READ_FILES" \
         --unlink-files "$UNLINK_FILES" \
         --file-size "$FILE_SIZE" \
         --wait-sec "$WAIT_SEC" \
@@ -961,12 +1073,13 @@ run_case() {
     case_threshold="$threshold"
     ensure_binary || return 1
     clean_runtime || return 1
-    if [[ "$mode" == "create_evict" ]]; then
+    if [[ "$mode" == "create_evict" || "$mode" == "read_write_evict" ]]; then
         configure_auto_evict_case "$threshold" || return 1
         case_threshold="$AUTO_EVICT_CASE_THRESHOLD"
         case_files="$AUTO_EVICT_CASE_FILES"
     fi
     prepare_cache_dirs || return 1
+    safe_rm_rf "$OUT_DIR/work_${case_id}" >/dev/null 2>&1 || true
     mkdir -p "$OUT_DIR/python" "$OUT_DIR/work_${case_id}" || return 1
     case_config="$(create_case_config "$case_id")" || return 1
     case_log="$OUT_DIR/python/${case_id}.log"
@@ -981,6 +1094,7 @@ run_case() {
             --mode "$mode" \
             --clients "$CLIENTS" \
             --files "$case_files" \
+            --read-files "$READ_FILES" \
             --unlink-files "$UNLINK_FILES" \
             --file-size "$FILE_SIZE" \
             --wait-sec "$WAIT_SEC" \
@@ -993,7 +1107,7 @@ run_case() {
     bench_pid=$!
 
     monitor_pid=""
-    if [[ "$mode" == "create_evict" && "$P3_MONITOR" == "1" ]]; then
+    if [[ ( "$mode" == "create_evict" || "$mode" == "read_write_evict" ) && "$P3_MONITOR" == "1" ]]; then
         monitor_p3_case "$case_id" "$bench_pid" "$case_log" "$monitor_log" &
         monitor_pid=$!
     fi
@@ -1023,7 +1137,12 @@ run_group() {
         P-2) run_step P-2 run_case P-2 unlink_only "$WRITE_THRESHOLD" ;;
         P-3) run_step P-3 run_case P-3 create_evict "$EVICT_THRESHOLD" ;;
         P-5) run_step P-5 run_case P-5 concurrent_unlink "$WRITE_THRESHOLD" ;;
-        B-1|B-2|B-3|B-4|B-5|B-6) run_step "$1" run_fio_case "$1" ;;
+        P-R1) run_step P-R1 run_case P-R1 read_only "$WRITE_THRESHOLD" ;;
+        P-RW) run_step P-RW run_case P-RW read_write "$WRITE_THRESHOLD" ;;
+        P-RWE) run_step P-RWE run_case P-RWE read_write_evict "$EVICT_THRESHOLD" ;;
+        P-DIO) run_step P-DIO run_case P-DIO direct_unaligned "$WRITE_THRESHOLD" ;;
+        B-1|B-2|B-3|B-4|B-5|B-6|B-DIO|B-MATRIX) run_step "$1" run_fio_case "$1" ;;
+        fio-matrix) run_step B-MATRIX run_fio_matrix ;;
         help|-h|--help) usage ;;
         *) usage; exit 1 ;;
     esac

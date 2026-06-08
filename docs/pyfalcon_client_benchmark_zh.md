@@ -12,8 +12,12 @@ benchmark 覆盖 Python internal API 和 fio 本地基准两类场景。Python i
 | P-2 | 纯删除 | 先 4 client 预创建文件，再 4 client 并发 `FalconUnlink` |
 | P-3 | 写触发 evict | 4 writer client 并发写，DiskCache 后台 cleanup 删除 cache |
 | P-5 | 边写边删 | 4 writer client + 4 deleter client 同时运行 |
+| P-R1 | 纯读 | 先预创建读数据集，再 4 reader client 并发 `FalconOpen/FalconRead/FalconClose` |
+| P-RW | 读 + 写 | 先预创建读数据集，再 4 reader client + 4 writer client 同时运行，不触发 evict |
+| P-RWE | 读 + 写 + evict | 读写同时运行，并通过自动水位触发后台 `DiskCache::Cleanup()` |
+| P-DIO | O_DIRECT 对齐探测 | 通过 Python internal API 测试对齐写、长度未对齐、offset 未对齐、buffer 未对齐 |
 
-fio 本地基准覆盖 5 个场景：
+fio 本地基准覆盖基础场景、并发矩阵和 direct I/O 未对齐探测：
 
 | 编号 | 场景 | 说明 |
 | --- | --- | --- |
@@ -22,6 +26,9 @@ fio 本地基准覆盖 5 个场景：
 | B-3 | 多文件 direct 顺序写 | 按 `FILES/CLIENTS` 拆分多文件 |
 | B-4 | 多文件 direct 顺序读 | 读取 B-3 创建的多文件 |
 | B-5 | 本地多文件删除 | 按 `UNLINK_FILES/CLIENTS` 先用 fio 创建待删文件，再用并发 `rm -f` 删除 |
+| B-6 | 大文件 2MiB psync 连续写 | 对齐用户给出的 fio 命令，测单 job 大文件连续写 |
+| B-MATRIX | fio 多并发矩阵 | 按 `FIO_NUMJOBS_LIST=1 4 8 16` 分别测试 write/read/rw |
+| B-DIO | fio direct I/O 未对齐写探测 | `bs=4097`，记录 fio 实际退出码和错误 |
 
 Python client 调用链：
 
@@ -114,11 +121,17 @@ bash tools/run_pyfalcon_client_benchmark.sh P-1
 bash tools/run_pyfalcon_client_benchmark.sh P-2
 bash tools/run_pyfalcon_client_benchmark.sh P-3
 bash tools/run_pyfalcon_client_benchmark.sh P-5
+bash tools/run_pyfalcon_client_benchmark.sh P-R1
+bash tools/run_pyfalcon_client_benchmark.sh P-RW
+bash tools/run_pyfalcon_client_benchmark.sh P-RWE
+bash tools/run_pyfalcon_client_benchmark.sh P-DIO
 
 # 只跑 fio 基准
 bash tools/run_pyfalcon_client_benchmark.sh fio
 bash tools/run_pyfalcon_client_benchmark.sh B-1
 bash tools/run_pyfalcon_client_benchmark.sh B-5
+bash tools/run_pyfalcon_client_benchmark.sh B-MATRIX
+bash tools/run_pyfalcon_client_benchmark.sh B-DIO
 ```
 
 ## 5. 参数说明
@@ -130,10 +143,14 @@ bash tools/run_pyfalcon_client_benchmark.sh B-5
 | `OUT_DIR` | `/tmp/pyfalcon_client_benchmark_<timestamp>` 或 `$BENCHMARK_ROOT/pyfalcon_client_benchmark_<timestamp>` | 输出目录，保留最终结果和日志 |
 | `CLIENTS` | 4 | 每组 Python client 进程数 |
 | `FILES` | 6000 | 写入文件数 |
+| `READ_FILES` | `$FILES` | P-R1/P-RW/P-RWE 的读数据集文件数 |
 | `UNLINK_FILES` | 6000 | 删除文件数 |
 | `FILE_SIZE` | 2097152 | 单文件大小，默认 2MiB |
 | `WAIT_SEC` | 45 | P-3 写完后等待 evict 的时间 |
 | `FIO_SIZE` | 2G | B-1/B-2 单文件 fio 基准每个 job 的数据量 |
+| `FIO_NUMJOBS_LIST` | `1 4 8 16` | B-MATRIX 使用的 fio 并发矩阵 |
+| `FIO_MATRIX_SIZE` | `$FIO_SIZE` | B-MATRIX 每个 job 的数据量 |
+| `FIO_UNALIGNED_SIZE` | 64M | B-DIO 未对齐 direct I/O 探测的数据量 |
 | `FIO_DIR` | `/tmp/pyfalcon_fio_baseline` 或 `$BENCHMARK_ROOT/pyfalcon_fio_baseline` | fio 临时工作目录，结束后清理 |
 | `CACHE_ROOT` | `/tmp/falcon_cache` 或 `$BENCHMARK_ROOT/falcon_cache` | Falcon DiskCache 本地 cache 目录，结束后清理 |
 | `REQUIRE_NVME` | 1 | 是否要求 `OUT_DIR/CACHE_ROOT/FIO_DIR/metadata workspace` 都在 NVMe 设备上；临时非 NVMe 测试可设为 0 |
@@ -348,3 +365,22 @@ cat "$OUT_DIR"/python/*-idle.log
 ```
 
 如果 P-3 在 `WAIT_SEC=45` 内没有清完所有 cache，这是当前 evict 后台调度和水位推进的表现，不代表 benchmark 失败。以 JSON 的写入结果和 Falcon `DiskCache::Cleanup()` 日志共同判断。
+
+## 11. 新增混合读写 evict 与 direct I/O 验证
+
+`all` 现在会覆盖基础 Python internal 场景、混合读写场景、fio 基准、fio 多并发矩阵和 direct I/O 未对齐探测。为了在非 NVMe 或本地功能验证时缩短时间，可以先用小规模参数跑完整流程：
+
+```bash
+REQUIRE_NVME=0 BENCHMARK_ROOT=/tmp/falconfs_local_benchmark CLIENTS=2 FILES=64 READ_FILES=64 UNLINK_FILES=64 WAIT_SEC=5 FIO_SIZE=64M FIO_LARGE_SIZE=256M FIO_LARGE_RUNTIME=3 FIO_NUMJOBS_LIST="1 2" FIO_MATRIX_SIZE=64M FIO_UNALIGNED_SIZE=16M bash tools/run_pyfalcon_client_benchmark.sh all
+```
+
+在 NVMe 服务器正式测试时，建议恢复 4 client 和 `1/4/8/16` 的 fio 矩阵：
+
+```bash
+BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 READ_FILES=6000 UNLINK_FILES=6000 WAIT_SEC=45 FIO_SIZE=2G FIO_LARGE_SIZE=10G FIO_LARGE_RUNTIME=10 FIO_NUMJOBS_LIST="1 4 8 16" bash tools/run_pyfalcon_client_benchmark.sh all
+```
+
+混合场景判断顺序：先看 fio 多并发读写上限，再看 P-R1/P-1 的 Falcon 纯读纯写，再看 P-RW 的读写混合基线，最后用 P-RWE 对比 P-RW，评估 evict 对读写混合的额外影响。
+
+P-DIO 和 B-DIO 不把未对齐写失败当成脚本失败。它们会记录实际返回值：fio 看 `B-DIO-status.json` 和 `B-DIO.stderr`，Falcon internal 看 `python/P-DIO.json` 中每个 probe 的 `create_ret/write_ret/flush_ret/close_ret/error`。
+

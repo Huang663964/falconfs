@@ -10,6 +10,10 @@ PYTHON_CASES = {
     "P-2": "Python internal 纯删除",
     "P-3": "Python internal 写触发 evict",
     "P-5": "Python internal 边写边删",
+    "P-R1": "Python internal 纯读",
+    "P-RW": "Python internal 读 + 写",
+    "P-RWE": "Python internal 读 + 写 + evict",
+    "P-DIO": "Python internal O_DIRECT 对齐探测",
 }
 
 FIO_CASES = {
@@ -19,6 +23,7 @@ FIO_CASES = {
     "B-4": "fio 多文件 direct 顺序读",
     "B-5": "本地多文件删除基准",
     "B-6": "fio 大文件 2MiB psync 连续写",
+    "B-DIO": "fio direct I/O 未对齐写探测",
 }
 
 
@@ -340,18 +345,20 @@ def fmt_rate(files_per_sec, mib_per_sec):
 
 
 def python_row(case_id, data, evict_stats=None):
+    name = PYTHON_CASES[case_id]
     if data is None:
-        return [case_id, PYTHON_CASES[case_id], "N/A", "N/A", "N/A", "N/A", "缺失"]
+        return [case_id, name, "N/A", "N/A", "N/A", "N/A", "N/A", "缺失"]
     if data.get("_load_error"):
-        return [case_id, PYTHON_CASES[case_id], "N/A", "N/A", "N/A", "N/A", data["_load_error"]]
+        return [case_id, name, "N/A", "N/A", "N/A", "N/A", "N/A", data["_load_error"]]
     error = data.get("error_count", 0)
     if case_id == "P-2":
         create = data.get("create", {})
         unlink = data.get("unlink", {})
         return [
             case_id,
-            PYTHON_CASES[case_id],
+            name,
             str(data.get("clients", "N/A")),
+            "N/A",
             fmt_rate(create.get("files_per_sec"), create.get("mib_per_sec")),
             fmt_rate(unlink.get("files_per_sec"), unlink.get("mib_per_sec")),
             fmt_sec(unlink.get("elapsed_sec")),
@@ -362,23 +369,54 @@ def python_row(case_id, data, evict_stats=None):
         deleter = data.get("deleter", {})
         return [
             case_id,
-            PYTHON_CASES[case_id],
+            name,
             str(data.get("total_processes", data.get("clients", "N/A"))),
+            "N/A",
             fmt_rate(writer.get("files_per_sec"), writer.get("mib_per_sec")),
             fmt_rate(deleter.get("files_per_sec"), deleter.get("mib_per_sec")),
             fmt_sec(data.get("mixed_elapsed_sec")),
             str(error),
         ]
+    if case_id == "P-R1":
+        read = data.get("read", {})
+        return [
+            case_id,
+            name,
+            str(data.get("clients", "N/A")),
+            fmt_rate(read.get("files_per_sec"), read.get("mib_per_sec")),
+            "N/A",
+            "N/A",
+            fmt_sec(read.get("elapsed_sec")),
+            str(error),
+        ]
+    if case_id in ("P-RW", "P-RWE"):
+        reader = data.get("reader", {})
+        writer = data.get("writer", {})
+        evict = evict_overview_value(evict_stats) if case_id == "P-RWE" and evict_stats is not None else "N/A"
+        return [
+            case_id,
+            name,
+            str(data.get("total_processes", data.get("clients", "N/A"))),
+            fmt_rate(reader.get("files_per_sec"), reader.get("mib_per_sec")),
+            fmt_rate(writer.get("files_per_sec"), writer.get("mib_per_sec")),
+            evict,
+            fmt_sec(data.get("mixed_elapsed_sec")),
+            str(error),
+        ]
+    if case_id == "P-DIO":
+        probes = data.get("probes") or []
+        failed = sum(1 for item in probes if item.get("write_ret") not in (0, None) or item.get("error"))
+        return [case_id, name, "1", "N/A", "见 direct I/O 探测", "N/A", f"probes={len(probes)}, failed_or_rejected={failed}", str(error)]
     return [
         case_id,
-        PYTHON_CASES[case_id],
+        name,
         str(data.get("clients", data.get("writer_clients", "N/A"))),
+        "N/A",
         fmt_rate(data.get("files_per_sec"), data.get("mib_per_sec")),
         evict_overview_value(evict_stats) if case_id == "P-3" and evict_stats is not None else ("DiskCache evict" if case_id == "P-3" else "N/A"),
         fmt_sec(data.get("elapsed_sec")),
         str(error),
     ]
-
 
 def python_detail_rows(case_id, data):
     if data is None:
@@ -399,6 +437,8 @@ def python_detail_rows(case_id, data):
         unlink = data.get("unlink", {})
         rows.extend([
             [case_id, "create.elapsed_sec", fmt_num(data.get("create", {}).get("elapsed_sec"), 6)],
+            [case_id, "create.files_per_sec", fmt_num(data.get("create", {}).get("files_per_sec"), 6)],
+            [case_id, "create.mib_per_sec", fmt_num(data.get("create", {}).get("mib_per_sec"), 6)],
             [case_id, "unlink.elapsed_sec", fmt_num(unlink.get("elapsed_sec"), 6)],
             [case_id, "unlink.files_per_sec", fmt_num(unlink.get("files_per_sec"), 6)],
             [case_id, "unlink.mib_per_sec", fmt_num(unlink.get("mib_per_sec"), 6)],
@@ -416,6 +456,31 @@ def python_detail_rows(case_id, data):
             [case_id, "writer.latency_p99", fmt_ms(writer.get("latency_p99_sec"))],
             [case_id, "deleter.latency_p99", fmt_ms(deleter.get("latency_p99_sec"))],
         ])
+    elif case_id == "P-R1":
+        read = data.get("read", {})
+        rows.extend([
+            [case_id, "read.elapsed_sec", fmt_num(read.get("elapsed_sec"), 6)],
+            [case_id, "read.files_per_sec", fmt_num(read.get("files_per_sec"), 6)],
+            [case_id, "read.mib_per_sec", fmt_num(read.get("mib_per_sec"), 6)],
+            [case_id, "read.latency_p99", fmt_ms(read.get("latency_p99_sec"))],
+        ])
+    elif case_id in ("P-RW", "P-RWE"):
+        reader = data.get("reader", {})
+        writer = data.get("writer", {})
+        rows.extend([
+            [case_id, "mixed_elapsed_sec", fmt_num(data.get("mixed_elapsed_sec"), 6)],
+            [case_id, "reader.files_per_sec", fmt_num(reader.get("files_per_sec"), 6)],
+            [case_id, "reader.mib_per_sec", fmt_num(reader.get("mib_per_sec"), 6)],
+            [case_id, "writer.files_per_sec", fmt_num(writer.get("files_per_sec"), 6)],
+            [case_id, "writer.mib_per_sec", fmt_num(writer.get("mib_per_sec"), 6)],
+            [case_id, "reader.latency_p99", fmt_ms(reader.get("latency_p99_sec"))],
+            [case_id, "writer.latency_p99", fmt_ms(writer.get("latency_p99_sec"))],
+        ])
+        if case_id == "P-RWE":
+            rows.append([case_id, "wait_sec", fmt_num(data.get("wait_sec"), 0)])
+    elif case_id == "P-DIO":
+        for item in data.get("probes") or []:
+            rows.append([case_id, item.get("name", "probe"), f"create={item.get('create_ret')} write={item.get('write_ret')} flush={item.get('flush_ret')} close={item.get('close_ret')} error={item.get('error', '')} cleanup_warning={item.get('cleanup_warning', '')}"])
     return rows
 
 
@@ -427,7 +492,7 @@ def fio_metric(data, rw):
         return None
     job = jobs[0]
     metric = job.get(rw, {})
-    lat = metric.get("lat_ns", {})
+    lat = metric.get("clat_ns") or metric.get("lat_ns", {})
     pct = lat.get("percentile", {})
     return {
         "runtime_sec": (metric.get("runtime") or 0) / 1000.0,
@@ -444,6 +509,16 @@ def fio_metric(data, rw):
 def fio_row(case_id, data):
     if data is None:
         return [case_id, FIO_CASES[case_id], "N/A", "N/A", "N/A", "缺失"]
+    if case_id == "B-DIO":
+        if data.get("_load_error"):
+            return [case_id, FIO_CASES[case_id], "N/A", "见 B-DIO-status.json", "N/A", data["_load_error"]]
+        if data.get("mode") == "fio_direct_unaligned":
+            return [case_id, FIO_CASES[case_id], "N/A", "见 B-DIO-status.json", "N/A", f"exit_status={data.get('exit_status')}"]
+        job_error = "N/A"
+        jobs = data.get("jobs") or []
+        if jobs:
+            job_error = str(jobs[0].get("error", 0))
+        return [case_id, FIO_CASES[case_id], "N/A", "见 B-DIO-status.json", "N/A", job_error]
     if data.get("_load_error"):
         return [case_id, FIO_CASES[case_id], "N/A", "N/A", "N/A", data["_load_error"]]
     if case_id == "B-5":
@@ -469,6 +544,29 @@ def fio_row(case_id, data):
     ]
 
 
+def fio_matrix_rows(fio_dir):
+    rows = []
+    for path in sorted(fio_dir.glob("B-*-N*.json")):
+        stem = path.stem
+        if stem.endswith("-prepare"):
+            continue
+        data = load_json(path)
+        if not data or data.get("_load_error"):
+            rows.append([stem, "N/A", "N/A", "N/A", data.get("_load_error", "缺失") if data else "缺失"])
+            continue
+        if stem.startswith("B-RW-"):
+            read = fio_metric(data, "read") or {}
+            write = fio_metric(data, "write") or {}
+            rows.append([stem, fmt_rate(None, read.get("mib_per_sec")), fmt_rate(None, write.get("mib_per_sec")), fmt_num(read.get("p99_ms")), str(read.get("error", 0) or write.get("error", 0))])
+        elif stem.startswith("B-R-"):
+            read = fio_metric(data, "read") or {}
+            rows.append([stem, fmt_rate(None, read.get("mib_per_sec")), "N/A", fmt_num(read.get("p99_ms")), str(read.get("error", 0))])
+        else:
+            write = fio_metric(data, "write") or {}
+            rows.append([stem, "N/A", fmt_rate(None, write.get("mib_per_sec")), fmt_num(write.get("p99_ms")), str(write.get("error", 0))])
+    return rows
+
+
 def table(headers, rows):
     lines = []
     lines.append("| " + " | ".join(headers) + " |")
@@ -485,6 +583,7 @@ def main():
     parser.add_argument("--log-output", default=None)
     parser.add_argument("--clients", default="")
     parser.add_argument("--files", default="")
+    parser.add_argument("--read-files", default="")
     parser.add_argument("--unlink-files", default="")
     parser.add_argument("--file-size", default="")
     parser.add_argument("--wait-sec", default="")
@@ -503,6 +602,10 @@ def main():
     python_data = {case: load_json(python_dir / f"{case}.json") for case in PYTHON_CASES}
     fio_data = {case: load_json(fio_dir / f"{case}.json") for case in FIO_CASES}
     evict_stats = parse_evict_stats(out_dir)
+    evict_stats_by_case = {
+        "P-3": parse_evict_stats(out_dir / "work_P-3"),
+        "P-RWE": parse_evict_stats(out_dir / "work_P-RWE"),
+    }
 
     lines = []
     lines.append("# PyFalcon internal client benchmark 测试结果")
@@ -514,6 +617,7 @@ def main():
         ["执行场景", args.scenario or "N/A"],
         ["CLIENTS", args.clients or "N/A"],
         ["FILES", args.files or "N/A"],
+        ["READ_FILES", args.read_files or "N/A"],
         ["UNLINK_FILES", args.unlink_files or "N/A"],
         ["FILE_SIZE bytes", args.file_size or "N/A"],
         ["WAIT_SEC", args.wait_sec or "N/A"],
@@ -525,8 +629,8 @@ def main():
     lines.append("## Python internal API 结果总览")
     lines.append("")
     lines.append(table(
-        ["编号", "场景", "并发", "写吞吐", "删除/evict 吞吐", "主要耗时", "错误"],
-        [python_row(case, python_data[case], evict_stats if case == "P-3" else None) for case in PYTHON_CASES],
+        ["编号", "场景", "并发", "读吞吐", "写吞吐", "删除/evict 吞吐", "主要耗时", "错误"],
+        [python_row(case, python_data[case], evict_stats_by_case.get(case, evict_stats) if case in ("P-3", "P-RWE") else None) for case in PYTHON_CASES],
     ))
     detail_rows = []
     for case in PYTHON_CASES:
@@ -548,6 +652,20 @@ def main():
         [fio_row(case, fio_data[case]) for case in FIO_CASES],
     ))
 
+    matrix_rows = fio_matrix_rows(fio_dir)
+    if matrix_rows:
+        lines.append("")
+        lines.append("## fio 多并发矩阵")
+        lines.append("")
+        lines.append(table(["编号", "读吞吐", "写吞吐", "p99(ms)", "错误"], matrix_rows))
+
+    dio_status = load_json(fio_dir / "B-DIO-status.json")
+    if dio_status:
+        lines.append("")
+        lines.append("## direct I/O 未对齐探测")
+        lines.append("")
+        lines.append(table(["项目", "值"], [["fio B-DIO exit_status", dio_status.get("exit_status")], ["expected_may_fail", dio_status.get("expected_may_fail")]]))
+
     lines.append("")
     lines.append("## 原始结果文件")
     lines.append("")
@@ -558,6 +676,10 @@ def main():
     for case in FIO_CASES:
         path = fio_dir / f"{case}.json"
         raw_rows.append([case, str(path), "是" if path.exists() else "否"])
+    for path in sorted(fio_dir.glob("B-*-N*.json")):
+        raw_rows.append([path.stem, str(path), "是"])
+    status_path = fio_dir / "B-DIO-status.json"
+    raw_rows.append(["B-DIO-status", str(status_path), "是" if status_path.exists() else "否"])
     storage_info = out_dir / "storage_info.txt"
     raw_rows.append(["storage", str(storage_info), "是" if storage_info.exists() else "否"])
     evict_config = out_dir / "evict_config.txt"
