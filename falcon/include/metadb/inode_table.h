@@ -41,11 +41,13 @@ typedef struct FormData_dfs_inode_table
     uint64 update_version;
     int32 primary_nodeid;
     int32 backup_nodeid;
+    uint64 lease_count;
+    TimestampTz lease_expire_at;
 } FormData_dfs_inode_table;
 
 typedef FormData_dfs_inode_table *Form_dfs_inode_table;
 
-#define Natts_pg_dfs_inode_table 19
+#define Natts_pg_dfs_inode_table 21
 #define Anum_pg_dfs_file_name 1
 #define Anum_pg_dfs_file_st_ino 2
 #define Anum_pg_dfs_file_parentid_partid 3
@@ -65,6 +67,8 @@ typedef FormData_dfs_inode_table *Form_dfs_inode_table;
 #define Anum_pg_dfs_file_update_version 17
 #define Anum_pg_dfs_file_primary_nodeid 18
 #define Anum_pg_dfs_file_backup_nodeid 19
+#define Anum_pg_dfs_file_lease_count 20
+#define Anum_pg_dfs_file_lease_expire_at 21
 
 // #define DFS_INODEID_SEQUENCE_NAME "pg_dfs_inodeid_seq"
 

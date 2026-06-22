@@ -54,17 +54,13 @@ std::string GetPodIPPort()
     return std::string(defaultPodIPPort);
 }
 
-float GetStorageThreshold(bool persistToStorage)
+float GetStorageUsedWatermark()
 {
-    const char *storageThreshold = std::getenv("STORAGE_THRESHOLD");
-    if (storageThreshold == nullptr) {
-        if (persistToStorage) {
-            return 0.8;
-        } else {
-            return 1;
-        }
+    const char *storageUsedWatermark = std::getenv("STORAGE_THRESHOLD");
+    if (storageUsedWatermark == nullptr) {
+        return 0.8F;
     }
-    return atof(storageThreshold);
+    return atof(storageUsedWatermark);
 }
 
 int GetParentPathLevel()

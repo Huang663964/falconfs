@@ -53,7 +53,8 @@ static bool InsertIntoInodeTable(Relation relation,
                                  const char *etag,
                                  uint64_t update_version,
                                  int32_t primaryNodeId,
-                                 int32_t backupNodeId);
+                                 int32_t backupNodeId,
+                                 uint64_t initialLeaseCount);
 // mistyped in original video as well
 #define CHECK_ERROR_CODE_WITH_CONTINUE(errCode) \
     if ((errCode) != SUCCESS) {                 \
@@ -537,7 +538,8 @@ void FalconMkdirSubCreateHandle(MetaProcessInfo *infoArray, int count)
                                  info->etag,
                                  0,
                                  -1,
-                                 -1);
+                                 -1,
+                                 0);
 
             info->errorCode = SUCCESS;
         }
@@ -649,6 +651,7 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
             toHandleMetaProcessList = lappend(toHandleMetaProcessList, info);
         }
 
+        // force the info written to memory
         volatile MetaProcessInfo info = NULL;
         while (list_length(toHandleMetaProcessList) != 0) {
             BeginInternalSubTransaction(NULL);
@@ -661,7 +664,6 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
                 int currentGroupHandled = BATCH_OPERATION_GROUP_SIZE;
                 int toHandleMetaProcessIndex = list_length(toHandleMetaProcessList) - 1;
                 while (currentGroupHandled > 0 && toHandleMetaProcessIndex >= 0) {
-                    // force the info writen to memory
                     info = list_nth(toHandleMetaProcessList, toHandleMetaProcessIndex);
                     --toHandleMetaProcessIndex;
                     if (info->errorCode != SUCCESS) {
@@ -690,6 +692,7 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
                                                           &info->node_id,
                                                           NULL,
                                                           NULL,
+                                                          NULL,
                                                           NULL);
                         }
                         continue;
@@ -716,7 +719,8 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
                                          info->etag,
                                          0,
                                          info->node_id,
-                                         -1);
+                                         -1,
+                                         1);
                     STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 8);
                     --currentGroupHandled;
                 }
@@ -755,6 +759,7 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
                                                   info->etag,
                                                   NULL,
                                                   &info->st_mtim,
+                                                  NULL,
                                                   NULL,
                                                   NULL,
                                                   NULL,
@@ -1008,6 +1013,7 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
                                                            &info->node_id,
                                                            NULL,
                                                            NULL,
+                                                           NULL,
                                                            &statContext);
             info->st_dev = 0;
             info->st_uid = 0;
@@ -1019,10 +1025,20 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
             info->st_mtim = 0;
             info->st_ctim = 0;
             info->etag = (char *)"";
-            if (!fileExist)
+            if (!fileExist) {
                 info->errorCode = FILE_NOT_EXISTS;
-            else
-                info->errorCode = SUCCESS;
+            } else {
+                if (!UpdateInodeLeaseCount(inodeShardName->data,
+                                           inodeIndexShardName->data,
+                                           info->parentId_partId,
+                                           info->name,
+                                           1,
+                                           NULL)) {
+                    info->errorCode = PROGRAM_ERROR;
+                } else {
+                    info->errorCode = SUCCESS;
+                }
+            }
 
         }
     }
@@ -1141,11 +1157,22 @@ void FalconCloseHandle(MetaProcessInfo *infoArray, int count)
                                                            NULL,
                                                            &nodeId,
                                                            NULL,
+                                                           NULL,
                                                            &statContext);
-            if (!fileExist)
+            if (!fileExist) {
                 info->errorCode = FILE_NOT_EXISTS;
-            else
-                info->errorCode = SUCCESS;
+            } else {
+                if (!UpdateInodeLeaseCount(inodeShardName->data,
+                                           inodeIndexShardName->data,
+                                           info->parentId_partId,
+                                           info->name,
+                                           -1,
+                                           NULL)) {
+                    info->errorCode = PROGRAM_ERROR;
+                } else {
+                    info->errorCode = SUCCESS;
+                }
+            }
 
         }
     }
@@ -1192,14 +1219,32 @@ void FalconUnlinkHandle(MetaProcessInfo *infoArray, int count)
 
         FalconErrorCode errorCode =
             PathParseTreeInsert(NULL, directoryRel, info->path, 0, &info->parentId, &info->name, NULL);
-        CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
+        if (errorCode != SUCCESS) {
+            FALCON_RAW_WARNING_EXTENDED(errorCode,
+                                       "evict unlink path parse failed, path=%s, expected_inode=%lu, error=%d",
+                                        info->path,
+                                        info->expectedInodeId,
+                                        errorCode);
+            info->errorCode = errorCode;
+            continue;
+        }
 
         uint16_t partId = HashPartId(info->name);
         info->parentId_partId = CombineParentIdWithPartId(info->parentId, partId);
         int shardId, workerId;
         SearchShardInfoByShardValue(info->parentId_partId, &shardId, &workerId);
-        if (workerId != GetLocalServerId())
-            CHECK_ERROR_CODE_WITH_CONTINUE(WRONG_WORKER);
+        if (workerId != GetLocalServerId()) {
+            FALCON_RAW_WARNING_EXTENDED(WRONG_WORKER,
+                                       "evict unlink wrong worker, path=%s, expected_inode=%lu, parent_part=%lu, shard=%d, owner_worker=%d, local_worker=%d",
+                                        info->path,
+                                        info->expectedInodeId,
+                                        info->parentId_partId,
+                                        shardId,
+                                        workerId,
+                                        GetLocalServerId());
+            info->errorCode = WRONG_WORKER;
+            continue;
+        }
 
         bool found;
         entry = hash_search(batchMetaProcessInfoListPerShard, &shardId, HASH_ENTER, &found);
@@ -1233,6 +1278,44 @@ void FalconUnlinkHandle(MetaProcessInfo *infoArray, int count)
                 .opDoneCheckpoint = CKPT_HANDLER_START + 6,
             };
 
+            if (info->hasExpectedInodeId) {
+                uint64_t nlink = 0;
+                mode_t mode = 0;
+                uint64_t leaseCount = 0;
+                bool inodeMatched = false;
+                bool fileExist = UnlinkInodeIfNoActiveLease(inodeShardName->data,
+                                                            inodeIndexShardName->data,
+                                                            info->parentId_partId,
+                                                            info->name,
+                                                            info->expectedInodeId,
+                                                            &info->inodeId,
+                                                            &info->st_size,
+                                                            &nlink,
+                                                            &mode,
+                                                            &info->node_id,
+                                                            &leaseCount,
+                                                            &inodeMatched,
+                                                            &statContext);
+                if (!fileExist || !inodeMatched) {
+                    info->errorCode = SUCCESS;
+                } else if (leaseCount > 0) {
+                    FALCON_RAW_WARNING_EXTENDED(LEASE_CONFLICT,
+                                               "evict unlink lease conflict, path=%s, expected_inode=%lu, parent_part=%lu, lease_count=%lu",
+                                                info->path,
+                                                info->expectedInodeId,
+                                                info->parentId_partId,
+                                                leaseCount);
+                    info->errorCode = LEASE_CONFLICT;
+                } else if (!S_ISREG(mode)) {
+                    info->errorCode = PATH_VERIFY_FAILED;
+                } else if (nlink != 1) {
+                    info->errorCode = PROGRAM_ERROR;
+                } else {
+                    info->errorCode = SUCCESS;
+                }
+                continue;
+            }
+
             uint64_t nlink;
             mode_t mode;
             bool fileExist = SearchAndUpdateInodeTableInfo(inodeShardName->data,
@@ -1259,15 +1342,19 @@ void FalconUnlinkHandle(MetaProcessInfo *infoArray, int count)
                                                            &info->node_id,
                                                            NULL,
                                                            NULL,
+                                                           info->hasExpectedInodeId ? &info->expectedInodeId : NULL,
                                                            &statContext);
-            if (!fileExist)
-                info->errorCode = FILE_NOT_EXISTS;
-            else if (!S_ISREG(mode))
-                info->errorCode = PATH_VERIFY_FAILED;
-            else if (nlink != 1)
-                info->errorCode = PROGRAM_ERROR;
-            else
+            if (!fileExist) {
+                info->errorCode = info->hasExpectedInodeId ? SUCCESS : FILE_NOT_EXISTS;
+            } else if (info->hasExpectedInodeId && info->inodeId != info->expectedInodeId) {
                 info->errorCode = SUCCESS;
+            } else if (!S_ISREG(mode)) {
+                info->errorCode = PATH_VERIFY_FAILED;
+            } else if (nlink != 1) {
+                info->errorCode = PROGRAM_ERROR;
+            } else {
+                info->errorCode = SUCCESS;
+            }
 
         }
     }
@@ -1686,6 +1773,7 @@ void FalconRmdirSubUnlinkHandle(MetaProcessInfo info)
                                                    NULL,
                                                    NULL,
                                                    NULL,
+                                                   NULL,
                                                    NULL);
     if (!fileExist)
         FALCON_ELOG_ERROR_EXTENDED(FILE_NOT_EXISTS,
@@ -2079,7 +2167,8 @@ void FalconRenameSubCreateHandle(MetaProcessInfo info)
                          "",
                          0,
                          info->node_id,
-                         -1);
+                         -1,
+                         0);
     STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
     table_close(workerInodeRel, RowExclusiveLock);
 
@@ -2158,6 +2247,7 @@ void FalconUtimeNsHandle(MetaProcessInfo info)
                                                    NULL,
                                                    NULL,
                                                    NULL,
+                                                   NULL,
                                                    NULL);
     if (!fileExist)
         FALCON_ELOG_ERROR(FILE_NOT_EXISTS, "file doesn't exist.");
@@ -2222,6 +2312,7 @@ void FalconChownHandle(MetaProcessInfo info)
                                                    MODE_CHECK_NONE,
                                                    &info->st_uid,
                                                    &info->st_gid,
+                                                   NULL,
                                                    NULL,
                                                    NULL,
                                                    NULL,
@@ -2300,6 +2391,7 @@ void FalconChmodHandle(MetaProcessInfo info)
                                                    NULL,
                                                    NULL,
                                                    NULL,
+                                                   NULL,
                                                    NULL);
     if (!fileExist)
         FALCON_ELOG_ERROR(FILE_NOT_EXISTS, "file doesn't exist.");
@@ -2330,7 +2422,8 @@ static bool InsertIntoInodeTable(Relation relation,
                                  const char *etag,
                                  uint64_t update_version,
                                  int32_t primaryNodeId,
-                                 int32_t backupNodeId)
+                                 int32_t backupNodeId,
+                                 uint64_t initialLeaseCount)
 {
 
     Datum values[Natts_pg_dfs_inode_table];
@@ -2360,6 +2453,9 @@ static bool InsertIntoInodeTable(Relation relation,
     values[Anum_pg_dfs_file_update_version - 1] = UInt64GetDatum(update_version);
     values[Anum_pg_dfs_file_primary_nodeid - 1] = UInt32GetDatum(primaryNodeId);
     values[Anum_pg_dfs_file_backup_nodeid - 1] = UInt32GetDatum(backupNodeId);
+    values[Anum_pg_dfs_file_lease_count - 1] = UInt64GetDatum(initialLeaseCount);
+    values[Anum_pg_dfs_file_lease_expire_at - 1] = TimestampTzGetDatum(
+        initialLeaseCount > 0 ? GetCurrentTimestamp() + FALCON_INODE_LEASE_TTL_US : FALCON_INODE_LEASE_EXPIRED_AT);
 
     heapTuple = heap_form_tuple(tupleDescriptor, values, isNulls);
     if (indexState == NULL)

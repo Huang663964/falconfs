@@ -165,6 +165,25 @@ FalconErrorCode FalconMetaServiceSerializer::SerializeRequestToSerializedData(co
         break;
     }
 
+    case DFC_UNLINK_IF_INODE_MATCH: {
+        const UnlinkIfInodeMatchParam *param = meta_param_helper::Get<UnlinkIfInodeMatchParam>(request.file_params);
+        if (!param)
+            return ARGUMENT_ERROR;
+        if (!ValidatePathComponentLengths(param->path)) {
+            fprintf(stderr,
+                    "[WARNING] [FalconMetaService] Path component exceeds %zu bytes: %s\n",
+                    FALCON_MAX_NAME_LENGTH,
+                    param->path.c_str());
+            return INVALID_PARAMETER;
+        }
+        auto path = builder.CreateString(param->path);
+        auto fbs_param = falcon::meta_fbs::CreateUnlinkIfInodeMatchParam(builder, path, param->expected_inode);
+        meta_param = falcon::meta_fbs::CreateMetaParam(builder,
+                                                       falcon::meta_fbs::AnyMetaParam_UnlinkIfInodeMatchParam,
+                                                       fbs_param.Union());
+        break;
+    }
+
     case DFC_CLOSE: {
         const CloseParam *param = meta_param_helper::Get<CloseParam>(request.file_params);
         if (!param)
@@ -628,6 +647,11 @@ bool FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(const vo
             memset(response->data, 0, sizeof(UnlinkResponse));
             return true;
         }
+        case DFC_UNLINK_IF_INODE_MATCH: {
+            response->data = new UnlinkResponse();
+            memset(response->data, 0, sizeof(UnlinkResponse));
+            return true;
+        }
         case DFC_READDIR: {
             response->data = new ReadDirResponse();
             memset(response->data, 0, sizeof(ReadDirResponse));
@@ -746,6 +770,19 @@ bool FalconMetaServiceSerializer::DeserializeResponseFromSerializedData(const vo
     }
 
     case DFC_UNLINK: {
+        if (meta_response->response_type() != falcon::meta_fbs::AnyMetaResponse_UnlinkResponse) {
+            return false;
+        }
+        const auto *fbs_resp = meta_response->response_as_UnlinkResponse();
+        UnlinkResponse *unlink_resp = new UnlinkResponse();
+        unlink_resp->st_ino = fbs_resp->st_ino();
+        unlink_resp->st_size = fbs_resp->st_size();
+        unlink_resp->node_id = fbs_resp->node_id();
+        response->data = unlink_resp;
+        return true;
+    }
+
+    case DFC_UNLINK_IF_INODE_MATCH: {
         if (meta_response->response_type() != falcon::meta_fbs::AnyMetaResponse_UnlinkResponse) {
             return false;
         }

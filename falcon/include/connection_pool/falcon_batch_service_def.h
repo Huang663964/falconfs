@@ -35,6 +35,8 @@ inline FalconBatchServiceType FalconMetaServiceTypeToBatchServiceType(const Falc
         return FalconBatchServiceType::STAT;
     case FalconMetaServiceType::UNLINK:
         return FalconBatchServiceType::UNLINK;
+    case FalconMetaServiceType::UNLINK_IF_INODE_MATCH:
+        return FalconBatchServiceType::UNLINK;
     case FalconMetaServiceType::OPEN:
         return FalconBatchServiceType::OPEN;
     case FalconMetaServiceType::CLOSE:

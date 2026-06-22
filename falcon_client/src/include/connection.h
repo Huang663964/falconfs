@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -70,6 +71,12 @@ class Connection {
                                    ResponseHandler responseHandler,
                                    ConnectionCache *cache = nullptr,
                                    ResultType *result = nullptr);
+    template <typename ParamBuilder, typename ResponseHandler>
+    FalconErrorCode ProcessBatchRequest(falcon::meta_proto::MetaServiceType type,
+                                        std::size_t count,
+                                        const ParamBuilder &paramBuilder,
+                                        ResponseHandler responseHandler,
+                                        ConnectionCache *cache = nullptr);
 
   public:
     ServerIdentifier server;
@@ -114,6 +121,10 @@ class Connection {
     Close(const char *path, int64_t size, uint64_t mtime, int32_t nodeId, ConnectionCache *cache = nullptr);
     FalconErrorCode
     Unlink(const char *path, uint64_t &inodeId, int64_t &size, int32_t &nodeId, ConnectionCache *cache = nullptr);
+    FalconErrorCode BatchUnlinkIfInodeMatch(const std::vector<std::string> &paths,
+                                            const std::vector<uint64_t> &expectedInodes,
+                                            std::vector<FalconErrorCode> &results,
+                                            ConnectionCache *cache = nullptr);
 
     struct ReadDirResponse
     {

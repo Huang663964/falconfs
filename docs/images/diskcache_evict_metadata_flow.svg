@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#344054"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 32px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #101828; }
+      .subtitle { font: 400 16px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #667085; }
+      .lane { fill: #eef2f6; stroke: #cbd5e1; stroke-width: 1; rx: 18; }
+      .laneTitle { font: 700 15px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #475467; }
+      .box { fill: #ffffff; stroke: #98a2b3; stroke-width: 2; rx: 12; }
+      .client { fill: #eff8ff; stroke: #2e90fa; stroke-width: 2; rx: 12; }
+      .server { fill: #f0fdf4; stroke: #12b76a; stroke-width: 2; rx: 12; }
+      .success { fill: #ecfdf3; stroke: #12b76a; stroke-width: 2; rx: 12; }
+      .fail { fill: #fef3f2; stroke: #f04438; stroke-width: 2; rx: 12; }
+      .decision { fill: #fff7ed; stroke: #f97316; stroke-width: 2; }
+      .text { font: 600 17px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #101828; }
+      .small { font: 400 13px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #475467; }
+      .label { font: 600 13px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #344054; }
+      .edge { fill: none; stroke: #344054; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1280" height="760"/>
+  <text class="title" x="64" y="58">Evict Metadata 数据流</text>
+  <text class="subtitle" x="64" y="84">Open/Create 在 metadb 增加 inode lease，Close 释放 lease；evict 前同步批量执行 path + expected_inode + no active lease 条件 unlink。</text>
+
+  <rect class="lane" x="40" y="125" width="260" height="550"/>
+  <text class="laneTitle" x="64" y="154">DiskCache</text>
+  <rect class="box" x="70" y="205" width="200" height="76"/>
+  <text class="text" x="102" y="235">Evict 候选</text>
+  <text class="small" x="102" y="258">inode / size / path</text>
+  <rect class="box" x="70" y="430" width="200" height="76"/>
+  <text class="text" x="102" y="460">回填 prepared</text>
+  <text class="small" x="102" y="483">true / false</text>
+  <rect class="success" x="70" y="570" width="200" height="70"/>
+  <text class="text" x="100" y="600">prepared=true</text>
+  <text class="small" x="100" y="622">继续删除本地 cache</text>
+
+  <rect class="lane" x="350" y="125" width="270" height="550"/>
+  <text class="laneTitle" x="374" y="154">Falcon client listener</text>
+  <rect class="client" x="385" y="205" width="200" height="76"/>
+  <text class="text" x="418" y="235">OnEvictingBatch</text>
+  <text class="small" x="418" y="258">批量接收候选</text>
+  <rect class="client" x="385" y="335" width="200" height="76"/>
+  <text class="text" x="418" y="365">按 path 路由</text>
+  <text class="small" x="418" y="388">GetWorkerConnByPath</text>
+  <rect class="client" x="385" y="465" width="200" height="76"/>
+  <text class="text" x="418" y="495">按 server 分组</text>
+  <text class="small" x="418" y="518">一次 RPC 携带多条</text>
+
+  <rect class="lane" x="670" y="125" width="270" height="550"/>
+  <text class="laneTitle" x="694" y="154">Metadata server</text>
+  <rect class="server" x="705" y="205" width="200" height="76"/>
+  <text class="text" x="738" y="235">批量条件 unlink</text>
+  <text class="small" x="724" y="258">path + expected_inode + no active lease</text>
+  <rect class="server" x="705" y="335" width="200" height="76"/>
+  <text class="text" x="738" y="365">FalconUnlinkHandle</text>
+  <text class="small" x="738" y="388">解析 path 并查 inode</text>
+  <polygon class="decision" points="805,455 925,510 805,565 685,510"/>
+  <text class="text" x="740" y="506">inode 匹配</text>
+  <text class="text" x="758" y="529">且无 lease?</text>
+
+  <rect class="lane" x="990" y="125" width="250" height="550"/>
+  <text class="laneTitle" x="1014" y="154">结果</text>
+  <rect class="success" x="1020" y="335" width="190" height="70"/>
+  <text class="text" x="1052" y="365">删除 metadata</text>
+  <text class="small" x="1052" y="387">返回 SUCCESS</text>
+  <rect class="box" x="1020" y="475" width="190" height="70"/>
+  <text class="text" x="1052" y="505">no-op success</text>
+  <text class="small" x="1052" y="527">不存在或 inode 不匹配</text>
+  <rect class="fail" x="1020" y="600" width="190" height="58"/>
+  <text class="text" x="1052" y="633">LEASE_CONFLICT/失败</text>
+
+  <path class="edge" d="M270 243 L385 243"/>
+  <path class="edge" d="M485 281 L485 335"/>
+  <path class="edge" d="M485 411 L485 465"/>
+  <path class="edge" d="M585 503 L640 503 L640 243 L705 243"/>
+  <path class="edge" d="M805 281 L805 335"/>
+  <path class="edge" d="M805 411 L805 455"/>
+  <path class="edge" d="M925 510 L1020 510"/>
+  <text class="label" x="954" y="498">否</text>
+  <path class="edge" d="M875 478 L955 478 L955 370 L1020 370"/>
+  <text class="label" x="948" y="408">是</text>
+  <path class="edge" d="M1020 370 L970 370 L970 700 L40 700 L40 456 L70 456"/>
+  <path class="edge" d="M1020 510 L955 510 L955 715 L55 715 L55 480 L70 480"/>
+  <path class="edge" d="M1020 629 L940 629 L940 730 L70 730 L70 506"/>
+  <path class="edge" d="M170 506 L170 570"/>
+</svg>

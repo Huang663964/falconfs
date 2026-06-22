@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1420" viewBox="0 0 1280 1420">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#344054"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 32px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #101828; }
+      .subtitle { font: 400 16px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #667085; }
+      .lane { fill: #eef2f6; stroke: #cbd5e1; stroke-width: 1; rx: 18; }
+      .laneTitle { font: 700 15px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #475467; }
+      .box { fill: #ffffff; stroke: #98a2b3; stroke-width: 2; rx: 12; }
+      .config { fill: #f0f9ff; stroke: #0284c7; stroke-width: 2; rx: 12; }
+      .io { fill: #eff8ff; stroke: #2e90fa; stroke-width: 2; rx: 12; }
+      .success { fill: #ecfdf3; stroke: #12b76a; stroke-width: 2; rx: 12; }
+      .fail { fill: #fef3f2; stroke: #f04438; stroke-width: 2; rx: 12; }
+      .decision { fill: #fff7ed; stroke: #f97316; stroke-width: 2; }
+      .text { font: 600 17px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #101828; }
+      .small { font: 400 13px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #475467; }
+      .label { font: 600 13px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #344054; }
+      .edge { fill: none; stroke: #344054; stroke-width: 2; marker-end: url(#arrow); }
+      .dash { fill: none; stroke: #667085; stroke-width: 2; stroke-dasharray: 6 6; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1280" height="1420"/>
+  <text class="title" x="64" y="58">DiskCache Evict 流程</text>
+  <text class="subtitle" x="64" y="84">按逻辑容量和前台/后台水位触发 cleanup；本地 pin 只保护本进程，跨 py client/FUSE 通过 metadb inode lease 保护；metadata 条件删除成功后才删除本地 cache 文件。</text>
+
+  <rect class="lane" x="45" y="120" width="345" height="1240"/>
+  <text class="laneTitle" x="73" y="150">配置与触发</text>
+
+  <rect class="config" x="78" y="175" width="278" height="86"/>
+  <text class="text" x="104" y="207">逻辑容量配置</text>
+  <text class="small" x="104" y="231">max_local_disk_size &gt; 0 时</text>
+  <text class="small" x="104" y="249">按逻辑容量计算水位</text>
+
+  <rect class="config" x="78" y="295" width="278" height="92"/>
+  <text class="text" x="104" y="327">前台写入水位</text>
+  <text class="small" x="104" y="351">STORAGE_THRESHOLD=0.9</text>
+  <text class="small" x="104" y="369">写后使用率超过 0.9 时同步 evict</text>
+
+  <rect class="config" x="78" y="420" width="278" height="92"/>
+  <text class="text" x="104" y="452">后台 cleanup 水位</text>
+  <text class="small" x="104" y="476">比前台使用率低约 0.1</text>
+  <text class="small" x="104" y="494">0.9 配置下约 0.8 使用率触发</text>
+
+  <rect class="box" x="78" y="585" width="278" height="72"/>
+  <text class="text" x="104" y="616">写入预分配</text>
+  <text class="small" x="104" y="639">PreAllocSpace 空间不足</text>
+
+  <rect class="box" x="78" y="700" width="278" height="72"/>
+  <text class="text" x="104" y="731">后台水位检查</text>
+  <text class="small" x="104" y="754">block / inode 低于 bgFreeRatio</text>
+
+  <rect class="lane" x="430" y="120" width="405" height="1240"/>
+  <text class="laneTitle" x="458" y="150">主流程</text>
+
+  <rect class="io" x="505" y="175" width="260" height="72"/>
+  <text class="text" x="539" y="206">进入 cleanup</text>
+  <text class="small" x="539" y="229">后台 Cleanup 或前台 Evict(size)</text>
+
+  <rect class="box" x="505" y="290" width="260" height="72"/>
+  <text class="text" x="539" y="321">计算回收目标</text>
+  <text class="small" x="539" y="344">前台按写后水位；后台按派生水位</text>
+
+  <rect class="box" x="505" y="405" width="260" height="72"/>
+  <text class="text" x="539" y="436">扫描 cacheItems</text>
+  <text class="small" x="539" y="459">选择未 pin 且 !evicting</text>
+
+  <rect class="box" x="505" y="520" width="260" height="72"/>
+  <text class="text" x="539" y="551">标记候选并释放锁</text>
+  <text class="small" x="539" y="574">evicting = true，避免长时间持锁</text>
+
+  <rect class="io" x="505" y="635" width="260" height="72"/>
+  <text class="text" x="539" y="666">批量条件 unlink</text>
+  <text class="small" x="539" y="689">OnEvictingBatch / Batch RPC</text>
+
+  <polygon class="decision" points="635,750 775,805 635,860 495,805"/>
+  <text class="text" x="558" y="801">metadata + lease</text>
+  <text class="text" x="590" y="824">检查通过?</text>
+
+  <rect class="box" x="505" y="905" width="260" height="72"/>
+  <text class="text" x="539" y="936">重新加锁校验</text>
+  <text class="small" x="539" y="959">refs / size / path 仍一致</text>
+
+  <polygon class="decision" points="635,1020 775,1075 635,1130 495,1075"/>
+  <text class="text" x="585" y="1071">校验通过?</text>
+  <text class="small" x="573" y="1093">未被重新打开或改写</text>
+
+  <rect class="io" x="505" y="1175" width="260" height="72"/>
+  <text class="text" x="539" y="1206">删除本地 cache 文件</text>
+  <text class="small" x="539" y="1229">remove 成功或 ENOENT</text>
+
+  <rect class="success" x="490" y="1290" width="290" height="72"/>
+  <text class="text" x="522" y="1321">清理索引并更新容量</text>
+  <text class="small" x="522" y="1344">erase cacheItems / inodeToCacheIter</text>
+
+  <rect class="lane" x="875" y="120" width="345" height="1240"/>
+  <text class="laneTitle" x="903" y="150">失败与保护</text>
+
+  <rect class="fail" x="910" y="765" width="270" height="82"/>
+  <text class="text" x="942" y="797">metadata 删除失败或 lease 冲突</text>
+  <text class="small" x="942" y="821">清除 evicting</text>
+  <text class="small" x="942" y="839">保留本地 cache 和索引，后续重试</text>
+
+  <rect class="fail" x="910" y="1035" width="270" height="82"/>
+  <text class="text" x="942" y="1067">候选重新校验失败</text>
+  <text class="small" x="942" y="1091">文件被打开或状态变化</text>
+  <text class="small" x="942" y="1109">跳过本轮 evict</text>
+
+  <path class="edge" d="M217 261 L217 295"/>
+  <path class="edge" d="M217 387 L217 420"/>
+  <path class="dash" d="M356 621 L430 621 L430 211 L505 211"/>
+  <path class="dash" d="M356 736 L415 736 L415 229 L505 229"/>
+  <path class="edge" d="M635 247 L635 290"/>
+  <path class="edge" d="M635 362 L635 405"/>
+  <path class="edge" d="M635 477 L635 520"/>
+  <path class="edge" d="M635 592 L635 635"/>
+  <path class="edge" d="M635 707 L635 750"/>
+  <path class="edge" d="M775 805 L910 805"/>
+  <text class="label" x="813" y="792">否</text>
+  <path class="edge" d="M635 860 L635 905"/>
+  <text class="label" x="652" y="888">是</text>
+  <path class="edge" d="M635 977 L635 1020"/>
+  <path class="edge" d="M775 1075 L910 1075"/>
+  <text class="label" x="813" y="1062">否</text>
+  <path class="edge" d="M635 1130 L635 1175"/>
+  <text class="label" x="652" y="1158">是</text>
+  <path class="edge" d="M635 1247 L635 1290"/>
+</svg>

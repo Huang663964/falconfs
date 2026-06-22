@@ -37,6 +37,8 @@ inline falcon::meta_fbs::AnyMetaParam ToFlatBuffersType(falcon::meta_proto::Meta
     case falcon::meta_proto::OPENDIR:
     case falcon::meta_proto::RMDIR:
         return falcon::meta_fbs::AnyMetaParam_PathOnlyParam;
+    case falcon::meta_proto::UNLINK_IF_INODE_MATCH:
+        return falcon::meta_fbs::AnyMetaParam_UnlinkIfInodeMatchParam;
     case falcon::meta_proto::CLOSE:
         return falcon::meta_fbs::AnyMetaParam_CloseParam;
     case falcon::meta_proto::READDIR:
@@ -94,6 +96,7 @@ FalconErrorCode Connection::ProcessRequest(falcon::meta_proto::MetaServiceType p
     if (proto_type == falcon::meta_proto::MKDIR || proto_type == falcon::meta_proto::CREATE ||
         proto_type == falcon::meta_proto::STAT || proto_type == falcon::meta_proto::OPEN ||
         proto_type == falcon::meta_proto::CLOSE || proto_type == falcon::meta_proto::UNLINK ||
+        proto_type == falcon::meta_proto::UNLINK_IF_INODE_MATCH ||
         proto_type == falcon::meta_proto::KV_PUT || proto_type == falcon::meta_proto::KV_GET ||
         proto_type == falcon::meta_proto::KV_DEL || proto_type == falcon::meta_proto::SLICE_PUT ||
         proto_type == falcon::meta_proto::SLICE_GET || proto_type == falcon::meta_proto::SLICE_DEL) {
@@ -161,6 +164,94 @@ FalconErrorCode Connection::ProcessRequest(falcon::meta_proto::MetaServiceType p
     }
 
     return responseHandler(metaResponse, result);
+}
+
+
+template <typename ParamBuilder, typename ResponseHandler>
+FalconErrorCode Connection::ProcessBatchRequest(falcon::meta_proto::MetaServiceType protoType,
+                                                std::size_t count,
+                                                const ParamBuilder &paramBuilder,
+                                                ResponseHandler responseHandler,
+                                                ConnectionCache *cache)
+{
+    if (!cache) {
+        cache = &ThreadLocalConnectionCache;
+    }
+
+    SerializedDataClear(&cache->serializedDataBuffer);
+    falcon::meta_proto::MetaRequest request;
+    request.set_allow_batch_with_others(ALLOW_BATCH_WITH_OTHERS);
+    auto type = ToFlatBuffersType(protoType);
+
+    for (std::size_t i = 0; i < count; ++i) {
+        cache->flatBufferBuilder.Clear();
+        auto param = paramBuilder(cache->flatBufferBuilder, i);
+        auto metaParam = falcon::meta_fbs::CreateMetaParam(cache->flatBufferBuilder, type, param.Union());
+        cache->flatBufferBuilder.Finish(metaParam);
+
+        char *segment = SerializedDataApplyForSegment(&cache->serializedDataBuffer,
+                                                      cache->flatBufferBuilder.GetSize());
+        if (segment == nullptr) {
+            return PROGRAM_ERROR;
+        }
+        memcpy(segment, cache->flatBufferBuilder.GetBufferPointer(), cache->flatBufferBuilder.GetSize());
+        request.add_type(protoType);
+    }
+
+    brpc::Controller cntl;
+    cntl.set_timeout_ms(10000);
+    cntl.request_attachment().append_user_data(cache->serializedDataBuffer.buffer,
+                                               cache->serializedDataBuffer.size,
+                                               BrpcDummyDeleter);
+
+    falcon::meta_proto::Empty dummyResponse;
+    stub.MetaCall(&cntl, &request, &dummyResponse, nullptr);
+    if (cntl.Failed()) {
+        FALCON_LOG(LOG_ERROR) << __func__ << ": Send request failed, error code = " << cntl.ErrorCode()
+                              << ", error text = " << cntl.ErrorText();
+        if (cntl.ErrorCode() == brpc::ELOGOFF || cntl.ErrorCode() == EHOSTDOWN) {
+            return SERVER_FAULT;
+        }
+        return REMOTE_QUERY_FAILED;
+    }
+
+    size_t responseBufferSize = cntl.response_attachment().size();
+    std::unique_ptr<char[]> tempBuffer = std::make_unique<char[]>(responseBufferSize);
+    cntl.response_attachment().cutn(tempBuffer.get(), responseBufferSize);
+
+    SerializedData response;
+    if (!SerializedDataInit(&response, tempBuffer.get(), responseBufferSize, responseBufferSize, nullptr)) {
+        return REMOTE_QUERY_FAILED;
+    }
+
+    sd_size_t offset = 0;
+    FalconErrorCode aggregate = SUCCESS;
+    for (std::size_t i = 0; i < count; ++i) {
+        sd_size_t responseSize = SerializedDataNextSeveralItemSize(&response, offset, 1);
+        if (responseSize == static_cast<sd_size_t>(-1)) {
+            return REMOTE_QUERY_FAILED;
+        }
+
+        flatbuffers::Verifier verifier(
+            reinterpret_cast<uint8_t *>(response.buffer + offset + SERIALIZED_DATA_ALIGNMENT),
+            responseSize - SERIALIZED_DATA_ALIGNMENT);
+        if (!verifier.VerifyBuffer<falcon::meta_fbs::MetaResponse>()) {
+            return REMOTE_QUERY_FAILED;
+        }
+
+        auto metaResponse = falcon::meta_fbs::GetMetaResponse(
+            reinterpret_cast<uint8_t *>(response.buffer + offset + SERIALIZED_DATA_ALIGNMENT));
+        FalconErrorCode errorCode = metaResponse->error_code() < LAST_FALCON_ERROR_CODE
+                                        ? static_cast<FalconErrorCode>(metaResponse->error_code())
+                                        : PROGRAM_ERROR;
+        FalconErrorCode itemRet = responseHandler(i, metaResponse, errorCode);
+        if (itemRet != SUCCESS && aggregate == SUCCESS) {
+            aggregate = itemRet;
+        }
+        offset += responseSize;
+    }
+
+    return aggregate;
 }
 
 static timespec ConvertTimestampFromPGToUnix(uint64_t t)
@@ -355,6 +446,41 @@ Connection::Unlink(const char *path, uint64_t &inodeId, int64_t &size, int32_t &
     };
 
     return ProcessRequest(falcon::meta_proto::UNLINK, paramBuilder, responseHandler, cache);
+}
+
+FalconErrorCode Connection::BatchUnlinkIfInodeMatch(const std::vector<std::string> &paths,
+                                                     const std::vector<uint64_t> &expectedInodes,
+                                                     std::vector<FalconErrorCode> &results,
+                                                     ConnectionCache *cache)
+{
+    results.assign(paths.size(), PROGRAM_ERROR);
+    if (paths.size() != expectedInodes.size()) {
+        return PROGRAM_ERROR;
+    }
+    if (paths.empty()) {
+        return SUCCESS;
+    }
+
+    auto paramBuilder = [&paths, &expectedInodes](flatbuffers::FlatBufferBuilder &builder, std::size_t index) {
+        auto pathOffset = builder.CreateString(paths[index]);
+        return falcon::meta_fbs::CreateUnlinkIfInodeMatchParam(builder, pathOffset, expectedInodes[index]);
+    };
+    auto responseHandler = [&results](std::size_t index,
+                                      const falcon::meta_fbs::MetaResponse *metaResponse,
+                                      FalconErrorCode errorCode) {
+        if (errorCode == SUCCESS &&
+            metaResponse->response_type() != falcon::meta_fbs::AnyMetaResponse_UnlinkResponse) {
+            errorCode = PROGRAM_ERROR;
+        }
+        results[index] = errorCode;
+        return errorCode;
+    };
+
+    return ProcessBatchRequest(falcon::meta_proto::UNLINK_IF_INODE_MATCH,
+                               paths.size(),
+                               paramBuilder,
+                               responseHandler,
+                               cache);
 }
 
 FalconErrorCode Connection::ReadDir(const char *path,

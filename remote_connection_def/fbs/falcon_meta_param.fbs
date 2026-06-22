@@ -6,6 +6,10 @@ table PlainCommandParam {
 table PathOnlyParam {
     path: string;
 }
+table UnlinkIfInodeMatchParam {
+    path: string;
+    expected_inode: uint64;
+}
 table MkdirSubMkdirParam {
     parent_id: uint64;
     name: string;
@@ -122,6 +126,7 @@ table SliceIdParam {
 union AnyMetaParam {
     PlainCommandParam,
     PathOnlyParam,
+    UnlinkIfInodeMatchParam,
     MkdirSubMkdirParam,
     MkdirSubCreateParam,
     CloseParam,

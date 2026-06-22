@@ -4,19 +4,25 @@
 
 #include "falcon_meta.h"
 
+#include <algorithm>
 #include <atomic>
-#include <condition_variable>
+#include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
+#include <vector>
 
 #include <sys/stat.h>
 #include <sys/time.h>
 
 #include "buffer/dir_open_instance.h"
 #include "cm/falcon_cm.h"
+#include "disk_cache/disk_cache.h"
 #include "falcon_store/falcon_store.h"
 #include "inner_falcon_meta.h"
 #include "router.h"
@@ -24,8 +30,312 @@
 
 constexpr int FILE_NUMBER_PER_EPOCH = 1048576;
 constexpr int FILE_NUMBER_PER_WORKER = 4096;
-
+constexpr std::size_t UNLINK_LATENCY_SAMPLE_LIMIT = 4096;
+constexpr std::size_t UNLINK_FAILURE_LOG_SAMPLE_LIMIT = 3;
 std::shared_ptr<Router> router;
+
+static void UpdateAtomicMax(std::atomic<uint64_t> &target, uint64_t value)
+{
+    uint64_t current = target.load();
+    while (current < value && !target.compare_exchange_weak(current, value)) {
+    }
+}
+
+static const char *FalconErrorCodeName(int errorCode)
+{
+    switch (errorCode) {
+    case SUCCESS:
+        return "SUCCESS";
+    case PROGRAM_ERROR:
+        return "PROGRAM_ERROR";
+    case LEASE_CONFLICT:
+        return "LEASE_CONFLICT";
+    case WRONG_WORKER:
+        return "WRONG_WORKER";
+    case FILE_NOT_EXISTS:
+        return "FILE_NOT_EXISTS";
+    case PATH_NOT_EXISTS:
+        return "PATH_NOT_EXISTS";
+    case SERVER_FAULT:
+        return "SERVER_FAULT";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void ReleaseMetadataLeaseBestEffort(const std::shared_ptr<Connection> &conn,
+                                           const std::string &path,
+                                           int64_t size,
+                                           int32_t nodeId,
+                                           const char *reason)
+{
+    if (conn == nullptr) {
+        return;
+    }
+    FalconErrorCode ret = conn->Close(path.c_str(), size, 0, nodeId);
+    if (ret != SUCCESS) {
+        FALCON_LOG(LOG_WARNING) << "release metadata lease failed, path=" << path
+                                << ", node=" << nodeId << ", size=" << size
+                                << ", reason=" << reason << ", error=" << ret;
+    }
+}
+
+static uint64_t Percentile(std::vector<uint64_t> values, double q)
+{
+    if (values.empty()) {
+        return 0;
+    }
+    std::sort(values.begin(), values.end());
+    std::size_t idx = static_cast<std::size_t>(values.size() * q);
+    if (idx >= values.size()) {
+        idx = values.size() - 1;
+    }
+    return values[idx];
+}
+
+struct UnlinkFailureSummary {
+    uint64_t total{0};
+    std::vector<std::string> samples;
+};
+
+static void AddUnlinkFailure(UnlinkFailureSummary &summary, const EvictedItem &item, int ret, uint64_t elapsedUs)
+{
+    ++summary.total;
+    if (summary.samples.size() >= UNLINK_FAILURE_LOG_SAMPLE_LIMIT) {
+        return;
+    }
+    std::ostringstream oss;
+    oss << "{path=" << item.path << ", inode=" << item.inode << ", size=" << item.size
+        << ", error=" << ret << "(" << FalconErrorCodeName(ret) << ")"
+        << ", elapsed_us=" << elapsedUs << "}";
+    summary.samples.push_back(oss.str());
+}
+
+static std::string JoinUnlinkSamples(const std::vector<std::string> &samples)
+{
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        if (i > 0) {
+            oss << "; ";
+        }
+        oss << samples[i];
+    }
+    return oss.str();
+}
+
+class FalconEvictUnlinkListener : public DiskCacheEvictListener {
+  public:
+    ~FalconEvictUnlinkListener() override { Stop(); }
+
+    void Start()
+    {
+        FALCON_LOG(LOG_WARNING) << "FalconEvictUnlinkListener started in pre-evict mode";
+    }
+
+    void Stop()
+    {
+        auto localState = state;
+        {
+            std::lock_guard<std::mutex> lock(localState->mutex);
+            if (localState->stopped) {
+                return;
+            }
+            localState->stopped = true;
+        }
+        LogStats(localState);
+    }
+
+    void OnEvictingBatch(const std::vector<EvictedItem> &items, std::vector<bool> &results) override
+    {
+        results.assign(items.size(), false);
+        auto localState = state;
+        {
+            std::lock_guard<std::mutex> lock(localState->mutex);
+            if (localState->stopped) {
+                return;
+            }
+        }
+
+        struct BatchGroup {
+            std::shared_ptr<Connection> conn;
+            std::vector<std::size_t> indices;
+            std::vector<std::string> paths;
+            std::vector<uint64_t> inodes;
+        };
+        std::vector<BatchGroup> groups;
+        UnlinkFailureSummary routeFailureSummary;
+
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            const auto &item = items[i];
+            if (item.path.empty()) {
+                FALCON_LOG(LOG_WARNING) << "Skip evicted inode " << item.inode << " without logical path";
+                results[i] = true;
+                continue;
+            }
+
+            std::shared_ptr<Connection> conn = router->GetWorkerConnByPath(item.path);
+            if (!conn) {
+                localState->enqueuedItems.fetch_add(1);
+                RecordUnlinkResult(localState, PROGRAM_ERROR, 0);
+                AddUnlinkFailure(routeFailureSummary, item, PROGRAM_ERROR, 0);
+                continue;
+            }
+
+            auto groupIt = std::find_if(groups.begin(), groups.end(), [&conn](const BatchGroup &group) {
+                return group.conn->server == conn->server;
+            });
+            if (groupIt == groups.end()) {
+                groups.push_back({conn, {}, {}, {}});
+                groupIt = std::prev(groups.end());
+            }
+            groupIt->indices.push_back(i);
+            groupIt->paths.push_back(item.path);
+            groupIt->inodes.push_back(item.inode);
+        }
+
+        if (routeFailureSummary.total > 0) {
+            FALCON_LOG(LOG_WARNING) << "Evict unlink route failed batch, failed = " << routeFailureSummary.total
+                                    << ", samples = " << JoinUnlinkSamples(routeFailureSummary.samples);
+        }
+
+        for (auto &group : groups) {
+            localState->batchCalls.fetch_add(1);
+            UpdateAtomicMax(localState->maxBatchSize, group.indices.size());
+            auto start = std::chrono::steady_clock::now();
+            std::vector<FalconErrorCode> unlinkResults;
+            int ret = group.conn->BatchUnlinkIfInodeMatch(group.paths, group.inodes, unlinkResults);
+#ifdef ZK_INIT
+            int cnt = 0;
+            while (cnt < RETRY_CNT && ret == SERVER_FAULT) {
+                ++cnt;
+                sleep(SLEEPTIME);
+                group.conn = router->TryToUpdateWorkerConn(group.conn);
+                ret = group.conn->BatchUnlinkIfInodeMatch(group.paths, group.inodes, unlinkResults);
+            }
+#endif
+            uint64_t elapsedUs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start)
+                    .count());
+            uint64_t itemElapsedUs = group.indices.empty() ? elapsedUs : elapsedUs / group.indices.size();
+            if (ret != SUCCESS && unlinkResults.size() != group.indices.size()) {
+                unlinkResults.assign(group.indices.size(), static_cast<FalconErrorCode>(ret));
+            }
+
+            UnlinkFailureSummary failureSummary;
+            for (std::size_t i = 0; i < group.indices.size(); ++i) {
+                std::size_t itemIndex = group.indices[i];
+                FalconErrorCode itemRet = i < unlinkResults.size() ? unlinkResults[i] : PROGRAM_ERROR;
+                localState->enqueuedItems.fetch_add(1);
+                RecordUnlinkResult(localState, itemRet, itemElapsedUs);
+                results[itemIndex] = itemRet == SUCCESS;
+                if (itemRet != SUCCESS) {
+                    AddUnlinkFailure(failureSummary, items[itemIndex], itemRet, itemElapsedUs);
+                }
+            }
+            if (failureSummary.total > 0) {
+                FALCON_LOG(LOG_WARNING) << "Evict unlink failed batch, DN = " << group.conn->server.id
+                                        << ", ip = " << group.conn->server.ip
+                                        << ", port = " << group.conn->server.port
+                                        << ", batch_size = " << group.indices.size()
+                                        << ", failed = " << failureSummary.total
+                                        << ", elapsed_us = " << elapsedUs
+                                        << ", samples = " << JoinUnlinkSamples(failureSummary.samples);
+            }
+        }
+    }
+
+    void OnEvicted(const EvictedItem &item) override
+    {
+        (void)item;
+    }
+
+  private:
+    struct SharedState {
+        std::mutex mutex;
+        bool stopped{false};
+        std::atomic<uint64_t> enqueuedItems{0};
+        std::atomic<uint64_t> processedItems{0};
+        std::atomic<uint64_t> succeededItems{0};
+        std::atomic<uint64_t> failedItems{0};
+        std::atomic<uint64_t> batchCalls{0};
+        std::atomic<uint64_t> maxBatchSize{0};
+        std::atomic<uint64_t> totalUnlinkLatencyUs{0};
+        std::atomic<uint64_t> maxUnlinkLatencyUs{0};
+        std::mutex statsMutex;
+        std::vector<uint64_t> unlinkLatencySamples;
+    };
+
+    static void RecordUnlinkResult(const std::shared_ptr<SharedState> &localState, int ret, uint64_t elapsedUs)
+    {
+        localState->processedItems.fetch_add(1);
+        localState->totalUnlinkLatencyUs.fetch_add(elapsedUs);
+        UpdateAtomicMax(localState->maxUnlinkLatencyUs, elapsedUs);
+        {
+            std::lock_guard<std::mutex> lock(localState->statsMutex);
+            if (localState->unlinkLatencySamples.size() < UNLINK_LATENCY_SAMPLE_LIMIT) {
+                localState->unlinkLatencySamples.push_back(elapsedUs);
+            }
+        }
+        if (ret != SUCCESS) {
+            localState->failedItems.fetch_add(1);
+        } else {
+            localState->succeededItems.fetch_add(1);
+        }
+    }
+
+    static void LogStats(const std::shared_ptr<SharedState> &localState)
+    {
+        uint64_t processed = localState->processedItems.load();
+        uint64_t avgLatencyUs = processed == 0 ? 0 : localState->totalUnlinkLatencyUs.load() / processed;
+        std::vector<uint64_t> latencySamples;
+        {
+            std::lock_guard<std::mutex> lock(localState->statsMutex);
+            latencySamples = localState->unlinkLatencySamples;
+        }
+        uint64_t failed = localState->failedItems.load();
+        std::ostringstream oss;
+        oss << "FalconEvictUnlinkListener stopped, enqueued = " << localState->enqueuedItems.load()
+            << ", processed = " << processed
+            << ", succeeded = " << localState->succeededItems.load()
+            << ", failed = " << failed
+            << ", batch calls = " << localState->batchCalls.load()
+            << ", max batch size = " << localState->maxBatchSize.load()
+            << ", latency samples = " << latencySamples.size()
+            << ", avg unlink latency us = " << avgLatencyUs
+            << ", p95 unlink latency us = " << Percentile(latencySamples, 0.95)
+            << ", p99 unlink latency us = " << Percentile(latencySamples, 0.99)
+            << ", max unlink latency us = " << localState->maxUnlinkLatencyUs.load();
+        if (failed > 0) {
+            FALCON_LOG(LOG_WARNING) << oss.str();
+        } else {
+            FALCON_LOG(LOG_INFO) << oss.str();
+        }
+    }
+
+    std::shared_ptr<SharedState> state{std::make_shared<SharedState>()};
+};
+
+std::unique_ptr<FalconEvictUnlinkListener> evictUnlinkListener;
+
+void StartEvictUnlinkListener()
+{
+    if (evictUnlinkListener != nullptr) {
+        return;
+    }
+    evictUnlinkListener = std::make_unique<FalconEvictUnlinkListener>();
+    evictUnlinkListener->Start();
+    DiskCache::GetInstance().SetEvictListener(evictUnlinkListener.get());
+}
+
+void StopEvictUnlinkListener()
+{
+    DiskCache::GetInstance().SetEvictListener(nullptr);
+    if (evictUnlinkListener == nullptr) {
+        return;
+    }
+    evictUnlinkListener->Stop();
+    evictUnlinkListener.reset();
+}
 
 int FalconInit(std::string &coordinatorIp, int coordinatorPort)
 {
@@ -35,6 +345,7 @@ int FalconInit(std::string &coordinatorIp, int coordinatorPort)
     }
     ServerIdentifier coordinator(coordinatorIp, coordinatorPort);
     router = std::make_shared<Router>(coordinator);
+    StartEvictUnlinkListener();
     return 0;
 }
 
@@ -66,6 +377,7 @@ int FalconInitWithZK(std::string zkEndPoint, const std::string &zkPath)
     }
     ServerIdentifier coordinator(coordinatorIp, coordinatorPort);
     router = std::make_shared<Router>(coordinator);
+    StartEvictUnlinkListener();
     return 0;
 }
 
@@ -101,29 +413,44 @@ int FalconCreate(const std::string &path, uint64_t &fd, int oflags, struct stat 
         return PROGRAM_ERROR;
     }
     uint64_t inodeId;
+    int64_t size = 0;
     int32_t nodeId;
-    int errorCode = conn->Create(path.c_str(), inodeId, nodeId, stbuf);
+    struct stat fallbackStbuf;
+    (void)memset(&fallbackStbuf, 0, sizeof(fallbackStbuf));
+    struct stat *createStat = stbuf != nullptr ? stbuf : &fallbackStbuf;
+    int errorCode = conn->Create(path.c_str(), inodeId, nodeId, createStat);
 #ifdef ZK_INIT
     int cnt = 0;
     while (cnt < RETRY_CNT && errorCode == SERVER_FAULT) {
         ++cnt;
         sleep(SLEEPTIME);
         conn = router->TryToUpdateWorkerConn(conn);
-        errorCode = conn->Create(path.c_str(), inodeId, nodeId, stbuf);
+        errorCode = conn->Create(path.c_str(), inodeId, nodeId, createStat);
     }
 #endif
-    /* Handle the case of not exclusively created file */
+    /* Handle the case of not exclusively created file. Open acquires the metadata lease. */
     if (errorCode == FILE_EXISTS && !(oflags & O_EXCL)) {
-        errorCode = SUCCESS;
+        errorCode = conn->Open(path.c_str(), inodeId, size, nodeId, createStat);
+#ifdef ZK_INIT
+        cnt = 0;
+        while (cnt < RETRY_CNT && errorCode == SERVER_FAULT) {
+            ++cnt;
+            sleep(SLEEPTIME);
+            conn = router->TryToUpdateWorkerConn(conn);
+            errorCode = conn->Open(path.c_str(), inodeId, size, nodeId, createStat);
+        }
+#endif
+    } else if (errorCode == SUCCESS) {
+        size = createStat->st_size;
     }
     if (errorCode != SUCCESS) {
         FALCON_LOG(LOG_ERROR) << "FalconCreate failed for path: " << path << ", DN: " << conn->server.id << ", ip: " << conn->server.ip << ", error code: " << errorCode;
         return errorCode; 
     }
 
-    fd = FalconFd::GetInstance()->AttachFd(inodeId, oflags, nullptr, stbuf->st_size, path, nodeId);
+    fd = FalconFd::GetInstance()->AttachFd(inodeId, oflags, nullptr, size, path, nodeId);
     if (fd == UINT64_MAX) {
-        FalconFd::GetInstance()->DeleteOpenInstance(fd);
+        ReleaseMetadataLeaseBestEffort(conn, path, size, nodeId, "attach_fd_failed");
         return -EMFILE;
     }
     return SUCCESS;
@@ -181,6 +508,7 @@ int FalconOpen(const std::string &path, int oflags, uint64_t &fd, struct stat *s
     if (errorCode != SUCCESS) {
         FalconFd::GetInstance()->ReleaseOpenInstance();
         FALCON_LOG(LOG_ERROR) << "FalconOpen failed for path: " << path << ", DN: " << conn->server.id << ", ip: " << conn->server.ip << ", error code: " << errorCode;
+        return errorCode;
     }
     openInstance->inodeId = inodeId;
     openInstance->originalSize = size;
@@ -205,6 +533,7 @@ int FalconOpen(const std::string &path, int oflags, uint64_t &fd, struct stat *s
             }
             if (buffer == nullptr) {
                 FALCON_LOG(LOG_ERROR) << "In FalconOpen() malloc failed";
+                ReleaseMetadataLeaseBestEffort(conn, path, size, nodeId, "read_buffer_alloc_failed");
                 FalconFd::GetInstance()->ReleaseOpenInstance();
                 return -ENOMEM;
             }
@@ -212,6 +541,7 @@ int FalconOpen(const std::string &path, int oflags, uint64_t &fd, struct stat *s
             openInstance->readBufferSize = openInstance->originalSize;
             int ret = InnerFalconReadSmallFiles(openInstance.get());
             if (ret < 0) {
+                ReleaseMetadataLeaseBestEffort(conn, path, size, nodeId, "small_file_preread_failed");
                 FalconFd::GetInstance()->ReleaseOpenInstance();
                 return ret;
             }
@@ -230,27 +560,34 @@ int FalconClose(const std::string &path, uint64_t fd, bool isFlush, int datasync
     }
 
     size_t size = openInstance->currentSize;
+    bool readFail = openInstance->readFail;
     // only read small files does not open file
     if (openInstance->isOpened) {
         int innerRet = InnerFalconTmpClose(openInstance, isFlush, datasync >= 0); // here may fail, mark in writeFail
         if (innerRet != 0) {
             if (!isFlush) {
+                ReleaseMetadataLeaseBestEffort(router->GetWorkerConnByPath(path),
+                                               path,
+                                               openInstance->originalSize,
+                                               openInstance->nodeId,
+                                               "local_close_failed");
                 FalconFd::GetInstance()->DeleteOpenInstance(fd);
             }
             return innerRet;
         }
     }
-    /* update only once if truncate */
+    /* Flush can skip unchanged metadata updates. Release must still close metadata to release the lease. */
     if (openInstance->readFail || openInstance->writeFail || datasync > 0 ||
         (!openInstance->nodeFail && size == openInstance->originalSize)) {
-        bool readFail = openInstance->readFail;
-        if (!isFlush) {
-            FalconFd::GetInstance()->DeleteOpenInstance(fd);
+        if (openInstance->readFail || openInstance->writeFail) {
+            size = openInstance->originalSize;
         }
-        if (readFail) {
-            return -EIO;
+        if (isFlush) {
+            if (readFail) {
+                return -EIO;
+            }
+            return SUCCESS;
         }
-        return SUCCESS;
     }
 
     std::shared_ptr<Connection> conn = router->GetWorkerConnByPath(path);
@@ -275,6 +612,9 @@ int FalconClose(const std::string &path, uint64_t fd, bool isFlush, int datasync
     openInstance->originalSize = size;
     if (!isFlush) {
         FalconFd::GetInstance()->DeleteOpenInstance(fd);
+    }
+    if (readFail) {
+        return -EIO;
     }
     return errorCode;
 }
@@ -301,7 +641,8 @@ int FalconUnlink(const std::string &path)
     }
 #endif
     if (errorCode != SUCCESS) {
-        FALCON_LOG(LOG_ERROR) << "FalconUnlink failed for path: " << path << ", DN: " << conn->server.id << ", ip: " << conn->server.ip << ", error code: " << errorCode;
+        FALCON_LOG(LOG_ERROR) << "FalconUnlink failed for path: " << path << ", DN: " << conn->server.id << ", ip: "
+                              << conn->server.ip << ", error code: " << errorCode;
     }
     int ret = 0;
     if (errorCode == SUCCESS) {
@@ -456,6 +797,7 @@ int FalconCloseDir(uint64_t fd)
 
 int FalconDestroy()
 {
+    StopEvictUnlinkListener();
     FalconStore::GetInstance()->DeleteInstance();
 
     return 0;

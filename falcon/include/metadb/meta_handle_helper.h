@@ -6,6 +6,9 @@
 #include "lib/stringinfo.h"
 #include "utils/relcache.h"
 
+#define FALCON_INODE_LEASE_TTL_US 300000000LL
+#define FALCON_INODE_LEASE_EXPIRED_AT 0
+
 Oid GetRelationOidByName_FALCON(const char *relationName);
 
 enum ModeCheckType
@@ -46,7 +49,28 @@ bool SearchAndUpdateInodeTableInfo(const char *workerInodeRelationName,
                                    int32_t *primaryNodeId,
                                    int32_t *newPrimaryNodeId,
                                    int32_t *backupNodeId,
+                                   const uint64_t *expectedInodeId,
                                    const InodeSearchStatContext *statContext);
+
+bool UpdateInodeLeaseCount(const char *workerInodeRelationName,
+                           const char *workerInodeRelationIndexName,
+                           const uint64_t parentId_partId,
+                           const char *fileName,
+                           int leaseCountChangeNum,
+                           uint64_t *leaseCount);
+bool UnlinkInodeIfNoActiveLease(const char *workerInodeRelationName,
+                                const char *workerInodeRelationIndexName,
+                                const uint64_t parentId_partId,
+                                const char *fileName,
+                                const uint64_t expectedInodeId,
+                                uint64_t *inodeId,
+                                int64_t *size,
+                                uint64_t *nlink,
+                                mode_t *mode,
+                                int32_t *primaryNodeId,
+                                uint64_t *leaseCount,
+                                bool *inodeMatched,
+                                const InodeSearchStatContext *statContext);
 
 uint16_t HashPartId(const char *fileName);
 uint64_t CombineParentIdWithPartId(uint64_t parent_id, uint16_t part_id);
