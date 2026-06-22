@@ -99,6 +99,9 @@ int ErrorCodeToErrno(int errorCode)
     case PATH_VERIFY_FAILED:
         ret = EINVAL;
         break;
+    case LEASE_CONFLICT:
+        ret = EBUSY;
+        break;
     default:
         ret = EIO;
         break;

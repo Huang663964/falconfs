@@ -39,6 +39,9 @@ static void CleanupResponseData(FalconMetaServiceResponse &response)
         case DFC_UNLINK:
             delete static_cast<UnlinkResponse *>(response.data);
             break;
+        case DFC_UNLINK_IF_INODE_MATCH:
+            delete static_cast<UnlinkResponse *>(response.data);
+            break;
         case DFC_READDIR:
             delete static_cast<ReadDirResponse *>(response.data);
             break;
@@ -81,6 +84,8 @@ static FalconMetaServiceType ConvertOperationToServiceType(FalconMetaOperationTy
             return FalconMetaServiceType::CLOSE;
         case DFC_UNLINK:
             return FalconMetaServiceType::UNLINK;
+        case DFC_UNLINK_IF_INODE_MATCH:
+            return FalconMetaServiceType::UNLINK_IF_INODE_MATCH;
         case DFC_READDIR:
             return FalconMetaServiceType::READDIR;
         case DFC_OPENDIR:
@@ -131,6 +136,8 @@ static bool IsAllowBatchOperation(FalconMetaOperationType op)
         case DFC_OPEN:
         case DFC_CLOSE:
         case DFC_UNLINK:
+            return true;
+        case DFC_UNLINK_IF_INODE_MATCH:
             return true;
         default:
             return false;

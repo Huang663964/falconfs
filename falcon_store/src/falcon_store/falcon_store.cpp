@@ -4,6 +4,12 @@
 
 #include "falcon_store/falcon_store.h"
 
+#include <cstring>
+#include <limits>
+#include <sstream>
+
+#include <sys/stat.h>
+
 #include "conf/falcon_property_key.h"
 #include "connection/node.h"
 #include "disk_cache/disk_cache.h"
@@ -12,6 +18,70 @@
 #include "stats/falcon_stats.h"
 #include "storage/obs_storage.h"
 #include "util/utils.h"
+
+namespace {
+
+bool RecoverCacheFileOnDisk(OpenInstance *openInstance, const std::string &fileName, const char *operation)
+{
+    struct stat st;
+    (void)memset(&st, 0, sizeof(st));
+    if (stat(fileName.c_str(), &st) != 0) {
+        return false;
+    }
+    if (openInstance->originalSize > 0 && static_cast<uint64_t>(st.st_size) < openInstance->originalSize) {
+        std::ostringstream oss;
+        oss << "OpenFile(): cache file on disk smaller than metadata for " << operation
+            << ", cache_path=" << fileName << ", path=" << openInstance->path
+            << ", inode=" << openInstance->inodeId << ", node=" << openInstance->nodeId
+            << ", file_size=" << st.st_size << ", original_size=" << openInstance->originalSize
+            << ", is_remote_call=" << openInstance->isRemoteCall;
+        FALCON_LOG(LOG_ERROR) << oss.str();
+        return false;
+    }
+    DiskCache::GetInstance().InsertAndUpdate(openInstance->inodeId,
+                                             static_cast<uint64_t>(st.st_size),
+                                             true,
+                                             openInstance->path);
+    std::ostringstream oss;
+    oss << "OpenFile(): recovered cache file on disk for " << operation
+        << ", cache_path=" << fileName << ", path=" << openInstance->path
+        << ", inode=" << openInstance->inodeId << ", node=" << openInstance->nodeId
+        << ", file_size=" << st.st_size << ", original_size=" << openInstance->originalSize
+        << ", is_remote_call=" << openInstance->isRemoteCall;
+    FALCON_LOG(LOG_WARNING) << oss.str();
+    return true;
+}
+
+void LogOpenFileCacheMiss(OpenInstance *openInstance, const std::string &fileName, const char *reason)
+{
+    std::ostringstream oss;
+    oss << "OpenFile(): " << reason << ", cache_path=" << fileName
+        << ", path=" << openInstance->path << ", inode=" << openInstance->inodeId
+        << ", node=" << openInstance->nodeId << ", original_size=" << openInstance->originalSize
+        << ", is_remote_call=" << openInstance->isRemoteCall;
+    FALCON_LOG(LOG_ERROR) << oss.str();
+}
+
+int OpenExistingLocalCacheFile(OpenInstance *openInstance, const std::string &fileName)
+{
+    int localFd = open(fileName.c_str(), openInstance->oflags, 0755);
+    if (localFd < 0) {
+        int err = errno;
+        DiskCache::GetInstance().Unpin(openInstance->inodeId);
+        FALCON_LOG(LOG_ERROR) << "OpenFile(): open local cache hit file failed, cache_path=" << fileName
+                              << ", path=" << openInstance->path << ", inode=" << openInstance->inodeId
+                              << ", node=" << openInstance->nodeId
+                              << ", is_remote_call=" << openInstance->isRemoteCall
+                              << ", oflags=" << openInstance->oflags << ", err=" << strerror(err);
+        return -err;
+    }
+    openInstance->physicalFd = static_cast<uint64_t>(localFd);
+    FALCON_LOG(LOG_INFO) << "OpenFile(): Opened existed local file " << fileName
+                         << " , fd = " << openInstance->physicalFd;
+    return 0;
+}
+
+} // namespace
 
 void FalconStore::SetFalconStoreParam(std::string &newNodeConfig) { nodeConfig = newNodeConfig; }
 
@@ -49,7 +119,8 @@ int FalconStore::InitStore()
     persistToStorage = config->GetBool(FalconPropertyKey::FALCON_PERSIST);
     uint32_t preBlockNum = config->GetUint32(FalconPropertyKey::FALCON_PRE_BLOCKNUM);
     uint32_t threadNum = config->GetUint32(FalconPropertyKey::FALCON_THREAD_NUM);
-    float storageThreshold = GetStorageThreshold(persistToStorage);
+    float storageUsedWatermark = GetStorageUsedWatermark();
+    uint64_t maxLocalDiskSizeGiB = config->GetUint64(FalconPropertyKey::FALCON_MAX_LOCAL_DISK_SIZE);
     parentPathLevel = GetParentPathLevel();
     isInference = config->GetBool(FalconPropertyKey::FALCON_IS_INFERENCE);
     toLocal = config->GetBool(FalconPropertyKey::FALCON_TO_LOCAL);
@@ -77,13 +148,20 @@ int FalconStore::InitStore()
     READ_BIGFILE_SIZE = bigFileReadSize;
     SetRootPath(rootPath);
     SetTotalDirectory(totalDirectory);
-    float diskFreeRatio = 0;
-    float bgDiskFreeRatio = 0;
-    if (storageThreshold < 1) {
-        diskFreeRatio = 1.0 - storageThreshold;
-        bgDiskFreeRatio = 1.1 - storageThreshold;
+    // STORAGE_THRESHOLD is configured as a used-space watermark. DiskCache
+    // uses free-space watermarks, so convert it at the module boundary.
+    float diskFreeWatermark = storageUsedWatermark < 1.0F ? 1.0F - storageUsedWatermark : 0.0F;
+    constexpr uint64_t bytesPerGiB = 1024ULL * 1024ULL * 1024ULL;
+    uint64_t maxLocalDiskSizeBytes = 0;
+    if (maxLocalDiskSizeGiB > 0) {
+        if (maxLocalDiskSizeGiB > std::numeric_limits<uint64_t>::max() / bytesPerGiB) {
+            maxLocalDiskSizeBytes = std::numeric_limits<uint64_t>::max();
+        } else {
+            maxLocalDiskSizeBytes = maxLocalDiskSizeGiB * bytesPerGiB;
+        }
     }
-    ret = DiskCache::GetInstance().Start(rootPath, totalDirectory, diskFreeRatio, bgDiskFreeRatio);
+    FALCON_LOG(LOG_INFO) << "falcon max local disk size: " << maxLocalDiskSizeGiB << " GiB";
+    ret = DiskCache::GetInstance().Start(rootPath, totalDirectory, diskFreeWatermark, maxLocalDiskSizeBytes);
     if (ret != 0) {
         FALCON_LOG(LOG_ERROR) << "DiskCache start failed";
         return 1;
@@ -190,6 +268,22 @@ void FalconStore::AllocNodeId(OpenInstance *openInstance)
         }
     }
 }
+int FalconStore::EnsureCacheSharedLock(OpenInstance *openInstance)
+{
+    if (openInstance->HasCacheLock()) {
+        return 0;
+    }
+
+    int lockFd = DiskCache::GetInstance().AcquireProcessLock(openInstance->inodeId, false, false);
+    if (lockFd < 0) {
+        FALCON_LOG(LOG_ERROR) << "EnsureCacheSharedLock(): lock cache file failed, path=" << openInstance->path
+                              << ", inode=" << openInstance->inodeId << ", err=" << strerror(-lockFd);
+        return lockFd;
+    }
+    openInstance->SetCacheLockFd(lockFd);
+    return 0;
+}
+
 bool FalconStore::ConnectionError(int err) { return err > 0; }
 
 bool FalconStore::IoError(int err) { return err < 0; }
@@ -550,7 +644,10 @@ int FalconStore::OpenFile(OpenInstance *openInstance)
             bool largeFile = true;
             ret = OpenFileFromRemote(openInstance, largeFile);
             if (ret != 0) {
-                FALCON_LOG(LOG_ERROR) << "OpenFile(): open remote file failed";
+                FALCON_LOG(LOG_ERROR) << "OpenFile(): open remote file failed, path=" << openInstance->path
+                                      << ", inode=" << openInstance->inodeId << ", node=" << openInstance->nodeId
+                                      << ", oflags=" << openInstance->oflags << ", original_size=" << openInstance->originalSize
+                                      << ", node_fail=" << openInstance->nodeFail;
                 return ret;
             }
         } else {
@@ -559,68 +656,99 @@ int FalconStore::OpenFile(OpenInstance *openInstance)
             if (openInstance->nodeFail) {
                 DiskCache::GetInstance().DeleteOldCacheWithNoPin(openInstance->inodeId);
             }
-            if (DiskCache::GetInstance().Find(openInstance->inodeId, true)) {
+            ret = EnsureCacheSharedLock(openInstance);
+            if (ret != 0) {
+                return ret;
+            }
+            bool localFileOpened = false;
+            DiskCacheFindResult cacheLookup = DiskCache::GetInstance().FindWithWait(openInstance->inodeId, true);
+            if (cacheLookup == DiskCacheFindResult::HIT) {
                 /* Cache Hits: read file from cache */
-                int localFd = open(fileName.c_str(), openInstance->oflags, 0755);
-                if (localFd < 0) {
-                    err = errno;
-                    DiskCache::GetInstance().Unpin(openInstance->inodeId);
-                    FALCON_LOG(LOG_ERROR) << "OpenFile(): open local file " << fileName << " failed: " << strerror(err);
-                    return -err;
+                ret = OpenExistingLocalCacheFile(openInstance, fileName);
+                if (ret != 0) {
+                    return ret;
                 }
-                openInstance->physicalFd = static_cast<uint64_t>(localFd);
-                FALCON_LOG(LOG_INFO) << "OpenFile(): Opened existed local file " << fileName
-                                     << " , fd = " << openInstance->physicalFd;
+                localFileOpened = true;
+            } else if (cacheLookup == DiskCacheFindResult::EVICTING) {
+                std::ostringstream oss;
+                oss << "OpenFile(): cache file is still evicting after wait, cache_path=" << fileName
+                    << ", path=" << openInstance->path << ", inode=" << openInstance->inodeId
+                    << ", node=" << openInstance->nodeId << ", original_size=" << openInstance->originalSize
+                    << ", is_remote_call=" << openInstance->isRemoteCall;
+                FALCON_LOG(LOG_ERROR) << oss.str();
+                return -EAGAIN;
             } else {
                 /* Cache Miss: either newly created file or cache file evicted */
                 if ((openInstance->oflags & O_ACCMODE) != O_RDONLY) {
                     /* Cache Miss: WR/RDWR case, sync load file from obs */
                     if ((openInstance->oflags & O_CREAT) == 0 && openInstance->originalSize > 0) {
                         if (!persistToStorage) {
-                            if (access(fileName.c_str(), F_OK) == 0) {
-                                FALCON_LOG(LOG_ERROR) << "OpenFile(): cache file " << fileName
-                                                      << " missing in diskCache but exists in ext for write";
+                            if (RecoverCacheFileOnDisk(openInstance, fileName, "write")) {
+                                ret = OpenExistingLocalCacheFile(openInstance, fileName);
+                                if (ret != 0) {
+                                    return ret;
+                                }
+                                localFileOpened = true;
                             } else {
-                                FALCON_LOG(LOG_ERROR) << "OpenFile(): cache file " << fileName << " missing in write";
+                                if (access(fileName.c_str(), F_OK) == 0) {
+                                    LogOpenFileCacheMiss(openInstance,
+                                                         fileName,
+                                                         "cache file missing in DiskCache but exists on disk for write");
+                                } else {
+                                    LogOpenFileCacheMiss(openInstance, fileName, "cache file missing in write");
+                                }
+                                return -ENOENT;
                             }
-                            return -ENOENT;
+                        } else {
+                            FALCON_LOG(LOG_INFO) << "OpenFile(): Loading evicted write only cache file";
+                            ret = DownLoadFromStorage(openInstance, true);
+                            if (ret != 0) {
+                                return ret;
+                            }
+                            /* file is pinned in disk cache now */
                         }
-                        FALCON_LOG(LOG_INFO) << "OpenFile(): Loading evicted write only cache file";
-                        ret = DownLoadFromStorage(openInstance, true);
-                        if (ret != 0) {
-                            return ret;
+                    }
+                    if (!localFileOpened) {
+                        int localFd = open(fileName.c_str(), openInstance->oflags | O_CREAT, 0755);
+                        if (localFd < 0) {
+                            err = errno;
+                            FALCON_LOG(LOG_ERROR)
+                                << "OpenFile(): create local cache file " << fileName << " failed: " << strerror(err);
+                            return -err;
                         }
-                        /* file is pinned in disk cache now */
+                        openInstance->physicalFd = static_cast<uint64_t>(localFd);
+                        /* here insert the new file to disk cache and pin, visible to other user */
+                        if (openInstance->originalSize == 0 || (openInstance->oflags & O_CREAT) != 0) {
+                            DiskCache::GetInstance().InsertAndUpdate(openInstance->inodeId, 0, true, openInstance->path);
+                        }
+                        FALCON_LOG(LOG_INFO) << "OpenFile(): create local cache file " << fileName
+                                             << " , fd = " << openInstance->physicalFd;
                     }
-                    int localFd = open(fileName.c_str(), openInstance->oflags | O_CREAT, 0755);
-                    if (localFd < 0) {
-                        err = errno;
-                        FALCON_LOG(LOG_ERROR)
-                            << "OpenFile(): create local cache file " << fileName << " failed: " << strerror(err);
-                        return -err;
-                    }
-                    openInstance->physicalFd = static_cast<uint64_t>(localFd);
-                    /* here insert the new file to disk cache and pin, visible to other user */
-                    if (openInstance->originalSize == 0 || (openInstance->oflags & O_CREAT) != 0) {
-                        DiskCache::GetInstance().InsertAndUpdate(openInstance->inodeId, 0, true);
-                    }
-                    FALCON_LOG(LOG_INFO) << "OpenFile(): create local cache file " << fileName
-                                         << " , fd = " << openInstance->physicalFd;
                 } else {
                     /* Cache Miss: RD case, background load file from obs */
                     if (!persistToStorage) {
-                        if (access(fileName.c_str(), F_OK) == 0) {
-                            FALCON_LOG(LOG_ERROR) << "OpenFile(): cache file " << fileName
-                                                  << " missing in diskCache but exists in ext for read";
+                        if (RecoverCacheFileOnDisk(openInstance, fileName, "read")) {
+                            ret = OpenExistingLocalCacheFile(openInstance, fileName);
+                            if (ret != 0) {
+                                return ret;
+                            }
+                            localFileOpened = true;
                         } else {
-                            FALCON_LOG(LOG_ERROR) << "OpenFile(): cache file " << fileName << " missing in read";
+                            if (access(fileName.c_str(), F_OK) == 0) {
+                                LogOpenFileCacheMiss(openInstance,
+                                                     fileName,
+                                                     "cache file missing in DiskCache but exists on disk for read");
+                            } else {
+                                LogOpenFileCacheMiss(openInstance, fileName, "cache file missing in read");
+                            }
+                            return -ENOENT;
                         }
-                        return -ENOENT;
-                    }
-                    /* only trigger the download, do not wait for it */
-                    ret = DownLoadFromStorage(openInstance, false);
-                    if (ret != 0) {
-                        return ret;
+                    } else {
+                        /* only trigger the download, do not wait for it */
+                        ret = DownLoadFromStorage(openInstance, false);
+                        if (ret != 0) {
+                            return ret;
+                        }
                     }
                 }
             }
@@ -693,7 +821,7 @@ int FalconStore::DownLoadFromStorage(OpenInstance *openInstance, bool isSync, bo
             }
             size = -EIO;
         } else {
-            DiskCache::GetInstance().InsertAndUpdate(inodeId, fileSize, isSync);
+            DiskCache::GetInstance().InsertAndUpdate(inodeId, fileSize, isSync, path);
         }
         DiskCache::GetInstance().FreePreAllocSpace(fileSize);
         return size < 0 ? size : 0;
@@ -771,8 +899,11 @@ int FalconStore::OpenFileFromRemote(OpenInstance *openInstance, bool largeFile)
         if (ConnectionError(ret)) {
             FALCON_LOG(LOG_ERROR) << "OpenFileFromRemote(): connection failed for all nodes";
         } else if (IoError(ret)) {
-            FALCON_LOG(LOG_ERROR) << "OpenFileFromRemote(): open remote file " << openInstance->path
-                                  << " failed: " << strerror(-ret) << ", for node " << openInstance->nodeId;
+            FALCON_LOG(LOG_ERROR) << "OpenFileFromRemote(): open remote file failed, path=" << openInstance->path
+                                  << ", inode=" << openInstance->inodeId << ", node=" << openInstance->nodeId
+                                  << ", oflags=" << openInstance->oflags << ", original_size=" << openInstance->originalSize
+                                  << ", node_fail=" << openInstance->nodeFail << ", is_remote_call=" << openInstance->isRemoteCall
+                                  << ", err=" << strerror(-ret);
         } else {
             openInstance->writeStream.SetClient(falconIOClient);
         }
@@ -861,7 +992,7 @@ int FalconStore::CloseTmpFiles(OpenInstance *openInstance, bool isFlush, bool is
         }
         /* flush file */
         /* update diskcache file size, do not pin */
-        DiskCache::GetInstance().InsertAndUpdate(openInstance->inodeId, openInstance->currentSize, false);
+        DiskCache::GetInstance().InsertAndUpdate(openInstance->inodeId, openInstance->currentSize, false, openInstance->path);
         if (openInstance->writeCnt > 0 && !openInstance->writeFail) {
             if (isSync) {
                 fsync(openInstance->physicalFd);
@@ -922,6 +1053,10 @@ int FalconStore::ReadSmallFiles(OpenInstance *openInstance)
 
     if (openInstance->nodeFail) {
         DiskCache::GetInstance().DeleteOldCacheWithNoPin(inodeId);
+    }
+    ret = EnsureCacheSharedLock(openInstance);
+    if (ret != 0) {
+        return ret;
     }
     /* Check if in disk cache. True then pin the file */
     if (DiskCache::GetInstance().Find(inodeId, true)) {
@@ -989,7 +1124,7 @@ int FalconStore::ReadSmallFiles(OpenInstance *openInstance)
         }
         /* Async write to local cache file */
         /* Read buffer is read only after initialization above */
-        return WriteToFileAsync(inodeId, fileName, openInstance->readBuffer, bufSize);
+        return WriteToFileAsync(inodeId, path, fileName, openInstance->readBuffer, bufSize);
     }
     return 0;
 }
@@ -998,7 +1133,7 @@ int FalconStore::ReadSmallFiles(OpenInstance *openInstance)
  * Called by OpenFile and ReadSmallFile. Large file try open and return, small file read obs if failed
  * Use a shared_ptr from read buffer to store the file content
  */
-int FalconStore::WriteToFileAsync(uint64_t inodeId, std::string &fileName, std::shared_ptr<char> buf, size_t bufSize)
+int FalconStore::WriteToFileAsync(uint64_t inodeId, const std::string &path, std::string &fileName, std::shared_ptr<char> buf, size_t bufSize)
 {
     auto lockerPtr = std::make_shared<FileLocker>(&fileLock, inodeId, LockMode::X, false);
     if (lockerPtr == nullptr) {
@@ -1029,7 +1164,7 @@ int FalconStore::WriteToFileAsync(uint64_t inodeId, std::string &fileName, std::
 
     /* Async write the file to local file */
     ThreadTask task;
-    task.task = [fd, buf, bufSize, inodeId, lockerPtr]() {
+    task.task = [fd, buf, bufSize, inodeId, path, lockerPtr]() {
         FalconStats::GetInstance().stats[BLOCKCACHE_WRITE] += bufSize;
         int retSize = pwrite(fd, buf.get(), bufSize, 0);
         int err = errno;
@@ -1037,7 +1172,7 @@ int FalconStore::WriteToFileAsync(uint64_t inodeId, std::string &fileName, std::
         if (retSize < 0) {
             FALCON_LOG(LOG_ERROR) << "WriteToFileAsync(): pwrite failed : " << strerror(err);
         } else {
-            DiskCache::GetInstance().InsertAndUpdate(inodeId, bufSize, false);
+            DiskCache::GetInstance().InsertAndUpdate(inodeId, bufSize, false, path);
         }
         DiskCache::GetInstance().FreePreAllocSpace(bufSize);
     };
@@ -1184,7 +1319,7 @@ int FalconStore::DownLoadFromStorageForBrpc(uint64_t inodeId,
             }
             size = -EIO;
         } else {
-            DiskCache::GetInstance().InsertAndUpdate(inodeId, bufSize, isSync);
+            DiskCache::GetInstance().InsertAndUpdate(inodeId, bufSize, isSync, path);
         }
         DiskCache::GetInstance().FreePreAllocSpace(bufSize);
         return size < 0 ? size : 0;

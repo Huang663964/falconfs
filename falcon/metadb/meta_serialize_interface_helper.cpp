@@ -59,6 +59,17 @@ bool SerializedDataMetaParamDecode(FalconSupportMetaService metaService,
             info->path = metaParam->param_as_PathOnlyParam()->path()->c_str();
             break;
         }
+        case FalconMetaServiceType::UNLINK_IF_INODE_MATCH: {
+            if (metaParam->param_type() != falcon::meta_fbs::AnyMetaParam::AnyMetaParam_UnlinkIfInodeMatchParam) {
+                printf("[debug] serialized param is corrupt: %s:%d\n", __FILE__, __LINE__);
+                return false;
+            }
+            auto unlinkIfInodeMatchParam = metaParam->param_as_UnlinkIfInodeMatchParam();
+            info->path = unlinkIfInodeMatchParam->path()->c_str();
+            info->hasExpectedInodeId = true;
+            info->expectedInodeId = unlinkIfInodeMatchParam->expected_inode();
+            break;
+        }
         case FalconMetaServiceType::MKDIR_SUB_MKDIR: {
             if (metaParam->param_type() != falcon::meta_fbs::AnyMetaParam::AnyMetaParam_MkdirSubMkdirParam) {
                 printf("[debug] serialized param is corrupt: %s:%d\n", __FILE__, __LINE__);
@@ -493,6 +504,7 @@ static bool SerializedDataMetaResponseEncode(FalconMetaServiceType metaService,
                                                                     openResponse.Union());
                 break;
             }
+            case FalconMetaServiceType::UNLINK_IF_INODE_MATCH:
             case FalconMetaServiceType::UNLINK: {
                 auto unlinkResponse =
                     falcon::meta_fbs::CreateUnlinkResponse(builder, info->inodeId, info->st_size, info->node_id);

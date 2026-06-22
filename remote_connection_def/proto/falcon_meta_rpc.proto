@@ -32,6 +32,7 @@ enum MetaServiceType {
     SLICE_GET = 24;
     SLICE_DEL = 25;
     FETCH_SLICE_ID = 26;
+    UNLINK_IF_INODE_MATCH = 27;
 }
 
 message MetaRequest {

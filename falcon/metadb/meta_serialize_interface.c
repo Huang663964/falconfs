@@ -26,7 +26,7 @@ static SerializedData FileMetaProcess(FalconSupportMetaService metaService, int 
 
     if (count != 1 && !(metaService == MKDIR || metaService == MKDIR_SUB_MKDIR || metaService == MKDIR_SUB_CREATE ||
                         metaService == CREATE || metaService == STAT || metaService == OPEN || metaService == CLOSE ||
-                        metaService == UNLINK))
+                        metaService == UNLINK || metaService == UNLINK_IF_INODE_MATCH))
         FALCON_ELOG_ERROR_EXTENDED(ARGUMENT_ERROR, "metaService %d doesn't support batch operation.", metaService);
 
     SerializedData param;
@@ -34,7 +34,7 @@ static SerializedData FileMetaProcess(FalconSupportMetaService metaService, int 
     if (!SerializedDataInit(&param, paramBuffer, SD_SIZE_T_MAX, SD_SIZE_T_MAX, NULL))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "SerializedDataInit failed.");
 
-    void *data = palloc((sizeof(MetaProcessInfoData) + sizeof(MetaProcessInfoData *)) * count);
+    void *data = palloc0((sizeof(MetaProcessInfoData) + sizeof(MetaProcessInfoData *)) * count);
     MetaProcessInfoData *infoDataArray = data;
     MetaProcessInfo *infoArray = (MetaProcessInfo *)(infoDataArray + count);
     if (!SerializedDataMetaParamDecode(metaService, count, &param, infoDataArray))
@@ -71,6 +71,9 @@ static SerializedData FileMetaProcess(FalconSupportMetaService metaService, int 
         FalconCloseHandle(infoArray, count);
         break;
     case UNLINK:
+        FalconUnlinkHandle(infoArray, count);
+        break;
+    case UNLINK_IF_INODE_MATCH:
         FalconUnlinkHandle(infoArray, count);
         break;
     case READDIR:
@@ -251,7 +254,7 @@ static SerializedData SliceIdProcess(char *paramBuffer)
 
 static SerializedData MetaProcess(FalconSupportMetaService metaService, int count, char *paramBuffer)
 {
-    if (metaService >= PLAIN_COMMAND && metaService <= CHMOD) {
+    if ((metaService >= PLAIN_COMMAND && metaService <= CHMOD) || metaService == UNLINK_IF_INODE_MATCH) {
         return FileMetaProcess(metaService, count, paramBuffer);
     }
 

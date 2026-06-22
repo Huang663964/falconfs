@@ -32,6 +32,7 @@ typedef enum FalconMetaServiceType {
     SLICE_GET,
     SLICE_DEL,
     FETCH_SLICE_ID,
+    UNLINK_IF_INODE_MATCH,
     NOT_SUPPORTED
 } FalconMetaServiceType;
 #endif // FALCON_META_SERVICE_DEF_H

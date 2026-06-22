@@ -66,7 +66,7 @@ class FalconStore {
     int ReadToBuffer(FalconReadBuffer buf, OpenInstance *openInstance, off_t offset);
     int RandomRead(FalconReadBuffer buf, OpenInstance *openInstance, off_t offset);
     int SequenceRead(FalconReadBuffer buf, OpenInstance *openInstance, off_t offset);
-    int WriteToFileAsync(uint64_t inodeId, std::string &fileName, std::shared_ptr<char> buf, size_t bufSize);
+    int WriteToFileAsync(uint64_t inodeId, const std::string &path, std::string &fileName, std::shared_ptr<char> buf, size_t bufSize);
 
     /*-----------------func-----------------*/
     int OpenFileFromRemote(OpenInstance *openInstance, bool largeFile);
@@ -74,6 +74,7 @@ class FalconStore {
     /*-----------------util-----------------*/
     int PathToNodeId(std::string &path);
     void AllocNodeId(OpenInstance *openInstance);
+    int EnsureCacheSharedLock(OpenInstance *openInstance);
     bool ConnectionError(int err);
     bool IoError(int err);
 

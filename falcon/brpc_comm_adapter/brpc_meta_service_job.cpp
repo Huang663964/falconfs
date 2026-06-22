@@ -60,6 +60,8 @@ FalconMetaServiceType BrpcMetaServiceJob::MetaServiceTypeDecode(falcon::meta_pro
         return FalconMetaServiceType::SLICE_DEL;
     case falcon::meta_proto::MetaServiceType::FETCH_SLICE_ID:
         return FalconMetaServiceType::FETCH_SLICE_ID;
+    case falcon::meta_proto::MetaServiceType::UNLINK_IF_INODE_MATCH:
+        return FalconMetaServiceType::UNLINK_IF_INODE_MATCH;
     default:
         return FalconMetaServiceType::NOT_SUPPORTED;
     }

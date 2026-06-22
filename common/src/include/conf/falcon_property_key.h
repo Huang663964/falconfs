@@ -58,6 +58,9 @@ class FalconPropertyKey : public PropertyKey {
     inline static const auto FALCON_EVICTION =
         PropertyKey::Builder("main", "falcon_eviction", FALCON, FALCON_DOUBLE).build();
 
+    inline static const auto FALCON_MAX_LOCAL_DISK_SIZE =
+        PropertyKey::Builder("main", "max_local_disk_size", FALCON, FALCON_UINT64).build();
+
     inline static const auto FALCON_IS_INFERENCE =
         PropertyKey::Builder("main", "falcon_is_inference", FALCON, FALCON_BOOL).build();
 

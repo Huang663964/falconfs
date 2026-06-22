@@ -210,6 +210,12 @@ const char *g_checkpointNames[NOT_SUPPORTED][STAT_MAX_CHECKPOINTS] = {
     {COMMON_PREFIX,
      "handlerEntry", "scanReady", "done",
      COMMON_TAIL, NULL},
+
+    /* UNLINK_IF_INODE_MATCH (27) */
+    {COMMON_PREFIX,
+     "handlerEntry", "pathVerify", "batchGroup", "pathParse",
+     "groupReady", "requestStart", "unlinkModify", "handlerDone",
+     COMMON_TAIL, NULL},
 };
 
 /*
@@ -393,6 +399,7 @@ void PerRequestStatAggregateAndOutput(void)
             case SLICE_GET:                opName = "SLICE_GET"; break;
             case SLICE_DEL:                opName = "SLICE_DEL"; break;
             case FETCH_SLICE_ID:           opName = "FETCH_SLICE_ID"; break;
+            case UNLINK_IF_INODE_MATCH:   opName = "UNLINK_IF_INODE_MATCH"; break;
             default:                       break;
         }
 

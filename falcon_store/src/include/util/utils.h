@@ -42,5 +42,5 @@ int GenerateRandom(int minValue, int maxValue);
 std::optional<std::string> GetUserName();
 std::optional<std::string_view> SplitIp(std::string_view ipPort);
 std::string GetPodIPPort();
-float GetStorageThreshold(bool persistToStorage);
+float GetStorageUsedWatermark();
 int GetParentPathLevel();

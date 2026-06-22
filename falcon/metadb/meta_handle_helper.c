@@ -64,6 +64,7 @@ bool SearchAndUpdateInodeTableInfo(const char *workerInodeRelationName,
                                    int32_t *primaryNodeId,
                                    int32_t *newPrimaryNodeId,
                                    int32_t *backupNodeId,
+                                   const uint64_t *expectedInodeId,
                                    const InodeSearchStatContext *statContext)
 {
     ScanKeyData scanKey[2];
@@ -118,6 +119,21 @@ bool SearchAndUpdateInodeTableInfo(const char *workerInodeRelationName,
     }
     if (size) {
         *size = DatumGetInt64(heap_getattr(heapTuple, Anum_pg_dfs_file_st_size, tupleDesc, &isNull));
+    }
+    if (expectedInodeId != NULL) {
+        uint64_t currentInodeId = inodeId != NULL
+                                      ? *inodeId
+                                      : DatumGetUInt64(heap_getattr(heapTuple, Anum_pg_dfs_file_st_ino, tupleDesc, &isNull));
+        if (currentInodeId != *expectedInodeId) {
+            if (statContext) {
+                STAT_CKPT(statContext->statArrayIndex, statContext->opDoneCheckpoint);
+            }
+            systable_endscan(scanDescriptor);
+            if (!workerInodeRelation) {
+                table_close(workerInodeRel, doUpdate ? RowExclusiveLock : AccessShareLock);
+            }
+            return true;
+        }
     }
     if (doUpdate && newSize) {
         updateDatumArray[Anum_pg_dfs_file_st_size - 1] = UInt64GetDatum(*newSize);
@@ -229,6 +245,272 @@ bool SearchAndUpdateInodeTableInfo(const char *workerInodeRelationName,
     if (!workerInodeRelation) {
         table_close(workerInodeRel, doUpdate ? RowExclusiveLock : AccessShareLock);
     }
+    return true;
+}
+
+bool UpdateInodeLeaseCount(const char *workerInodeRelationName,
+                           const char *workerInodeRelationIndexName,
+                           const uint64_t parentId_partId,
+                           const char *fileName,
+                           int leaseCountChangeNum,
+                           uint64_t *leaseCount)
+{
+    ScanKeyData scanKey[2];
+    SysScanDesc scanDescriptor = NULL;
+    HeapTuple heapTuple;
+    TupleDesc tupleDesc;
+
+    SetUpScanCaches();
+    scanKey[0] = InodeTableScanKey[INODE_TABLE_PARENT_ID_PART_ID_EQ];
+    scanKey[0].sk_argument = UInt64GetDatum(parentId_partId);
+    scanKey[1] = InodeTableScanKey[INODE_TABLE_NAME_EQ];
+    scanKey[1].sk_argument = CStringGetTextDatum(fileName);
+
+    TimestampTz now = GetCurrentTimestamp();
+    Relation workerInodeRel = table_open(GetRelationOidByName_FALCON(workerInodeRelationName), RowExclusiveLock);
+    Oid workerInodeIndexOid = GetRelationOidByName_FALCON(workerInodeRelationIndexName);
+    scanDescriptor = systable_beginscan(workerInodeRel,
+                                        workerInodeIndexOid,
+                                        true,
+                                        GetTransactionSnapshot(),
+                                        2,
+                                        scanKey);
+    heapTuple = systable_getnext(scanDescriptor);
+    tupleDesc = RelationGetDescr(workerInodeRel);
+
+    if (!HeapTupleIsValid(heapTuple)) {
+        systable_endscan(scanDescriptor);
+        table_close(workerInodeRel, RowExclusiveLock);
+        return false;
+    }
+
+    if (tupleDesc->natts < Anum_pg_dfs_file_lease_expire_at) {
+        FALCON_RAW_WARNING_EXTENDED(PROGRAM_ERROR,
+                                   "inode lease columns missing, relation=%s, natts=%d, expected_natts=%d, parent_part=%lu, name=%s",
+                                    workerInodeRelationName,
+                                    tupleDesc->natts,
+                                    Anum_pg_dfs_file_lease_expire_at,
+                                    parentId_partId,
+                                    fileName);
+        if (leaseCount != NULL) {
+            *leaseCount = UINT64_MAX;
+        }
+        systable_endscan(scanDescriptor);
+        table_close(workerInodeRel, RowExclusiveLock);
+        return true;
+    }
+
+    bool isNull = false;
+    uint64_t currentLeaseCount = DatumGetUInt64(heap_getattr(heapTuple,
+                                                            Anum_pg_dfs_file_lease_count,
+                                                            tupleDesc,
+                                                            &isNull));
+    if (isNull) {
+        currentLeaseCount = 0;
+    }
+
+    isNull = false;
+    TimestampTz currentLeaseExpireAt = DatumGetTimestampTz(heap_getattr(heapTuple,
+                                                                        Anum_pg_dfs_file_lease_expire_at,
+                                                                        tupleDesc,
+                                                                        &isNull));
+    if (isNull) {
+        currentLeaseExpireAt = FALCON_INODE_LEASE_EXPIRED_AT;
+    }
+
+    bool expiredLease = currentLeaseCount > 0 && currentLeaseExpireAt <= now;
+    if (expiredLease) {
+        currentLeaseCount = 0;
+        currentLeaseExpireAt = FALCON_INODE_LEASE_EXPIRED_AT;
+    }
+    if (leaseCount != NULL) {
+        *leaseCount = currentLeaseCount;
+    }
+
+    if (leaseCountChangeNum != 0 || expiredLease) {
+        uint64_t newLeaseCount = currentLeaseCount;
+        TimestampTz newLeaseExpireAt = currentLeaseExpireAt;
+        if (leaseCountChangeNum > 0) {
+            newLeaseCount += (uint64_t)leaseCountChangeNum;
+            newLeaseExpireAt = now + FALCON_INODE_LEASE_TTL_US;
+        } else if (leaseCountChangeNum < 0) {
+            uint64_t releaseCount = (uint64_t)(-leaseCountChangeNum);
+            newLeaseCount = currentLeaseCount > releaseCount ? currentLeaseCount - releaseCount : 0;
+            newLeaseExpireAt = newLeaseCount > 0 ? now + FALCON_INODE_LEASE_TTL_US : FALCON_INODE_LEASE_EXPIRED_AT;
+        } else {
+            newLeaseCount = 0;
+            newLeaseExpireAt = FALCON_INODE_LEASE_EXPIRED_AT;
+        }
+
+        Datum updateDatumArray[Natts_pg_dfs_inode_table];
+        bool isNullArray[Natts_pg_dfs_inode_table];
+        bool doUpdateArray[Natts_pg_dfs_inode_table];
+        memset(updateDatumArray, 0, sizeof(updateDatumArray));
+        memset(isNullArray, false, sizeof(isNullArray));
+        memset(doUpdateArray, false, sizeof(doUpdateArray));
+        updateDatumArray[Anum_pg_dfs_file_lease_count - 1] = UInt64GetDatum(newLeaseCount);
+        isNullArray[Anum_pg_dfs_file_lease_count - 1] = false;
+        doUpdateArray[Anum_pg_dfs_file_lease_count - 1] = true;
+        updateDatumArray[Anum_pg_dfs_file_lease_expire_at - 1] = TimestampTzGetDatum(newLeaseExpireAt);
+        isNullArray[Anum_pg_dfs_file_lease_expire_at - 1] = false;
+        doUpdateArray[Anum_pg_dfs_file_lease_expire_at - 1] = true;
+
+        HeapTuple updatedTuple = heap_modify_tuple(heapTuple, tupleDesc, updateDatumArray, isNullArray, doUpdateArray);
+        CatalogTupleUpdate(workerInodeRel, &updatedTuple->t_self, updatedTuple);
+        CommandCounterIncrement();
+        if (leaseCount != NULL) {
+            *leaseCount = newLeaseCount;
+        }
+    }
+
+    systable_endscan(scanDescriptor);
+    table_close(workerInodeRel, RowExclusiveLock);
+    return true;
+}
+
+bool UnlinkInodeIfNoActiveLease(const char *workerInodeRelationName,
+                                const char *workerInodeRelationIndexName,
+                                const uint64_t parentId_partId,
+                                const char *fileName,
+                                const uint64_t expectedInodeId,
+                                uint64_t *inodeId,
+                                int64_t *size,
+                                uint64_t *nlink,
+                                mode_t *mode,
+                                int32_t *primaryNodeId,
+                                uint64_t *leaseCount,
+                                bool *inodeMatched,
+                                const InodeSearchStatContext *statContext)
+{
+    ScanKeyData scanKey[2];
+    SysScanDesc scanDescriptor = NULL;
+    HeapTuple heapTuple;
+
+    SetUpScanCaches();
+    scanKey[0] = InodeTableScanKey[INODE_TABLE_PARENT_ID_PART_ID_EQ];
+    scanKey[0].sk_argument = UInt64GetDatum(parentId_partId);
+    scanKey[1] = InodeTableScanKey[INODE_TABLE_NAME_EQ];
+    scanKey[1].sk_argument = CStringGetTextDatum(fileName);
+
+    if (inodeMatched != NULL) {
+        *inodeMatched = false;
+    }
+    if (leaseCount != NULL) {
+        *leaseCount = 0;
+    }
+
+    Relation workerInodeRel = table_open(GetRelationOidByName_FALCON(workerInodeRelationName), RowExclusiveLock);
+    Oid workerInodeIndexOid = GetRelationOidByName_FALCON(workerInodeRelationIndexName);
+    if (statContext) {
+        STAT_CKPT(statContext->statArrayIndex, statContext->requestStartCheckpoint);
+    }
+    scanDescriptor = systable_beginscan(workerInodeRel,
+                                        workerInodeIndexOid,
+                                        true,
+                                        GetTransactionSnapshot(),
+                                        2,
+                                        scanKey);
+    heapTuple = systable_getnext(scanDescriptor);
+    TupleDesc tupleDesc = RelationGetDescr(workerInodeRel);
+
+    if (!HeapTupleIsValid(heapTuple)) {
+        if (statContext) {
+            STAT_CKPT(statContext->statArrayIndex, statContext->opDoneCheckpoint);
+        }
+        systable_endscan(scanDescriptor);
+        table_close(workerInodeRel, RowExclusiveLock);
+        return false;
+    }
+
+    bool isNull = false;
+    uint64_t currentInodeId = DatumGetUInt64(heap_getattr(heapTuple, Anum_pg_dfs_file_st_ino, tupleDesc, &isNull));
+    if (inodeId != NULL) {
+        *inodeId = currentInodeId;
+    }
+    if (currentInodeId != expectedInodeId) {
+        if (statContext) {
+            STAT_CKPT(statContext->statArrayIndex, statContext->opDoneCheckpoint);
+        }
+        systable_endscan(scanDescriptor);
+        table_close(workerInodeRel, RowExclusiveLock);
+        return true;
+    }
+    if (inodeMatched != NULL) {
+        *inodeMatched = true;
+    }
+
+    if (size != NULL) {
+        *size = DatumGetInt64(heap_getattr(heapTuple, Anum_pg_dfs_file_st_size, tupleDesc, &isNull));
+    }
+    uint64_t currentNlink = DatumGetUInt64(heap_getattr(heapTuple, Anum_pg_dfs_file_st_nlink, tupleDesc, &isNull));
+    if (nlink != NULL) {
+        *nlink = currentNlink;
+    }
+    mode_t currentMode = DatumGetUInt32(heap_getattr(heapTuple, Anum_pg_dfs_file_st_mode, tupleDesc, &isNull));
+    if (mode != NULL) {
+        *mode = currentMode;
+    }
+    if (primaryNodeId != NULL) {
+        *primaryNodeId = DatumGetUInt32(heap_getattr(heapTuple, Anum_pg_dfs_file_primary_nodeid, tupleDesc, &isNull));
+    }
+
+    if (tupleDesc->natts < Anum_pg_dfs_file_lease_expire_at) {
+        FALCON_RAW_WARNING_EXTENDED(PROGRAM_ERROR,
+                                   "inode lease columns missing during evict unlink, relation=%s, natts=%d, expected_natts=%d, parent_part=%lu, name=%s",
+                                    workerInodeRelationName,
+                                    tupleDesc->natts,
+                                    Anum_pg_dfs_file_lease_expire_at,
+                                    parentId_partId,
+                                    fileName);
+        if (leaseCount != NULL) {
+            *leaseCount = UINT64_MAX;
+        }
+        if (statContext) {
+            STAT_CKPT(statContext->statArrayIndex, statContext->opDoneCheckpoint);
+        }
+        systable_endscan(scanDescriptor);
+        table_close(workerInodeRel, RowExclusiveLock);
+        return true;
+    }
+
+    uint64_t currentLeaseCount = DatumGetUInt64(heap_getattr(heapTuple,
+                                                            Anum_pg_dfs_file_lease_count,
+                                                            tupleDesc,
+                                                            &isNull));
+    if (isNull) {
+        currentLeaseCount = 0;
+    }
+    isNull = false;
+    TimestampTz currentLeaseExpireAt = DatumGetTimestampTz(heap_getattr(heapTuple,
+                                                                        Anum_pg_dfs_file_lease_expire_at,
+                                                                        tupleDesc,
+                                                                        &isNull));
+    if (isNull) {
+        currentLeaseExpireAt = FALCON_INODE_LEASE_EXPIRED_AT;
+    }
+    if (currentLeaseCount > 0 && currentLeaseExpireAt <= GetCurrentTimestamp()) {
+        currentLeaseCount = 0;
+    }
+    if (leaseCount != NULL) {
+        *leaseCount = currentLeaseCount;
+    }
+    if (currentLeaseCount > 0 || !S_ISREG(currentMode) || currentNlink != 1) {
+        if (statContext) {
+            STAT_CKPT(statContext->statArrayIndex, statContext->opDoneCheckpoint);
+        }
+        systable_endscan(scanDescriptor);
+        table_close(workerInodeRel, RowExclusiveLock);
+        return true;
+    }
+
+    CatalogTupleDelete(workerInodeRel, &heapTuple->t_self);
+    CommandCounterIncrement();
+
+    if (statContext) {
+        STAT_CKPT(statContext->statArrayIndex, statContext->opDoneCheckpoint);
+    }
+    systable_endscan(scanDescriptor);
+    table_close(workerInodeRel, RowExclusiveLock);
     return true;
 }
 

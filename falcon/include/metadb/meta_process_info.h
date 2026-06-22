@@ -24,6 +24,8 @@ typedef struct MetaProcessInfoData
 
     // inode info (input/output)
     uint64_t inodeId;
+    bool hasExpectedInodeId;
+    uint64_t expectedInodeId;
     uint64_t parentId_partId;
     char *name;
     uint64_t st_dev;
