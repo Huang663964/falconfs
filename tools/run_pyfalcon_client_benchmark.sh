@@ -715,11 +715,38 @@ configure_auto_evict_case() {
         return 1
     fi
 
+    local capacity_source="filesystem"
+    local safe_avail="$avail"
+    if [[ "$MAX_LOCAL_DISK_SIZE" =~ ^[0-9]+$ ]] && (( MAX_LOCAL_DISK_SIZE > 0 )); then
+        local fs_total="$total"
+        local fs_used="$used"
+        local fs_avail="$avail"
+        safe_avail="$fs_avail"
+        local cache_bytes
+        cache_bytes="$(cache_size_bytes)"
+        [[ -n "$cache_bytes" ]] || cache_bytes=0
+        local logical_total=$((MAX_LOCAL_DISK_SIZE * 1024 * 1024 * 1024))
+        local logical_used="$cache_bytes"
+        if (( logical_used > logical_total )); then
+            logical_used="$logical_total"
+        fi
+        local logical_avail=$((logical_total - logical_used))
+        if (( logical_avail > fs_avail )); then
+            logical_avail="$fs_avail"
+        fi
+        total="$logical_total"
+        used="$logical_used"
+        avail="$logical_avail"
+        capacity_source="max_local_disk_size"
+        log "auto evict capacity source=max_local_disk_size, logical_total=$(bytes_to_mib "$total")MiB, logical_used=$(bytes_to_mib "$used")MiB, logical_avail=$(bytes_to_mib "$avail")MiB, fs_total=$(bytes_to_mib "$fs_total")MiB, fs_used=$(bytes_to_mib "$fs_used")MiB, fs_avail=$(bytes_to_mib "$fs_avail")MiB"
+    fi
+
     local plan
     plan="$(
         TOTAL_BYTES="$total" \
         USED_BYTES="$used" \
         AVAIL_BYTES="$avail" \
+        SAFE_AVAIL_BYTES="$safe_avail" \
         INODES_TOTAL="$inodes_total" \
         INODES_USED="$inodes_used" \
         INODES_AVAIL="$inodes_avail" \
@@ -740,6 +767,7 @@ import os
 total = int(os.environ["TOTAL_BYTES"])
 used = int(os.environ["USED_BYTES"])
 avail = int(os.environ["AVAIL_BYTES"])
+safe_avail = int(os.environ.get("SAFE_AVAIL_BYTES", str(avail)))
 inodes_total = int(os.environ["INODES_TOTAL"])
 inodes_used = int(os.environ["INODES_USED"])
 inodes_avail = int(os.environ["INODES_AVAIL"])
@@ -800,7 +828,7 @@ if max_write > 0 and desired_write > max_write:
         % (desired_write / 1048576.0, max_write / 1048576.0)
     )
 
-safe_auto_write = int(avail * max_avail_ratio)
+safe_auto_write = int(safe_avail * max_avail_ratio)
 if safe_auto_write > 0 and desired_write > safe_auto_write:
     raise SystemExit(
         "auto evict needs %.2f MiB to cross startup-safe threshold, but safe limit is %.2f MiB; "
@@ -838,6 +866,7 @@ print(f"files={auto_files}")
 print(f"total_bytes={total}")
 print(f"used_bytes={used}")
 print(f"avail_bytes={avail}")
+print(f"safe_avail_bytes={safe_avail}")
 print(f"inodes_total={inodes_total}")
 print(f"inodes_used={inodes_used}")
 print(f"inodes_avail={inodes_avail}")
@@ -897,6 +926,7 @@ PYAUTO
     {
         echo "auto_evict_config=1"
         echo "$plan"
+        echo "capacity_source=$capacity_source"
         echo "cache_root=$CACHE_ROOT"
     } > "$plan_file"
 
