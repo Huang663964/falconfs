@@ -479,6 +479,8 @@ start_meta() {
     local threshold="$1"
     local case_id="${2:-meta}"
     local meta_log="$OUT_DIR/python/${case_id}-meta.log"
+    local meta_root
+    meta_root="$(metadata_root 2>/dev/null || true)"
     log "starting Falcon meta services, STORAGE_THRESHOLD=${threshold}"
     (
         cd "$ROOT_DIR"
@@ -1253,6 +1255,12 @@ write_final_report() {
             echo
         done
 
+        echo "## failure diagnostics"
+        if [[ -f "$OUT_DIR/failure_diagnostics.log" ]]; then
+            cat "$OUT_DIR/failure_diagnostics.log"
+            echo
+        fi
+
         echo "## python monitor logs"
         for file in "$OUT_DIR/python/P-3-monitor.log" "$OUT_DIR/python/P-RWE-monitor.log"; do
             if [[ -f "$file" ]]; then
@@ -1307,6 +1315,88 @@ write_summary() {
         --fio-large-runtime "$FIO_LARGE_RUNTIME"
 }
 
+
+write_case_failure_diagnostics() {
+    local case_id="$1"
+    local diag="$OUT_DIR/failure_diagnostics.log"
+    local case_log="$OUT_DIR/python/${case_id}.log"
+    local monitor_log="$OUT_DIR/python/${case_id}-monitor.log"
+    local falcon_log_dir="$OUT_DIR/python/${case_id}-falcon-log"
+    local meta_log="$OUT_DIR/python/${case_id}-meta.log"
+    local meta_root
+    meta_root="$(metadata_root 2>/dev/null || true)"
+
+    {
+        echo "# ${case_id} failure diagnostics"
+        echo "generated_at=$(date '+%F %T')"
+        echo "out_dir=$OUT_DIR"
+        echo "cache_root=$CACHE_ROOT"
+        echo "clients=$CLIENTS files=$FILES read_files=$READ_FILES pinned_read_files=$PINNED_READ_FILES file_size=$FILE_SIZE"
+        echo "mixed_duration_sec=$MIXED_DURATION_SEC max_local_disk_size_gib=$MAX_LOCAL_DISK_SIZE evict_threshold=$EVICT_THRESHOLD"
+        echo
+
+        echo "## space"
+        for path in "$CACHE_ROOT" "$OUT_DIR" "${meta_root:+$(dirname "$meta_root")}"; do
+            [[ -e "$path" ]] || continue
+            echo "### $path"
+            df -h "$path" || true
+            df -ih "$path" || true
+        done
+        if [[ -d "$CACHE_ROOT" ]]; then
+            echo "cache_size=$(du -sh "$CACHE_ROOT" 2>/dev/null | awk '{print $1}')"
+            echo "cache_data_files=$(find "$CACHE_ROOT" -type f ! -path '*/.falcon_cache_locks/*' 2>/dev/null | wc -l)"
+            if [[ -d "$CACHE_ROOT/.falcon_cache_locks" ]]; then
+                echo "cache_lock_files=$(find "$CACHE_ROOT/.falcon_cache_locks" -type f 2>/dev/null | wc -l)"
+            fi
+        fi
+        echo
+
+        echo "## evict plan"
+        if [[ -f "$OUT_DIR/evict_config.txt" ]]; then
+            cat "$OUT_DIR/evict_config.txt"
+        else
+            echo "missing $OUT_DIR/evict_config.txt"
+        fi
+        echo
+
+        echo "## case error summary"
+        if [[ -f "$OUT_DIR/python/${case_id}.json" ]]; then
+            python3 - "$OUT_DIR/python/${case_id}.json" <<'PYFAILJSON' || true
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(f"mode={data.get('mode')} error_count={data.get('error_count')} timed={data.get('timed')}")
+for group_name in ("prepare", "reader", "writer", "deleter", "create", "unlink"):
+    group = data.get(group_name)
+    if not isinstance(group, dict):
+        continue
+    print(
+        f"{group_name}: files={group.get('files')} error_count={group.get('error_count')} "
+        f"elapsed={group.get('elapsed_sec')} max_worker_elapsed={group.get('max_worker_elapsed_sec')} "
+        f"files_per_sec={group.get('files_per_sec')}"
+    )
+    for item in (group.get("errors") or [])[:8]:
+        print(
+            f"{group_name} error role={item.get('role')} client={item.get('client_id')} "
+            f"files={item.get('files')} completed_before_error={item.get('completed_files_before_error')} "
+            f"next_index={item.get('next_index')} failed_path={item.get('failed_path')} "
+            f"elapsed={item.get('elapsed_sec')} stop_reason={item.get('stop_reason')} msg={item.get('error')}"
+        )
+PYFAILJSON
+        else
+            echo "missing $OUT_DIR/python/${case_id}.json"
+        fi
+        echo
+
+        echo "## key error logs"
+        rg -n "ERROR|FATAL|ENOSPC|No space|-28|DiskCache::Cleanup|CleanupForEvict|Evicted|process_lock_busy|metadata_unlink_failed|remove_failed|PreAllocSpace|HasFreeSpace|LEASE|failed" \
+            "$falcon_log_dir" "$case_log" "$monitor_log" "$meta_log" "$ROOT_DIR/deploy/meta" 2>/dev/null | tail -n 200 || true
+        echo
+    } >> "$diag"
+    log "failure diagnostics: $diag"
+}
+
 print_python_case_diagnostics() {
     local case_id="$1"
     local case_json="$OUT_DIR/python/${case_id}.json"
@@ -1316,6 +1406,7 @@ print_python_case_diagnostics() {
 
     [[ "$case_id" != P-* ]] && return 0
     log "diagnostics for ${case_id}"
+    write_case_failure_diagnostics "$case_id" || true
     if [[ -f "$case_json" ]]; then
         python3 - "$case_json" <<'PYDIAG' || true
 import json
@@ -1359,6 +1450,9 @@ def show_group(name, group):
                 item.get("error", ""),
             )
         )
+        for key in ("completed_files_before_error", "next_index", "failed_path", "last_path"):
+            if key in item:
+                print(f"{name} error detail {key}={item.get(key)}")
     for item in per_client:
         if item.get("error") or item.get("stop_reason") == "max_files":
             print(
@@ -1373,6 +1467,9 @@ def show_group(name, group):
                     item.get("error", ""),
                 )
             )
+            for key in ("completed_files_before_error", "next_index", "failed_path", "last_path"):
+                if key in item:
+                    print(f"{name} per_client detail role={item.get('role', 'N/A')} client={item.get('client_id', 'N/A')} {key}={item.get(key)}")
 
 for name in ("create", "unlink", "prepare", "read", "reader", "writer", "deleter"):
     show_group(name, data.get(name))

@@ -451,6 +451,7 @@ $OUT_DIR/final_report.log
 | 存储设备信息 | `$OUT_DIR/storage_info.txt` |
 | evict 自动水位配置 | `$OUT_DIR/evict_config.txt` |
 | 执行过程 | `$OUT_DIR/run*.log` 的尾部 |
+| 失败定位 | `$OUT_DIR/failure_diagnostics.log`，包含 df/du、cache 文件数、evict config、case JSON 错误摘要和关键 Falcon 日志摘录 |
 | P-3/P-RWE 运行监控 | `$OUT_DIR/python/P-3-monitor.log`、`$OUT_DIR/python/P-RWE-monitor.log` |
 | P-3/P-RWE cache 状态 | `$OUT_DIR/python/P-3-cache_state.txt`、`$OUT_DIR/python/P-RWE-cache_state.txt` |
 | evict 原始日志摘录 | 从 `$OUT_DIR/work_P-*`、`$OUT_DIR/python/P-*-falcon-log` 和 `$OUT_DIR/falcon_logs/P-*` 中摘取 `DiskCache::Cleanup()` / `CleanupForEvict()` / `FalconEvictUnlinkListener stopped` 相关行 |

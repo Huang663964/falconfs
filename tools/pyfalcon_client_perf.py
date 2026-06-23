@@ -168,6 +168,10 @@ def worker_read(args, role, client_id, base_dir, files, start_event, ready_q, re
 
 
 def worker_write_timed(args, role, client_id, base_dir, max_files, start_event, stop_event, ready_q, result_q):
+    begin = None
+    latencies = []
+    i = 0
+    path = ""
     try:
         client = make_client(args, role, client_id)
         mkdir(client, base_dir)
@@ -176,8 +180,6 @@ def worker_write_timed(args, role, client_id, base_dir, max_files, start_event, 
         start_event.wait()
         begin = time.monotonic()
         deadline = begin + args.duration_sec
-        latencies = []
-        i = 0
         while not stop_event.is_set() and time.monotonic() < deadline and (max_files <= 0 or i < max_files):
             path = f"{base_dir}/f_{i:08d}"
             op_begin = time.monotonic()
@@ -193,17 +195,23 @@ def worker_write_timed(args, role, client_id, base_dir, max_files, start_event, 
             "latencies": latencies,
             "stop_reason": "max_files" if max_files > 0 and i >= max_files else "duration",
             "error": "",
+            "last_path": path,
+            "next_index": i,
         })
     except Exception as exc:
+        elapsed = time.monotonic() - begin if begin is not None else 0.0
         ready_q.put({"role": role, "client_id": client_id, "ready": False, "error": str(exc)})
         result_q.put({
             "role": role,
             "client_id": client_id,
-            "files": 0,
-            "elapsed_sec": 0.0,
-            "latencies": [],
+            "files": len(latencies),
+            "elapsed_sec": elapsed,
+            "latencies": latencies,
             "stop_reason": "error",
             "error": str(exc),
+            "failed_path": path,
+            "next_index": i,
+            "completed_files_before_error": len(latencies),
         })
 
 
@@ -325,6 +333,10 @@ def worker_read_pinned_timed(args, role, client_id, base_dir, files, counters, s
 
 
 def worker_write_timed_publish(args, role, client_id, base_dir, max_files, counters, start_event, stop_event, ready_q, result_q):
+    begin = None
+    latencies = []
+    i = 0
+    path = ""
     try:
         client = make_client(args, role, client_id)
         mkdir(client, base_dir)
@@ -333,8 +345,6 @@ def worker_write_timed_publish(args, role, client_id, base_dir, max_files, count
         start_event.wait()
         begin = time.monotonic()
         deadline = begin + args.duration_sec
-        latencies = []
-        i = 0
         while not stop_event.is_set() and time.monotonic() < deadline and (max_files <= 0 or i < max_files):
             path = f"{base_dir}/f_{i:08d}"
             op_begin = time.monotonic()
@@ -353,19 +363,25 @@ def worker_write_timed_publish(args, role, client_id, base_dir, max_files, count
             "operation_errors": [],
             "stop_reason": "max_files" if max_files > 0 and i >= max_files else "duration",
             "error": "",
+            "last_path": path,
+            "next_index": i,
         })
     except Exception as exc:
+        elapsed = time.monotonic() - begin if begin is not None else 0.0
         ready_q.put({"role": role, "client_id": client_id, "ready": False, "error": str(exc)})
         result_q.put({
             "role": role,
             "client_id": client_id,
-            "files": 0,
-            "elapsed_sec": 0.0,
-            "latencies": [],
+            "files": len(latencies),
+            "elapsed_sec": elapsed,
+            "latencies": latencies,
             "operation_error_count": 0,
             "operation_errors": [],
             "stop_reason": "error",
             "error": str(exc),
+            "failed_path": path,
+            "next_index": i,
+            "completed_files_before_error": len(latencies),
         })
 
 
