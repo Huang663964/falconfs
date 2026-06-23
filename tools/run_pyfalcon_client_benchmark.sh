@@ -64,6 +64,7 @@ P3_STALL_SECONDS="${P3_STALL_SECONDS:-180}"
 KEEP_WORK_DIRS="${KEEP_WORK_DIRS:-1}"
 MAX_LOCAL_DISK_SIZE="${MAX_LOCAL_DISK_SIZE:-16}"
 FALCON_LOG_LEVEL="${FALCON_LOG_LEVEL:-}"
+EVICT_FALCON_LOG_LEVEL="${EVICT_FALCON_LOG_LEVEL:-INFO}"
 PREPARE_ENV="${PREPARE_ENV:-1}"
 PREPARE_PG="${PREPARE_PG:-auto}"
 PREPARE_FALCON="${PREPARE_FALCON:-1}"
@@ -147,6 +148,7 @@ Environment overrides:
   P3_STALL_SECONDS=${P3_STALL_SECONDS}
   MAX_LOCAL_DISK_SIZE=${MAX_LOCAL_DISK_SIZE}
   FALCON_LOG_LEVEL=${FALCON_LOG_LEVEL}
+  EVICT_FALCON_LOG_LEVEL=${EVICT_FALCON_LOG_LEVEL}
   PREPARE_ENV=${PREPARE_ENV}
   PREPARE_PG=${PREPARE_PG}
   PREPARE_FALCON=${PREPARE_FALCON}
@@ -249,6 +251,8 @@ write_storage_info() {
         echo "auto_evict_max_write_bytes=$AUTO_EVICT_MAX_WRITE_BYTES"
         echo "auto_evict_trigger_ratio=$AUTO_EVICT_TRIGGER_RATIO"
         echo "auto_evict_start_margin_ratio=$AUTO_EVICT_START_MARGIN_RATIO"
+        echo "falcon_log_level=$FALCON_LOG_LEVEL"
+        echo "evict_falcon_log_level=$EVICT_FALCON_LOG_LEVEL"
         path_device_info "$OUT_DIR"
         path_device_info "$FIO_DIR"
         if scenario_uses_falcon; then
@@ -1600,8 +1604,8 @@ run_case() {
     case_unlink_files="$UNLINK_FILES"
     case_threshold="$threshold"
     case_log_level="$FALCON_LOG_LEVEL"
-    if [[ "$mode" == "create_evict" || "$mode" == "read_write_evict" ]] && [[ -z "$case_log_level" ]]; then
-        case_log_level="INFO"
+    if [[ "$mode" == "create_evict" || "$mode" == "read_write_evict" ]]; then
+        case_log_level="$EVICT_FALCON_LOG_LEVEL"
     fi
     if [[ "$SHARED_PINNED_READ_DIR" == "1" ]]; then
         shared_pinned_read_arg=(--shared-pinned-read-dir)
