@@ -500,6 +500,7 @@ start_meta() {
 
 create_case_config() {
     local case_id="$1"
+    local case_log_level="${2:-$FALCON_LOG_LEVEL}"
     local case_config="$OUT_DIR/python/${case_id}-config.json"
     mkdir -p "$OUT_DIR/python"
     BASE_CONFIG="$CONFIG_FILE_PATH" \
@@ -508,7 +509,7 @@ create_case_config() {
     BENCHMARK_CLUSTER_VIEW_VALUE="$BENCHMARK_CLUSTER_VIEW" \
     CASE_LOG_DIR="$OUT_DIR/python/${case_id}-falcon-log" \
     MAX_LOCAL_DISK_SIZE_VALUE="$MAX_LOCAL_DISK_SIZE" \
-    FALCON_LOG_LEVEL_VALUE="$FALCON_LOG_LEVEL" \
+    FALCON_LOG_LEVEL_VALUE="$case_log_level" \
     python3 - <<'PYCONFIG'
 import json
 import os
@@ -859,9 +860,14 @@ if threshold_bytes <= start_used_bytes or threshold_bytes >= start_used_bytes + 
     raise SystemExit("cannot compute threshold between current usage and planned final usage")
 
 threshold = threshold_bytes / total
+background_threshold = min(1.0, threshold + 0.10)
 final_ratio = (start_used_bytes + write_bytes) / total
 write_ratio_actual = write_bytes / total
 print(f"threshold={threshold:.6f}")
+print(f"foreground_free_watermark={threshold:.6f}")
+print(f"background_cleanup_free_watermark={background_threshold:.6f}")
+print(f"foreground_trigger_used_ratio={1.0 - threshold:.6f}")
+print(f"background_trigger_used_ratio={1.0 - background_threshold:.6f}")
 print(f"files={auto_files}")
 print(f"total_bytes={total}")
 print(f"used_bytes={used}")
@@ -930,9 +936,9 @@ PYAUTO
         echo "cache_root=$CACHE_ROOT"
     } > "$plan_file"
 
-    log "auto evict plan: threshold=${AUTO_EVICT_CASE_THRESHOLD}, files=${AUTO_EVICT_CASE_FILES}, write=$(bytes_to_mib $((AUTO_EVICT_CASE_FILES * FILE_SIZE)))MiB, cache_fs=$(path_device_info "$CACHE_ROOT")"
+    log "auto evict plan: foreground_free_watermark=${AUTO_EVICT_CASE_THRESHOLD}, files=${AUTO_EVICT_CASE_FILES}, write=$(bytes_to_mib $((AUTO_EVICT_CASE_FILES * FILE_SIZE)))MiB, cache_fs=$(path_device_info "$CACHE_ROOT")"
     if (( AUTO_EVICT_CASE_FILES > FILES )); then
-        log "auto evict increased P-3 files from ${FILES} to ${AUTO_EVICT_CASE_FILES} to cross the evict threshold on this filesystem"
+        log "auto evict increased files from ${FILES} to ${AUTO_EVICT_CASE_FILES} to cross the evict threshold on this filesystem"
     fi
     return 0
 }
@@ -1588,11 +1594,15 @@ run_case() {
     local case_id="$1"
     local mode="$2"
     local threshold="$3"
-    local status case_files case_unlink_files case_threshold case_config case_log monitor_log bench_pid monitor_pid
+    local status case_files case_unlink_files case_threshold case_config case_log case_log_level monitor_log bench_pid monitor_pid
     local -a shared_pinned_read_arg=()
     case_files="$FILES"
     case_unlink_files="$UNLINK_FILES"
     case_threshold="$threshold"
+    case_log_level="$FALCON_LOG_LEVEL"
+    if [[ "$mode" == "create_evict" || "$mode" == "read_write_evict" ]] && [[ -z "$case_log_level" ]]; then
+        case_log_level="INFO"
+    fi
     if [[ "$SHARED_PINNED_READ_DIR" == "1" ]]; then
         shared_pinned_read_arg=(--shared-pinned-read-dir)
     fi
@@ -1617,10 +1627,10 @@ run_case() {
     prepare_cache_dirs || return 1
     safe_rm_rf "$OUT_DIR/work_${case_id}" >/dev/null 2>&1 || true
     mkdir -p "$OUT_DIR/python" "$OUT_DIR/work_${case_id}" || return 1
-    case_config="$(create_case_config "$case_id")" || return 1
+    case_config="$(create_case_config "$case_id" "$case_log_level")" || return 1
     case_log="$OUT_DIR/python/${case_id}.log"
     monitor_log="$OUT_DIR/python/${case_id}-monitor.log"
-    log "case ${case_id} config: ${case_config}, cache_root=${CACHE_ROOT}, cluster_view=${BENCHMARK_CLUSTER_VIEW}"
+    log "case ${case_id} config: ${case_config}, cache_root=${CACHE_ROOT}, cluster_view=${BENCHMARK_CLUSTER_VIEW}, falcon_log_level=${case_log_level:-default}"
     start_meta "$case_threshold" "$case_id" || return 1
     start_idle_server "$case_threshold" "$case_id" "$case_config" || return 1
     log "running ${case_id}: mode=${mode}, clients=${CLIENTS}, files=${case_files}, file_size=${FILE_SIZE}, threshold=${case_threshold}"
