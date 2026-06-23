@@ -235,15 +235,23 @@ TEST_F(DiskCacheUT, StartScansExistingCacheFiles)
     SetTotalDirectory(2);
 
     uint64_t key = 302;
+    uint64_t tmpKey = 303;
     std::string file = GetFilePath(key);
+    std::string tmpFile = cacheRoot + "/" + std::to_string(tmpKey % 2) + "/" + std::to_string(tmpKey) + "-large.tmp.123";
     {
         std::ofstream out(file);
         out << "existing-cache";
+    }
+    {
+        std::ofstream out(tmpFile);
+        out << "partial-cache";
     }
 
     DiskCache cache;
     EXPECT_EQ(cache.Start(cacheRoot, 2, 0.000001), 0);
     EXPECT_TRUE(cache.Find(key, false));
+    EXPECT_FALSE(cache.Find(tmpKey, false));
+    EXPECT_FALSE(std::filesystem::exists(tmpFile));
     EXPECT_EQ(cache.Delete(key), 0);
     std::filesystem::remove_all(cacheRoot);
 }

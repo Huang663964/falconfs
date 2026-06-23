@@ -332,9 +332,13 @@ int DiskCache::Walk(std::string dirPath)
         if (strcmp(f->d_name, ".") == 0 || strcmp(f->d_name, "..") == 0) {
             continue;
         }
+        std::string filePath = dirPath + "/" + f->d_name;
+        if (strstr(f->d_name, ".tmp.") != nullptr) {
+            (void)remove(filePath.c_str());
+            continue;
+        }
         struct stat st;
         (void)memset(&st, 0, sizeof(st));
-        std::string filePath = dirPath + "/" + f->d_name;
         stat(filePath.c_str(), &st);
         CacheItem cache;
         cache.inode = atoll(f->d_name);
