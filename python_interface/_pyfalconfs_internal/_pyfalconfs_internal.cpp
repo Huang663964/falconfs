@@ -27,6 +27,22 @@ static int64_t steady_clock_now_us() {
     ).count();
 }
 
+static void ReleasePyBufferWithGil(Py_buffer* buffer)
+{
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    PyBuffer_Release(buffer);
+    PyGILState_Release(gstate);
+}
+
+struct AsyncState;
+
+static void ReleaseAsyncStateWithGil(AsyncState* state);
+
+struct AsyncStateRefGuard {
+    AsyncState* state;
+    ~AsyncStateRefGuard() { ReleaseAsyncStateWithGil(state); }
+};
+
 /* =================== Blocking Methods =======================*/
 static void Init(const char* workspace, const char* runningConfigFile) 
 {
@@ -767,6 +783,13 @@ static PyObject* AsyncState_iternext(PyObject* self)
     return NULL;
 }
 
+static void ReleaseAsyncStateWithGil(AsyncState* state)
+{
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    Py_DECREF((PyObject*)state);
+    PyGILState_Release(gstate);
+}
+
 static PyObject* AsyncState_await(PyObject *self)
 {
     Py_INCREF(self);
@@ -801,15 +824,18 @@ static PyObject* PyWrapper_AsyncExists(PyObject* self, PyObject* args)
     if (!PyArg_ParseTuple(args, "s", &path))
         return nullptr;
 
+    std::string pathStr(path);
     AsyncState* state = (AsyncState*)AsyncStateType.tp_new(&AsyncStateType, nullptr, nullptr);
     state->cpp_recv_time_us = steady_clock_now_us();
-    auto task = [path, state]() -> std::unique_ptr<AsyncResultBase>
+    Py_INCREF((PyObject*)state);
+    auto task = [pathStr, state]() -> std::unique_ptr<AsyncResultBase>
     {
+        AsyncStateRefGuard stateGuard{state};
         int ret = -1;
         struct stat stbuf;
         try
         {
-            ret = Stat(path, &stbuf);
+            ret = Stat(pathStr.c_str(), &stbuf);
         }
         catch (const std::exception& e)
         {
@@ -832,31 +858,44 @@ static PyObject* PyWrapper_AsyncGet(PyObject* self, PyObject* args)
     int offset;
     if (!PyArg_ParseTuple(args, "sw*ii", &path, &buffer, &size, &offset))
         return nullptr;
+    if (size < 0 || buffer.len < size)
+    {
+        PyBuffer_Release(&buffer);
+        PyErr_SetString(PyExc_RuntimeError, "the buffer is not enough for requested data.");
+        return nullptr;
+    }
 
+    std::string pathStr(path);
     AsyncState *state = (AsyncState *)AsyncStateType.tp_new(&AsyncStateType, nullptr, nullptr);
     state->cpp_recv_time_us = steady_clock_now_us();
-    auto task = [path, buffer, size, offset, state]() -> std::unique_ptr<AsyncResultBase> {
+    Py_INCREF((PyObject*)state);
+    auto task = [pathStr, buffer, size, offset, state]() mutable -> std::unique_ptr<AsyncResultBase> {
+        AsyncStateRefGuard stateGuard{state};
+        struct BufferGuard {
+            Py_buffer* buffer;
+            ~BufferGuard() { ReleasePyBufferWithGil(buffer); }
+        } guard{&buffer};
         int ret = -1;
-        int readSize;
+        int readSize = 0;
         uint64_t fd = UINT64_MAX;
         try
         {
-            ret = Open(path, O_RDONLY, fd);
+            ret = Open(pathStr.c_str(), O_RDONLY, fd);
             if (ret != 0)
             {
                 state->cpp_done_time_us = steady_clock_now_us();
                 return std::make_unique<AsyncResultIntOnly>(ret);
             }
 
-            readSize = Read(path, fd, (char*)buffer.buf, size, offset);
+            readSize = Read(pathStr.c_str(), fd, (char*)buffer.buf, size, offset);
             if (readSize < 0)
             {
-                Close(path, fd);
+                Close(pathStr.c_str(), fd);
                 state->cpp_done_time_us = steady_clock_now_us();
                 return std::make_unique<AsyncResultIntOnly>(readSize);
             }
 
-            ret = Close(path, fd);
+            ret = Close(pathStr.c_str(), fd);
             if (ret != 0)
             {
                 state->cpp_done_time_us = steady_clock_now_us();
@@ -866,7 +905,7 @@ static PyObject* PyWrapper_AsyncGet(PyObject* self, PyObject* args)
         catch (const std::exception& e)
         {
             if (fd != UINT64_MAX)
-                Close(path, fd);
+                Close(pathStr.c_str(), fd);
             state->cpp_done_time_us = steady_clock_now_us();
             return std::make_unique<AsyncResultBase>(strdup(e.what()));
         }
@@ -885,39 +924,51 @@ static PyObject* PyWrapper_AsyncPut(PyObject* self, PyObject* args)
     int offset;
     if (!PyArg_ParseTuple(args, "sw*ii", &path, &buffer, &size, &offset))
         return nullptr;
+    if (size < 0 || buffer.len < size)
+    {
+        PyBuffer_Release(&buffer);
+        PyErr_SetString(PyExc_RuntimeError, "the buffer is not enough for writing data.");
+        return nullptr;
+    }
+
+    std::string pathStr(path);
+    std::string writeBuffer(static_cast<char*>(buffer.buf), static_cast<size_t>(size));
+    PyBuffer_Release(&buffer);
 
     AsyncState *state = (AsyncState *)AsyncStateType.tp_new(&AsyncStateType, nullptr, nullptr);
     state->cpp_recv_time_us = steady_clock_now_us();
-    auto task = [path, buffer, size, offset, state]() -> std::unique_ptr<AsyncResultBase>
+    Py_INCREF((PyObject*)state);
+    auto task = [pathStr, writeBuffer = std::move(writeBuffer), size, offset, state]() mutable -> std::unique_ptr<AsyncResultBase>
     {
+        AsyncStateRefGuard stateGuard{state};
         int ret = -1;
         uint64_t fd = UINT64_MAX;
         try
         {
-            ret = Create(path, O_CREAT | O_WRONLY | O_TRUNC, fd);
+            ret = Create(pathStr.c_str(), O_CREAT | O_WRONLY | O_TRUNC, fd);
             if (ret != 0)
             {
                 state->cpp_done_time_us = steady_clock_now_us();
                 return std::make_unique<AsyncResultIntOnly>(ret);
             }
 
-            ret = Write(path, fd, (char*)buffer.buf, size, offset);
+            ret = Write(pathStr.c_str(), fd, writeBuffer.data(), size, offset);
             if (ret != 0)
             {
-                Close(path, fd);
+                Close(pathStr.c_str(), fd);
                 state->cpp_done_time_us = steady_clock_now_us();
                 return std::make_unique<AsyncResultIntOnly>(ret);
             }
 
-            ret = Flush(path, fd);
+            ret = Flush(pathStr.c_str(), fd);
             if (ret != 0)
             {
-                Close(path, fd);
+                Close(pathStr.c_str(), fd);
                 state->cpp_done_time_us = steady_clock_now_us();
                 return std::make_unique<AsyncResultIntOnly>(ret);
             }
 
-            ret = Close(path, fd);
+            ret = Close(pathStr.c_str(), fd);
             if (ret != 0)
             {
                 state->cpp_done_time_us = steady_clock_now_us();
@@ -927,7 +978,7 @@ static PyObject* PyWrapper_AsyncPut(PyObject* self, PyObject* args)
         catch (const std::exception& e)
         {
             if (fd != UINT64_MAX)
-                Close(path, fd);
+                Close(pathStr.c_str(), fd);
             state->cpp_done_time_us = steady_clock_now_us();
             return std::make_unique<AsyncResultBase>(strdup(e.what()));
         }

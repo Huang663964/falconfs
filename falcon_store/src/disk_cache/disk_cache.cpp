@@ -5,6 +5,7 @@
 #include "disk_cache/disk_cache.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -14,6 +15,8 @@
 #include <sstream>
 #include <thread>
 
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/time.h>
 
@@ -41,6 +44,7 @@ struct EvictFailureSummary {
     uint64_t metadataUnlinkFailed{0};
     uint64_t itemChanged{0};
     uint64_t removeFailed{0};
+    uint64_t processLockBusy{0};
     uint64_t staleIndexCleared{0};
     std::vector<std::string> samples;
 };
@@ -48,6 +52,7 @@ struct EvictFailureSummary {
 struct EvictRemoveTask {
     EvictedItem item;
     std::string fileName;
+    int lockFd{-1};
 };
 
 struct EvictRemoveResult {
@@ -161,6 +166,47 @@ void DiskCache::SetEvictListener(DiskCacheEvictListener *listener)
 {
     std::lock_guard<std::mutex> lock(listenerMutex);
     evictListener = listener;
+}
+
+int DiskCache::AcquireProcessLock(uint64_t key, bool exclusive, bool nonBlocking)
+{
+    if (rootDir.empty()) {
+        return -EINVAL;
+    }
+
+    std::string lockRoot = rootDir + "/.falcon_cache_locks";
+    if (mkdir(lockRoot.c_str(), 0755) != 0 && errno != EEXIST) {
+        return -errno;
+    }
+    uint64_t shard = totalDirNum > 0 ? key % static_cast<uint64_t>(totalDirNum) : 0;
+    std::string lockDir = lockRoot + "/" + std::to_string(shard);
+    if (mkdir(lockDir.c_str(), 0755) != 0 && errno != EEXIST) {
+        return -errno;
+    }
+
+    std::string lockFile = lockDir + "/" + std::to_string(key) + ".lock";
+    int fd = open(lockFile.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+    if (fd < 0) {
+        return -errno;
+    }
+
+    int operation = exclusive ? LOCK_EX : LOCK_SH;
+    if (nonBlocking) {
+        operation |= LOCK_NB;
+    }
+    if (flock(fd, operation) != 0) {
+        int err = errno;
+        close(fd);
+        return -err;
+    }
+    return fd;
+}
+
+void DiskCache::ReleaseProcessLock(int fd)
+{
+    if (fd >= 0) {
+        close(fd);
+    }
 }
 
 void DiskCache::PrepareEvictionBatch(std::vector<EvictCandidate> &candidates, std::size_t begin, std::size_t end)
@@ -501,7 +547,16 @@ void DiskCache::FinishPreparedEvictions(std::vector<EvictCandidate> &candidates,
             continue;
         }
 
-        removeTasks.push_back({candidate.item, candidate.fileName});
+        int lockFd = AcquireProcessLock(candidate.item.inode, true, true);
+        if (lockFd < 0) {
+            itemIt->evicting = false;
+            ++failedInode;
+            ++failureSummary.processLockBusy;
+            AddEvictFailureSample(failureSummary, candidate.item, candidate.fileName, "process_lock_busy");
+            continue;
+        }
+
+        removeTasks.push_back({candidate.item, candidate.fileName, lockFd});
     }
     finishLockHeldUs += ElapsedUs(lockHeldStart, DiskCacheClock::now());
 
@@ -514,6 +569,7 @@ void DiskCache::FinishPreparedEvictions(std::vector<EvictCandidate> &candidates,
         uint64_t elapsedUs = ElapsedUs(removeStart, DiskCacheClock::now());
         int err = ret == 0 ? 0 : errno;
         removeElapsedUs += elapsedUs;
+        ReleaseProcessLock(task.lockFd);
         removeResults.push_back({task, ret, err, elapsedUs});
     }
     auto removeRelockWaitStart = DiskCacheClock::now();
@@ -559,12 +615,13 @@ void DiskCache::FinishPreparedEvictions(std::vector<EvictCandidate> &candidates,
 
     evictCv.notify_all();
 
-    if (failureSummary.metadataUnlinkFailed > 0 || failureSummary.itemChanged > 0 || failureSummary.removeFailed > 0 ||
+    if (failureSummary.metadataUnlinkFailed > 0 || failureSummary.itemChanged > 0 || failureSummary.removeFailed > 0 || failureSummary.processLockBusy > 0 ||
         failureSummary.staleIndexCleared > 0) {
         FALCON_LOG(LOG_WARNING) << "DiskCache::FinishPreparedEvictions(): metadata_unlink_failed = "
                                 << failureSummary.metadataUnlinkFailed
                                 << ", cache_item_changed = " << failureSummary.itemChanged
                                 << ", remove_failed = " << failureSummary.removeFailed
+                                << ", process_lock_busy = " << failureSummary.processLockBusy
                                 << ", stale_index_cleared = " << failureSummary.staleIndexCleared
                                 << ", samples = " << JoinSamples(failureSummary.samples);
     }
@@ -849,7 +906,14 @@ void DiskCache::DeleteOldCacheWithNoPin(uint64_t key)
             auto elem = inodeToCacheIter[key];
             uint64_t size = elem->size;
             std::string fileName = GetFilePath(key);
+            int lockFd = AcquireProcessLock(key, true, true);
+            if (lockFd < 0 && lockFd != -EINVAL) {
+                FALCON_LOG(LOG_WARNING) << "DeleteOldCacheWithNoPin file: " << fileName
+                                        << " skipped, process lock busy: " << strerror(-lockFd);
+                return;
+            }
             ret = remove(fileName.c_str());
+            ReleaseProcessLock(lockFd);
             if (ret != 0) {
                 int err = errno;
                 FALCON_LOG(LOG_ERROR) << "DeleteOldCacheWithNoPin file: " << fileName << " failed: " << strerror(err);

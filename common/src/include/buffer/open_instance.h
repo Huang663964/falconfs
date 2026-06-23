@@ -15,7 +15,10 @@ struct OpenInstance
 {
     OpenInstance() = default;
 
-    ~OpenInstance() = default;
+    ~OpenInstance();
+    void SetCacheLockFd(int fd);
+    bool HasCacheLock() const;
+    void ReleaseCacheLock();
     void LockOpenInstance();
     void UnlockOpenInstance();
 
@@ -70,6 +73,7 @@ struct OpenInstance
     std::atomic<bool> isOpened{false};
     // buffer to aggregate write data
     WriteStream writeStream;
+    int cacheLockFd = -1;
     // buffer to store pre-fetched data. Must be LAST to be DESTRUCTED FIRST
     ReadStream readStream;
 };

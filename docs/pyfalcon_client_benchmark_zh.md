@@ -4,10 +4,11 @@
 
 ## 1. 测试目标
 
-benchmark 覆盖 Python internal API 和 fio 本地基准两类场景。Python internal API 覆盖 4 个场景：
+benchmark 覆盖 Python internal API 和 fio 本地基准两类场景。Python internal API 覆盖以下场景：
 
 | 编号 | 场景 | 并发模型 |
 | --- | --- | --- |
+| P-LOCK | 共享 cache evict 锁回归 | 构建并运行 `DiskCacheUT` 中的跨进程 cache 锁用例，验证其他进程持有 cache 文件时 evict 无法拿到独占锁并跳过删除 |
 | P-1 | 纯写 | 4 个 Python 进程，每个进程 1 个 `pyfalconfs.Client` |
 | P-2 | 纯删除 | 先 4 client 预创建文件，再 4 client 并发 `FalconUnlink` |
 | P-3 | 写触发 evict | 4 writer client 并发写，DiskCache 后台 cleanup 删除 cache |
@@ -99,7 +100,7 @@ test -x build/internal_perf/falcon_internal_perf
 
 ## 4. 一键执行
 
-默认一键执行只跑核心 Python internal 场景：P-1/P-2/P-3/P-5/P-R1/P-RW/P-RWE，不再每次跑 fio 和 direct I/O 探测。另一台服务器如果 NVMe 盘挂载在 `/data4/hxing`，建议显式设置 `BENCHMARK_ROOT=/data4/hxing`。默认情况下，metadata workspace 也会跟随 `BENCHMARK_ROOT`，即使用 `/data4/hxing/metadata`，不需要手动修改 `deploy/meta/falcon_meta_config.sh`：
+默认一键执行 `all` 会跑 Python internal 场景和 fio 本地基准；只想快速验证 Python internal 场景时使用 `python`。另一台服务器如果 NVMe 盘挂载在 `/data4/hxing`，建议显式设置 `BENCHMARK_ROOT=/data4/hxing`。默认情况下，metadata workspace 也会跟随 `BENCHMARK_ROOT`，即使用 `/data4/hxing/metadata`，不需要手动修改 `deploy/meta/falcon_meta_config.sh`：
 
 ```bash
 cd ~/code/falconfs
@@ -117,12 +118,13 @@ WAIT_SEC=45 \
 bash tools/run_pyfalcon_client_benchmark.sh all
 ```
 
-`all/python/full/fio` 会按 case 独立执行。某个 case 失败时，脚本会记录失败状态并继续执行后续 case，最后生成 summary，并在 `run.log` 末尾列出失败项。`full` 保留旧的完整口径，会额外跑 P-DIO、fio B-1..B-6、fio matrix 和 B-DIO。
+`all/python/fio` 会按 case 独立执行。某个 case 失败时，脚本会记录失败状态并继续执行后续 case，最后生成 summary，并在 `run.log` 末尾列出失败项。`all` 是完整口径，会额外跑 P-DIO、fio B-1..B-6、fio matrix 和 B-DIO。
 
 只跑核心 Python internal 场景或单个场景：
 
 ```bash
 bash tools/run_pyfalcon_client_benchmark.sh python
+bash tools/run_pyfalcon_client_benchmark.sh P-LOCK
 bash tools/run_pyfalcon_client_benchmark.sh P-1
 bash tools/run_pyfalcon_client_benchmark.sh P-2
 bash tools/run_pyfalcon_client_benchmark.sh P-3
@@ -133,7 +135,7 @@ bash tools/run_pyfalcon_client_benchmark.sh P-RWE
 
 # 需要时单独跑 direct I/O 探测或完整基准
 bash tools/run_pyfalcon_client_benchmark.sh P-DIO
-bash tools/run_pyfalcon_client_benchmark.sh full
+bash tools/run_pyfalcon_client_benchmark.sh all
 
 # 只跑 fio 基准
 bash tools/run_pyfalcon_client_benchmark.sh fio
@@ -275,7 +277,7 @@ $OUT_DIR/fio/B-5.json
 | 文件 | 说明 |
 | --- | --- |
 | `run.log` | 一键脚本执行过程日志，包含每个场景启动、清理和汇总路径 |
-| `benchmark_summary.md` | 类似性能测试结果文档的最终汇总表；默认 `all` 只包含核心 Python internal 场景，`full/fio` 才包含 fio 基准 |
+| `benchmark_summary.md` | 类似性能测试结果文档的最终汇总表；`all` 包含 Python internal 和 fio 基准，`python` 只包含 Python internal 场景 |
 | `benchmark_summary.log` | 与 `benchmark_summary.md` 内容一致，便于直接归档或 `cat` 查看 |
 | `storage_info.txt` | 记录 `OUT_DIR/CACHE_ROOT/FIO_DIR/metadata workspace` 对应的挂载点、设备和文件系统类型 |
 | `evict_config.txt` | 记录 P-3 自动计算出的 `threshold`、实际 `files`、磁盘总量/已用量/可用量、inode 总量/已用量/可用量、计划写入量；失败后 cache root 被清理时也以这里为准 |
@@ -387,7 +389,7 @@ falcon_meta_config.sh 中 workspace 所在目录
 如果任一目录不在 NVMe 设备上，脚本会直接退出，避免把结果误测到系统盘或非目标盘。确认在 `/data4/hxing` 上测试时，推荐命令：
 
 ```bash
-BENCHMARK_ROOT=/data4/hxing bash tools/run_pyfalcon_client_benchmark.sh all
+BENCHMARK_ROOT=/data4/hxing bash tools/run_pyfalcon_client_benchmark.sh python
 ```
 
 仅做功能 smoke、不关心磁盘类型时，可以临时关闭检查：
@@ -417,21 +419,21 @@ cat "$OUT_DIR"/python/*-brpc-data-node.log
 
 ## 11. 新增混合读写 evict 与 direct I/O 验证
 
-`all` 现在只覆盖核心 Python internal 场景和混合读写/evict 场景，不再默认跑 fio 基准和 direct I/O 未对齐探测。为了在非 NVMe 或本地功能验证时缩短时间，可以先用小规模参数跑核心流程：
+为了在非 NVMe 或本地功能验证时缩短时间，可以先用小规模参数跑核心 Python internal 流程：
 
 ```bash
-REQUIRE_NVME=0 BENCHMARK_ROOT=/tmp/falconfs_local_benchmark CLIENTS=2 FILES=64 READ_FILES=64 UNLINK_FILES=64 P5_UNLINK_FILES=512 WAIT_SEC=5 MIXED_DURATION_SEC=30 bash tools/run_pyfalcon_client_benchmark.sh all
+REQUIRE_NVME=0 BENCHMARK_ROOT=/tmp/falconfs_local_benchmark CLIENTS=2 FILES=64 READ_FILES=64 UNLINK_FILES=64 P5_UNLINK_FILES=512 WAIT_SEC=5 MIXED_DURATION_SEC=30 bash tools/run_pyfalcon_client_benchmark.sh python
 ```
 
 在 NVMe 服务器正式测试核心 Python internal 场景时，建议恢复 4 client，并给 P-5 准备足够大的删除集：
 
 ```bash
-BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 READ_FILES=6000 UNLINK_FILES=6000 P5_UNLINK_FILES=200000 WAIT_SEC=45 MIXED_DURATION_SEC=120 bash tools/run_pyfalcon_client_benchmark.sh all
+BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 READ_FILES=6000 UNLINK_FILES=6000 P5_UNLINK_FILES=200000 WAIT_SEC=45 MIXED_DURATION_SEC=120 bash tools/run_pyfalcon_client_benchmark.sh python
 ```
 
-混合场景判断顺序：先看 P-R1/P-1 的 Falcon 纯读纯写，再看固定时长 P-5/P-RW 的写删、读写基线，最后用固定时长 P-RWE 对比 P-RW，评估 evict 对已打开读热集和持续写入的额外影响。P-RW/P-RWE 的 JSON 中必须确认 `timed=true`、`read_pattern=pinned_read_set`；总览写吞吐看 active 口径，窗口平均值只作为固定时长占用程度参考；P-5 如果 `delete_dataset_exhausted=false`，删除吞吐可作为完整窗口结果，如果为 `true`，只能说明有限待删数据集被删完，不能当作删除上限。需要重新采 fio 基准时再单独执行 `fio` 或 `full`。
+混合场景判断顺序：先看 P-R1/P-1 的 Falcon 纯读纯写，再看固定时长 P-5/P-RW 的写删、读写基线，最后用固定时长 P-RWE 对比 P-RW，评估 evict 对已打开读热集和持续写入的额外影响。P-RW/P-RWE 的 JSON 中必须确认 `timed=true`、`read_pattern=pinned_read_set`；总览写吞吐看 active 口径，窗口平均值只作为固定时长占用程度参考；P-5 如果 `delete_dataset_exhausted=false`，删除吞吐可作为完整窗口结果，如果为 `true`，只能说明有限待删数据集被删完，不能当作删除上限。需要重新采 fio 基准时可单独执行 `fio`，或执行完整 `all`。
 
-P-DIO 和 B-DIO 不再由默认 `all` 自动执行。需要验证 direct I/O 未对齐行为时单独运行 `P-DIO`、`B-DIO` 或 `full`；未对齐写失败不会被当成脚本失败。
+需要验证 direct I/O 未对齐行为时单独运行 `P-DIO`、`B-DIO`，或执行完整 `all`；未对齐写失败不会被当成脚本失败。
 
 ## 12. 最终整合日志
 
@@ -453,8 +455,8 @@ $OUT_DIR/final_report.log
 | P-3/P-RWE cache 状态 | `$OUT_DIR/python/P-3-cache_state.txt`、`$OUT_DIR/python/P-RWE-cache_state.txt` |
 | evict 原始日志摘录 | 从 `$OUT_DIR/work_P-*`、`$OUT_DIR/python/P-*-falcon-log` 和 `$OUT_DIR/falcon_logs/P-*` 中摘取 `DiskCache::Cleanup()` / `CleanupForEvict()` / `FalconEvictUnlinkListener stopped` 相关行 |
 | 关键 Python JSON | `$OUT_DIR/python/P-3.json`、`$OUT_DIR/python/P-5.json`、`$OUT_DIR/python/P-RWE.json` |
-| direct I/O 探测 | 只有执行 `P-DIO`、`B-DIO` 或 `full` 时才生成对应 JSON/stderr/stdout |
-| 文件清单 | 默认 `all` 主要是 `$OUT_DIR/python/*.json`；执行 `fio/full` 时还会包含 `$OUT_DIR/fio/*.json` |
+| direct I/O 探测 | 执行 `P-DIO`、`B-DIO` 或完整 `all` 时生成对应 JSON/stderr/stdout |
+| 文件清单 | `python` 主要是 `$OUT_DIR/python/*.json`；执行 `fio/all` 时还会包含 `$OUT_DIR/fio/*.json` |
 
 因此在另一台服务器完成 NVMe 测试后，只需要把 `$OUT_DIR/final_report.log` 发回来即可，不需要分别复制 summary、storage、evict config 和各个 JSON 文件。
 

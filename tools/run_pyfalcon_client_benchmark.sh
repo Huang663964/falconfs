@@ -80,9 +80,10 @@ Usage:
   $0 <scenario>
 
 Scenarios:
-  all    Run Python internal P-1/P-2/P-3/P-5/P-R1/P-RW/P-RWE/P-DIO and fio B-1..B-6 plus fio matrix/direct probes.
+  all    Run Python internal P-LOCK/P-1/P-2/P-3/P-5/P-R1/P-RW/P-RWE/P-DIO and fio B-1..B-6 plus fio matrix/direct probes.
   python Run Python internal cases only.
   fio    Run fio/local baseline B-1..B-6, fio numjobs matrix, and fio direct-unaligned probe.
+  P-LOCK Run DiskCache shared-cache process-lock regression test.
   P-1    Python internal 4-client write-only benchmark.
   P-2    Python internal 4-client unlink-only benchmark.
   P-3    Python internal 4-client write-triggered DiskCache evict benchmark.
@@ -1164,7 +1165,17 @@ PYDIO
     return 0
 }
 
+run_cache_lock_ut() {
+    mkdir -p "$OUT_DIR/unit"
+    log "building DiskCacheUT"
+    ninja -C "$BUILD_DIR" DiskCacheUT
+    "$BUILD_DIR/tests/falcon_store/DiskCacheUT" \
+        --gtest_filter=DiskCacheUT.ProcessLockBlocksExclusiveEvictLockAcrossProcesses \
+        >"$OUT_DIR/unit/P-LOCK.log" 2>"$OUT_DIR/unit/P-LOCK.err"
+}
+
 run_python_group() {
+    run_step P-LOCK run_cache_lock_ut
     run_step P-1 run_case P-1 write_only "$WRITE_THRESHOLD"
     run_step P-2 run_case P-2 unlink_only "$WRITE_THRESHOLD"
     run_step P-3 run_case P-3 create_evict "$EVICT_THRESHOLD"
@@ -1497,6 +1508,7 @@ run_group() {
             ;;
         python) run_python_group ;;
         fio) run_fio_group ;;
+        P-LOCK) run_step P-LOCK run_cache_lock_ut ;;
         P-1) run_step P-1 run_case P-1 write_only "$WRITE_THRESHOLD" ;;
         P-2) run_step P-2 run_case P-2 unlink_only "$WRITE_THRESHOLD" ;;
         P-3) run_step P-3 run_case P-3 create_evict "$EVICT_THRESHOLD" ;;

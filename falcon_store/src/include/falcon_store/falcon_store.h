@@ -74,6 +74,7 @@ class FalconStore {
     /*-----------------util-----------------*/
     int PathToNodeId(std::string &path);
     void AllocNodeId(OpenInstance *openInstance);
+    int EnsureCacheSharedLock(OpenInstance *openInstance);
     bool ConnectionError(int err);
     bool IoError(int err);
 

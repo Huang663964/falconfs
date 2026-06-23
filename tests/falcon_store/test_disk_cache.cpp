@@ -1,4 +1,5 @@
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -6,6 +7,9 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "test_disk_cache.h"
 #include "disk_cache/disk_cache.h"
@@ -714,6 +718,45 @@ TEST_F(DiskCacheUT, PublicEvictAndFailureBranches)
 
     cache.Unpin(pinnedKey);
     EXPECT_EQ(cache.Delete(pinnedKey), 0);
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
+TEST_F(DiskCacheUT, ProcessLockBlocksExclusiveEvictLockAcrossProcesses)
+{
+    std::string cacheRoot = "/tmp/testdir_process_lock";
+    std::filesystem::remove_all(cacheRoot);
+    std::filesystem::create_directories(cacheRoot);
+
+    DiskCache cache;
+    ASSERT_EQ(cache.Start(cacheRoot, 2, 0.0), 0);
+
+    uint64_t key = 12345;
+    int sharedFd = cache.AcquireProcessLock(key, false, false);
+    ASSERT_GE(sharedFd, 0);
+
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        close(sharedFd);
+        int exclusiveFd = cache.AcquireProcessLock(key, true, true);
+        if (exclusiveFd >= 0) {
+            DiskCache::ReleaseProcessLock(exclusiveFd);
+            _exit(2);
+        }
+        int err = -exclusiveFd;
+        _exit((err == EWOULDBLOCK || err == EAGAIN) ? 0 : 3);
+    }
+
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    EXPECT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+
+    DiskCache::ReleaseProcessLock(sharedFd);
+    int exclusiveFd = cache.AcquireProcessLock(key, true, true);
+    ASSERT_GE(exclusiveFd, 0);
+    DiskCache::ReleaseProcessLock(exclusiveFd);
 
     std::filesystem::remove_all(cacheRoot);
 }

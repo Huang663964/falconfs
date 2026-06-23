@@ -268,6 +268,22 @@ void FalconStore::AllocNodeId(OpenInstance *openInstance)
         }
     }
 }
+int FalconStore::EnsureCacheSharedLock(OpenInstance *openInstance)
+{
+    if (openInstance->HasCacheLock()) {
+        return 0;
+    }
+
+    int lockFd = DiskCache::GetInstance().AcquireProcessLock(openInstance->inodeId, false, false);
+    if (lockFd < 0) {
+        FALCON_LOG(LOG_ERROR) << "EnsureCacheSharedLock(): lock cache file failed, path=" << openInstance->path
+                              << ", inode=" << openInstance->inodeId << ", err=" << strerror(-lockFd);
+        return lockFd;
+    }
+    openInstance->SetCacheLockFd(lockFd);
+    return 0;
+}
+
 bool FalconStore::ConnectionError(int err) { return err > 0; }
 
 bool FalconStore::IoError(int err) { return err < 0; }
@@ -639,6 +655,10 @@ int FalconStore::OpenFile(OpenInstance *openInstance)
             std::string fileName = GetFilePath(openInstance->inodeId);
             if (openInstance->nodeFail) {
                 DiskCache::GetInstance().DeleteOldCacheWithNoPin(openInstance->inodeId);
+            }
+            ret = EnsureCacheSharedLock(openInstance);
+            if (ret != 0) {
+                return ret;
             }
             bool localFileOpened = false;
             DiskCacheFindResult cacheLookup = DiskCache::GetInstance().FindWithWait(openInstance->inodeId, true);
@@ -1033,6 +1053,10 @@ int FalconStore::ReadSmallFiles(OpenInstance *openInstance)
 
     if (openInstance->nodeFail) {
         DiskCache::GetInstance().DeleteOldCacheWithNoPin(inodeId);
+    }
+    ret = EnsureCacheSharedLock(openInstance);
+    if (ret != 0) {
+        return ret;
     }
     /* Check if in disk cache. True then pin the file */
     if (DiskCache::GetInstance().Find(inodeId, true)) {

@@ -82,6 +82,8 @@ class DiskCache {
     void FreePreAllocSpace(uint64_t size);
     bool HasFreeSpace();
     void SetEvictListener(DiskCacheEvictListener *listener);
+    int AcquireProcessLock(uint64_t key, bool exclusive, bool nonBlocking);
+    static void ReleaseProcessLock(int fd);
 
   private:
     uint64_t totalCap{0};
