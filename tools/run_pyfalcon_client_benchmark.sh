@@ -1515,6 +1515,7 @@ run_step() {
     FAILED_CASES+=("${case_id}:${status}")
     set +e
     print_python_case_diagnostics "$case_id"
+    cleanup_case_artifacts "$case_id" failure
     stop_idle_server 2>/dev/null
     if [[ "$case_id" == P-* ]]; then
         clean_runtime
@@ -1523,11 +1524,14 @@ run_step() {
     return 0
 }
 
-cleanup_success_case_artifacts() {
+cleanup_case_artifacts() {
     local case_id="$1"
-    [[ "${KEEP_SUCCESS_CASE_LOGS:-0}" == "1" ]] && return 0
-    rm -f "$OUT_DIR/python/${case_id}.log" \
-        "$OUT_DIR/python/${case_id}-idle.log" \
+    local status="${2:-success}"
+    [[ "${KEEP_CASE_ARTIFACTS:-0}" == "1" ]] && return 0
+    if [[ "$status" == "success" ]]; then
+        rm -f "$OUT_DIR/python/${case_id}.log"
+    fi
+    rm -f "$OUT_DIR/python/${case_id}-idle.log" \
         "$OUT_DIR/python/${case_id}-idle.json" \
         "$OUT_DIR/python/${case_id}-meta.log" \
         "$OUT_DIR/python/${case_id}-monitor.log" \
@@ -1608,7 +1612,6 @@ run_case() {
     set +e
     wait "$bench_pid"
     status=$?
-    set -e
     log "case ${case_id} benchmark process exited, status=${status}"
 
     if [[ -n "$monitor_pid" ]]; then
@@ -1617,7 +1620,7 @@ run_case() {
     fi
     stop_idle_server || true
     if [[ "$status" == "0" ]]; then
-        cleanup_success_case_artifacts "$case_id"
+        cleanup_case_artifacts "$case_id" success
     fi
     return "$status"
 }
