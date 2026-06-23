@@ -423,6 +423,17 @@ static int Stat(const char *path, struct stat *stbuf)
     int ret = FalconGetStat(path, stbuf);
     return ret > 0 ? -ErrorCodeToErrno(ret) : ret;
 }
+static int SetLongItem(PyObject* dict, const char* key, long long value)
+{
+    PyObject* pyValue = PyLong_FromLongLong(value);
+    if (pyValue == nullptr) {
+        return -1;
+    }
+    int ret = PyDict_SetItemString(dict, key, pyValue);
+    Py_DECREF(pyValue);
+    return ret;
+}
+
 static PyObject* PyWrapper_Stat(PyObject* self, PyObject* args)
 {
     // T_entry: C++ function entry timestamp (GIL already held by Python)
@@ -448,21 +459,27 @@ static PyObject* PyWrapper_Stat(PyObject* self, PyObject* args)
     int64_t exit_us = steady_clock_now_us();
 
     PyObject* dict = PyDict_New();
+    if (dict == nullptr) {
+        return NULL;
+    }
     if (ret == 0)
     {
-        PyDict_SetItem(dict, PyUnicode_FromString("st_dev"), PyLong_FromLong(stbuf.st_dev));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_ino"), PyLong_FromLong(stbuf.st_ino));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_nlink"), PyLong_FromLong(stbuf.st_nlink));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_mode"), PyLong_FromLong(stbuf.st_mode));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_uid"), PyLong_FromLong(stbuf.st_uid));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_gid"), PyLong_FromLong(stbuf.st_gid));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_rdev"), PyLong_FromLong(stbuf.st_rdev));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_size"), PyLong_FromLong(stbuf.st_size));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_blksize"), PyLong_FromLong(stbuf.st_blksize));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_blocks"), PyLong_FromLong(stbuf.st_blocks));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_atime"), PyLong_FromLong(stbuf.st_atime));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_mtime"), PyLong_FromLong(stbuf.st_mtime));
-        PyDict_SetItem(dict, PyUnicode_FromString("st_ctime"), PyLong_FromLong(stbuf.st_ctime));
+        if (SetLongItem(dict, "st_dev", stbuf.st_dev) != 0 ||
+            SetLongItem(dict, "st_ino", stbuf.st_ino) != 0 ||
+            SetLongItem(dict, "st_nlink", stbuf.st_nlink) != 0 ||
+            SetLongItem(dict, "st_mode", stbuf.st_mode) != 0 ||
+            SetLongItem(dict, "st_uid", stbuf.st_uid) != 0 ||
+            SetLongItem(dict, "st_gid", stbuf.st_gid) != 0 ||
+            SetLongItem(dict, "st_rdev", stbuf.st_rdev) != 0 ||
+            SetLongItem(dict, "st_size", stbuf.st_size) != 0 ||
+            SetLongItem(dict, "st_blksize", stbuf.st_blksize) != 0 ||
+            SetLongItem(dict, "st_blocks", stbuf.st_blocks) != 0 ||
+            SetLongItem(dict, "st_atime", stbuf.st_atime) != 0 ||
+            SetLongItem(dict, "st_mtime", stbuf.st_mtime) != 0 ||
+            SetLongItem(dict, "st_ctime", stbuf.st_ctime) != 0) {
+            Py_DECREF(dict);
+            return NULL;
+        }
     }
 
     // Return 4-tuple: (ret, dict, entry_us, exit_us)
@@ -552,8 +569,13 @@ static PyObject* PyWrapper_ReadDir(PyObject* self, PyObject* args)
     {
         PyObject* list = (PyObject*)buf;
         mode_t mode = stbuf ? stbuf->st_mode : (S_IFDIR | 0755);
-        PyList_Append(list, Py_BuildValue("(si)", name, mode));
-        return 0;
+        PyObject* item = Py_BuildValue("(si)", name, mode);
+        if (item == nullptr) {
+            return -1;
+        }
+        int ret = PyList_Append(list, item);
+        Py_DECREF(item);
+        return ret;
     };
     int ret = 0;
     int offset = 0;
@@ -696,7 +718,7 @@ public:
         PyErr_SetString(PyExc_RuntimeError, exceptionInfo);
         return NULL;
     }
-    ~AsyncResultBase()
+    virtual ~AsyncResultBase()
     {
         if (exceptionInfo)
             free(exceptionInfo);
