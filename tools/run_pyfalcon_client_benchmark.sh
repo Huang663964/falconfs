@@ -1522,6 +1522,18 @@ run_step() {
     return 0
 }
 
+cleanup_success_case_artifacts() {
+    local case_id="$1"
+    [[ "${KEEP_SUCCESS_CASE_LOGS:-0}" == "1" ]] && return 0
+    rm -f "$OUT_DIR/python/${case_id}.log" \
+        "$OUT_DIR/python/${case_id}-idle.log" \
+        "$OUT_DIR/python/${case_id}-idle.json" \
+        "$OUT_DIR/python/${case_id}-meta.log" \
+        "$OUT_DIR/python/${case_id}-monitor.log" \
+        "$OUT_DIR/python/${case_id}-config.json"
+    rm -rf "$OUT_DIR/python/${case_id}-falcon-log"
+}
+
 run_case() {
     local case_id="$1"
     local mode="$2"
@@ -1603,6 +1615,9 @@ run_case() {
         wait "$monitor_pid" 2>/dev/null || true
     fi
     stop_idle_server || true
+    if [[ "$status" == "0" ]]; then
+        cleanup_success_case_artifacts "$case_id"
+    fi
     return "$status"
 }
 
