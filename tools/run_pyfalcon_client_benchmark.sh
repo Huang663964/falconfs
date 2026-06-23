@@ -92,6 +92,7 @@ Scenarios:
   P-R1   Python internal read-only benchmark.
   P-RW   Python internal concurrent read + write benchmark without evict.
   P-RWE  Python internal concurrent read + write + DiskCache evict benchmark.
+  pwe    Shortcut for P-RWE only.
   P-DIO  Python internal O_DIRECT alignment probe.
   B-1    fio single-file direct write baseline.
   B-2    fio single-file direct read baseline.
@@ -1636,7 +1637,7 @@ run_group() {
         P-5) run_step P-5 run_case P-5 concurrent_unlink "$WRITE_THRESHOLD" ;;
         P-R1) run_step P-R1 run_case P-R1 read_only "$WRITE_THRESHOLD" ;;
         P-RW) run_step P-RW run_case P-RW read_write "$WRITE_THRESHOLD" ;;
-        P-RWE) run_step P-RWE run_case P-RWE read_write_evict "$EVICT_THRESHOLD" ;;
+        P-RWE|PWE|pwe) run_step P-RWE run_case P-RWE read_write_evict "$EVICT_THRESHOLD" ;;
         P-DIO) run_step P-DIO run_case P-DIO direct_unaligned "$WRITE_THRESHOLD" ;;
         B-1|B-2|B-3|B-4|B-5|B-6|B-DIO|B-MATRIX) run_step "$1" run_fio_case "$1" ;;
         fio-matrix) run_step B-MATRIX run_fio_matrix ;;
