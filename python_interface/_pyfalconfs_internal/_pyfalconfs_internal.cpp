@@ -800,6 +800,8 @@ static PyObject* AsyncState_iternext(PyObject* self)
 
     std::unique_ptr<AsyncResultBase> result = state->future.get();
     PyObject* pyResult = result->GeneratePyObject();
+    if (pyResult == nullptr)
+        return nullptr;
     PyErr_SetObject(PyExc_StopIteration, pyResult);
     Py_DECREF(pyResult);
     return NULL;
@@ -1020,51 +1022,53 @@ static PyObject* PyWrapper_AsyncPutNoWait(PyObject* self, PyObject* args)
     PyObject* memobj = nullptr;
     if (!PyArg_ParseTuple(args, "sy*iiO", &path, &buffer, &size, &offset, &memobj))
         return nullptr;
+    if (size < 0 || buffer.len < size)
+    {
+        PyBuffer_Release(&buffer);
+        PyErr_SetString(PyExc_RuntimeError, "the buffer is not enough for writing data.");
+        return nullptr;
+    }
 
-    // 0-copy: only take the raw pointer, no memcpy
-    char* dataPtr = (char*)buffer.buf;
     std::string pathStr(path);
+    Py_INCREF(memobj);
 
-    // Keep both Python objects alive until async task completes
-    PyObject* bufObj = buffer.obj;
-    Py_INCREF(bufObj);   // prevents memoryview from being GC'd
-    Py_INCREF(memobj);   // prevents MemoryObj from being GC'd
+    try {
+        AsyncTaskThreadPoolForPy->DispatchFireAndForget(
+            TASK_PRIORITY_PUT,
+            [pathStr, buffer, size, offset, memobj]() mutable -> void {
+                uint64_t fd = UINT64_MAX;
+                try {
+                    int ret = Create(pathStr.c_str(), O_CREAT | O_WRONLY | O_TRUNC, fd);
+                    if (ret != 0) goto done;
 
-    // Release the buffer view (we already have the raw pointer)
-    PyBuffer_Release(&buffer);
+                    ret = Write(pathStr.c_str(), fd, static_cast<char*>(buffer.buf), size, offset);
+                    if (ret != 0) {
+                        Close(pathStr.c_str(), fd);
+                        goto done;
+                    }
 
-    AsyncTaskThreadPoolForPy->DispatchFireAndForget(
-        TASK_PRIORITY_PUT,
-        [pathStr, dataPtr, size, offset, bufObj, memobj]() -> void {
-            uint64_t fd = UINT64_MAX;
-            try {
-                int ret = Create(pathStr.c_str(), O_CREAT | O_WRONLY | O_TRUNC, fd);
-                if (ret != 0) goto done;
-
-                ret = Write(pathStr.c_str(), fd, dataPtr, size, offset);
-                if (ret != 0) {
+                    ret = Flush(pathStr.c_str(), fd);
                     Close(pathStr.c_str(), fd);
-                    goto done;
+                } catch (...) {
+                    if (fd != UINT64_MAX)
+                        Close(pathStr.c_str(), fd);
                 }
 
-                ret = Flush(pathStr.c_str(), fd);
-                Close(pathStr.c_str(), fd);
-            } catch (...) {
-                if (fd != UINT64_MAX)
-                    Close(pathStr.c_str(), fd);
+            done:
+                PyGILState_STATE gstate = PyGILState_Ensure();
+                PyBuffer_Release(&buffer);
+                PyObject* r = PyObject_CallMethod(memobj, "ref_count_down", NULL);
+                Py_XDECREF(r);
+                Py_DECREF(memobj);
+                PyGILState_Release(gstate);
             }
-
-        done:
-            // Cleanup: acquire GIL to release Python references
-            PyGILState_STATE gstate = PyGILState_Ensure();
-            // Call ref_count_down to allow memory pool to reclaim
-            PyObject* r = PyObject_CallMethod(memobj, "ref_count_down", NULL);
-            Py_XDECREF(r);
-            Py_DECREF(memobj);
-            Py_DECREF(bufObj);
-            PyGILState_Release(gstate);
-        }
-    );
+        );
+    } catch (...) {
+        Py_DECREF(memobj);
+        PyBuffer_Release(&buffer);
+        PyErr_SetString(PyExc_RuntimeError, "AsyncPutNoWait dispatch failed.");
+        return nullptr;
+    }
 
     Py_RETURN_NONE;
 }
