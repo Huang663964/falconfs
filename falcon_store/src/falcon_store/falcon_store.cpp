@@ -7,8 +7,10 @@
 #include <cstring>
 #include <limits>
 #include <sstream>
+#include <atomic>
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "conf/falcon_property_key.h"
 #include "connection/node.h"
@@ -50,6 +52,24 @@ bool RecoverCacheFileOnDisk(OpenInstance *openInstance, const std::string &fileN
         << ", is_remote_call=" << openInstance->isRemoteCall;
     FALCON_LOG(LOG_WARNING) << oss.str();
     return true;
+}
+
+std::string MakeCacheTmpFileName(const std::string &fileName)
+{
+    static std::atomic<uint64_t> tmpSeq{0};
+    return fileName + ".tmp." + std::to_string(getpid()) + "." + std::to_string(tmpSeq.fetch_add(1));
+}
+
+int CommitCacheTmpFile(const std::string &tmpFileName, const std::string &fileName)
+{
+    if (rename(tmpFileName.c_str(), fileName.c_str()) != 0) {
+        int err = errno;
+        FALCON_LOG(LOG_ERROR) << "Commit cache tmp file failed, tmp=" << tmpFileName
+                              << ", file=" << fileName << ", err=" << strerror(err);
+        (void)std::remove(tmpFileName.c_str());
+        return -err;
+    }
+    return 0;
 }
 
 void LogOpenFileCacheMiss(OpenInstance *openInstance, const std::string &fileName, const char *reason)
@@ -796,10 +816,12 @@ int FalconStore::DownLoadFromStorage(OpenInstance *openInstance, bool isSync, bo
     }
 
     /* here cache file must not exist */
-    auto fd = open(fileName.c_str(), O_WRONLY | O_CREAT, 0755);
+    std::string tmpFileName = MakeCacheTmpFileName(fileName);
+    auto fd = open(tmpFileName.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (fd < 0) {
         int err = errno;
-        FALCON_LOG(LOG_ERROR) << "DownLoadFromStorage(): Create local file for loading failed: " << strerror(err);
+        FALCON_LOG(LOG_ERROR) << "DownLoadFromStorage(): Create local tmp file for loading failed, tmp="
+                              << tmpFileName << ", err=" << strerror(err);
         DiskCache::GetInstance().FreePreAllocSpace(fileSize);
         return -err;
     }
@@ -816,12 +838,17 @@ int FalconStore::DownLoadFromStorage(OpenInstance *openInstance, bool isSync, bo
         close(fd);
         if (size < 0) {
             FALCON_LOG(LOG_ERROR) << "DownLoadFromStorage(): Loading file from obs failed";
-            if (std::remove(fileName.c_str()) != 0) {
+            if (std::remove(tmpFileName.c_str()) != 0) {
                 FALCON_LOG(LOG_ERROR) << "DownLoadFromStorage(): Delete obs tmp file failed" << strerror(errno);
             }
             size = -EIO;
         } else {
-            DiskCache::GetInstance().InsertAndUpdate(inodeId, fileSize, isSync, path);
+            int commitRet = CommitCacheTmpFile(tmpFileName, fileName);
+            if (commitRet != 0) {
+                size = commitRet;
+            } else {
+                DiskCache::GetInstance().InsertAndUpdate(inodeId, fileSize, isSync, path);
+            }
         }
         DiskCache::GetInstance().FreePreAllocSpace(fileSize);
         return size < 0 ? size : 0;
@@ -1153,25 +1180,32 @@ int FalconStore::WriteToFileAsync(uint64_t inodeId, const std::string &path, std
         return -ENOSPC;
     }
 
-    /* Cache file must not exist. Create it */
-    auto fd = open(fileName.c_str(), O_WRONLY | O_CREAT, 0755);
+    /* Cache file must not exist. Create a tmp file and publish it with rename after the write completes. */
+    std::string tmpFileName = MakeCacheTmpFileName(fileName);
+    auto fd = open(tmpFileName.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (fd < 0) {
         int err = errno;
-        FALCON_LOG(LOG_ERROR) << "WriteToFileAsync(): open file failed : " << fileName << ", " << strerror(errno);
+        FALCON_LOG(LOG_ERROR) << "WriteToFileAsync(): open tmp file failed, tmp=" << tmpFileName
+                              << ", file=" << fileName << ", err=" << strerror(err);
         DiskCache::GetInstance().FreePreAllocSpace(bufSize);
         return -err;
     }
 
     /* Async write the file to local file */
     ThreadTask task;
-    task.task = [fd, buf, bufSize, inodeId, path, lockerPtr]() {
+    task.task = [fd, buf, bufSize, inodeId, path, fileName, tmpFileName, lockerPtr]() {
         FalconStats::GetInstance().stats[BLOCKCACHE_WRITE] += bufSize;
-        int retSize = pwrite(fd, buf.get(), bufSize, 0);
+        ssize_t retSize = pwrite(fd, buf.get(), bufSize, 0);
         int err = errno;
         close(fd);
-        if (retSize < 0) {
-            FALCON_LOG(LOG_ERROR) << "WriteToFileAsync(): pwrite failed : " << strerror(err);
-        } else {
+        if (retSize != static_cast<ssize_t>(bufSize)) {
+            if (retSize < 0) {
+                FALCON_LOG(LOG_ERROR) << "WriteToFileAsync(): pwrite failed: " << strerror(err);
+            } else {
+                FALCON_LOG(LOG_ERROR) << "WriteToFileAsync(): short write, expected=" << bufSize << ", actual=" << retSize;
+            }
+            (void)std::remove(tmpFileName.c_str());
+        } else if (CommitCacheTmpFile(tmpFileName, fileName) == 0) {
             DiskCache::GetInstance().InsertAndUpdate(inodeId, bufSize, false, path);
         }
         DiskCache::GetInstance().FreePreAllocSpace(bufSize);
@@ -1294,10 +1328,12 @@ int FalconStore::DownLoadFromStorageForBrpc(uint64_t inodeId,
     }
 
     /* here cache file must not exist */
-    auto fd = open(fileName.c_str(), O_WRONLY | O_CREAT, 0755);
+    std::string tmpFileName = MakeCacheTmpFileName(fileName);
+    auto fd = open(tmpFileName.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (fd < 0) {
         int err = errno;
-        FALCON_LOG(LOG_ERROR) << "DownLoadFromStorage(): Create local file for loading failed: " << strerror(err);
+        FALCON_LOG(LOG_ERROR) << "DownLoadFromStorage(): Create local tmp file for loading failed, tmp="
+                              << tmpFileName << ", err=" << strerror(err);
         DiskCache::GetInstance().FreePreAllocSpace(bufSize);
         return -err;
     }
@@ -1314,12 +1350,17 @@ int FalconStore::DownLoadFromStorageForBrpc(uint64_t inodeId,
         close(fd);
         if (size < 0) {
             FALCON_LOG(LOG_ERROR) << "DownLoadFromStorage(): Loading file from obs failed";
-            if (std::remove(fileName.c_str()) != 0) {
+            if (std::remove(tmpFileName.c_str()) != 0) {
                 FALCON_LOG(LOG_ERROR) << "DownLoadFromStorage(): Delete obs tmp file failed" << strerror(errno);
             }
             size = -EIO;
         } else {
-            DiskCache::GetInstance().InsertAndUpdate(inodeId, bufSize, isSync, path);
+            int commitRet = CommitCacheTmpFile(tmpFileName, fileName);
+            if (commitRet != 0) {
+                size = commitRet;
+            } else {
+                DiskCache::GetInstance().InsertAndUpdate(inodeId, bufSize, isSync, path);
+            }
         }
         DiskCache::GetInstance().FreePreAllocSpace(bufSize);
         return size < 0 ? size : 0;

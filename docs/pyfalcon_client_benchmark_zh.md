@@ -155,7 +155,8 @@ bash tools/run_pyfalcon_client_benchmark.sh B-DIO
 | `CLIENTS` | 4 | 每组 Python client 进程数 |
 | `FILES` | 6000 | 写入文件数 |
 | `READ_FILES` | `$FILES` | P-R1 的读数据集文件数 |
-| `PINNED_READ_FILES` | `256` | P-RW/P-RWE 每个 reader 预打开并 pin 住的读热集文件数 |
+| `PINNED_READ_FILES` | `256` | P-RW/P-RWE 每个 reader 预打开并 pin 住的读热集文件数；默认所有 reader 读同一个热集目录 |
+| `SHARED_PINNED_READ_DIR` | `1` | P-RW/P-RWE 默认让多个 reader client 打开同一个目录下按 reader 分片的热集文件；设为 `0` 时回到每 reader 独立目录 |
 | `MIXED_DURATION_SEC` | `120` | P-5/P-RW/P-RWE 固定时长混合压力窗口 |
 | `HOT_READ_WINDOW` | `1024` | 保留给历史 hot-window 风险验证；正式 P-RW/P-RWE 不使用 |
 | `HOT_READ_LAG` | `128` | 保留给历史 hot-window 风险验证；正式 P-RW/P-RWE 不使用 |
@@ -316,7 +317,7 @@ deleter.files_per_sec
 deleter.mib_per_sec
 ```
 
-P-RW/P-RWE 会先预打开 `PINNED_READ_FILES * CLIENTS` 个读热集文件；lease 方案下这些打开文件会持有 metadata lease，并在 case 收尾 close 时集中释放。NVMe 正式测试可以保留默认热集规模，本机或非 NVMe 完整性验证如果出现 metadata brpc timeout，可临时设置 `PINNED_READ_FILES=64 RESULT_TIMEOUT_SEC=120` 先验证脚本完整链路。
+P-RW/P-RWE 默认 `SHARED_PINNED_READ_DIR=1`，会在同一个共享目录下创建 `PINNED_READ_FILES * CLIENTS` 个读热集文件，每个 reader client 打开这个目录下自己的 `PINNED_READ_FILES` 个文件分片；lease 方案下这些打开文件会持有 metadata lease，并在 case 收尾 close 时集中释放。设为 `SHARED_PINNED_READ_DIR=0` 时，脚本才会创建 `PINNED_READ_FILES * CLIENTS` 个分 reader 热集文件。NVMe 正式测试可以保留默认热集规模，本机或非 NVMe 完整性验证如果出现 metadata brpc timeout，可临时设置 `PINNED_READ_FILES=64 RESULT_TIMEOUT_SEC=120` 先验证脚本完整链路。
 
 P-RW/P-RWE 的总览表中，writer 写吞吐使用 active 口径，即 `writer` 实际写入文件数除以 `writer.max_worker_elapsed_sec`。这是因为 writer 可能提前达到 `max_files` 并停止，不能用 120s 混合窗口平均值代表真实写能力。JSON 明细中会同时保留：
 
@@ -431,7 +432,7 @@ REQUIRE_NVME=0 BENCHMARK_ROOT=/tmp/falconfs_local_benchmark CLIENTS=2 FILES=64 R
 BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 READ_FILES=6000 UNLINK_FILES=6000 P5_UNLINK_FILES=200000 WAIT_SEC=45 MIXED_DURATION_SEC=120 bash tools/run_pyfalcon_client_benchmark.sh python
 ```
 
-混合场景判断顺序：先看 P-R1/P-1 的 Falcon 纯读纯写，再看固定时长 P-5/P-RW 的写删、读写基线，最后用固定时长 P-RWE 对比 P-RW，评估 evict 对已打开读热集和持续写入的额外影响。P-RW/P-RWE 的 JSON 中必须确认 `timed=true`、`read_pattern=pinned_read_set`；总览写吞吐看 active 口径，窗口平均值只作为固定时长占用程度参考；P-5 如果 `delete_dataset_exhausted=false`，删除吞吐可作为完整窗口结果，如果为 `true`，只能说明有限待删数据集被删完，不能当作删除上限。需要重新采 fio 基准时可单独执行 `fio`，或执行完整 `all`。
+混合场景判断顺序：先看 P-R1/P-1 的 Falcon 纯读纯写，再看固定时长 P-5/P-RW 的写删、读写基线，最后用固定时长 P-RWE 对比 P-RW，评估 evict 对已打开读热集和持续写入的额外影响。P-RW/P-RWE 的 JSON 中必须确认 `timed=true`、默认共享目录口径下 `read_pattern=shared_pinned_read_set` 且 `shared_pinned_read_dir=true`；总览写吞吐看 active 口径，窗口平均值只作为固定时长占用程度参考；P-5 如果 `delete_dataset_exhausted=false`，删除吞吐可作为完整窗口结果，如果为 `true`，只能说明有限待删数据集被删完，不能当作删除上限。需要重新采 fio 基准时可单独执行 `fio`，或执行完整 `all`。
 
 需要验证 direct I/O 未对齐行为时单独运行 `P-DIO`、`B-DIO`，或执行完整 `all`；未对齐写失败不会被当成脚本失败。
 

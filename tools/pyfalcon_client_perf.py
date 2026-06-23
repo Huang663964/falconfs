@@ -257,7 +257,7 @@ def worker_read_timed(args, role, client_id, base_dir, files, start_event, stop_
 
 
 
-def worker_read_pinned_timed(args, role, client_id, base_dir, files, counters, start_event, stop_event, ready_q, result_q):
+def worker_read_pinned_timed(args, role, client_id, base_dir, files, start_index, counters, start_event, stop_event, ready_q, result_q):
     client = None
     opened = []
     try:
@@ -265,7 +265,7 @@ def worker_read_pinned_timed(args, role, client_id, base_dir, files, counters, s
             raise RuntimeError("pinned timed read requires at least one prepared file per reader")
         client = make_client(args, role, client_id)
         for i in range(files):
-            path = f"{base_dir}/f_{i:08d}"
+            path = f"{base_dir}/f_{start_index + i:08d}"
             ret, fd = client.Open(path, os.O_RDONLY)
             if ret != 0:
                 raise RuntimeError(f"Open pinned read file {path} failed: {ret}, fd={fd}, {describe_path_state(client, path)}")
@@ -691,9 +691,20 @@ def build_hot_read_jobs(args, role, writer_prefix, clients):
     return [(worker_read_hot_timed, (args, role, client_id, writer_prefix, clients)) for client_id in range(clients)]
 
 
+def build_shared_pinned_prepare_jobs(args, role, base_prefix, total_files):
+    shared_dir = f"{args.dir}_{base_prefix}_shared"
+    return [(worker_write, (args, role, 0, shared_dir, total_files))]
+
+
 def build_pinned_read_jobs(args, role, base_prefix, files_per_client, clients):
+    if args.shared_pinned_read_dir:
+        shared_dir = f"{args.dir}_{base_prefix}_shared"
+        return [
+            (worker_read_pinned_timed, (args, role, client_id, shared_dir, files_per_client, client_id * files_per_client))
+            for client_id in range(clients)
+        ]
     return [
-        (worker_read_pinned_timed, (args, role, client_id, f"{args.dir}_{base_prefix}_{client_id}", files_per_client))
+        (worker_read_pinned_timed, (args, role, client_id, f"{args.dir}_{base_prefix}_{client_id}", files_per_client, 0))
         for client_id in range(clients)
     ]
 
@@ -790,14 +801,18 @@ def run_read_write(args):
     timed = args.duration_sec > 0
     if timed:
         pinned_total_files = args.pinned_read_files * args.clients
-        prepare_elapsed, prepare_results = run_processes(
-            build_write_jobs(args, "prepare_read", "pinned_read", pinned_total_files, args.clients)
+        prepare_clients = 1 if args.shared_pinned_read_dir else args.clients
+        prepare_jobs = (
+            build_shared_pinned_prepare_jobs(args, "prepare_read", "pinned_read", pinned_total_files)
+            if args.shared_pinned_read_dir
+            else build_write_jobs(args, "prepare_read", "pinned_read", pinned_total_files, prepare_clients)
         )
+        prepare_elapsed, prepare_results = run_processes(prepare_jobs)
         prepare = summarize_group(prepare_results, prepare_elapsed, args.file_size)
         read_jobs = build_pinned_read_jobs(args, "reader", "pinned_read", args.pinned_read_files, args.clients)
         write_jobs = build_hot_write_jobs(args, "writer", "write", args.files, args.clients)
         mixed_elapsed, mixed_results = run_processes_timed_hot(read_jobs, write_jobs, args.duration_sec)
-        read_pattern = "pinned_read_set"
+        read_pattern = "shared_pinned_read_set" if args.shared_pinned_read_dir else "pinned_read_set"
     else:
         prepare_elapsed, prepare_results = run_processes(
             build_write_jobs(args, "prepare_read", "read", args.read_files, args.clients)
@@ -820,6 +835,7 @@ def run_read_write(args):
         "hot_read_lag": args.hot_read_lag if timed else 0,
         "hot_read_min_files": args.hot_read_min_files if timed else 0,
         "pinned_read_files_per_client": args.pinned_read_files if timed else 0,
+        "shared_pinned_read_dir": bool(args.shared_pinned_read_dir) if timed else False,
         "reader_clients": args.clients,
         "writer_clients": args.clients,
         "total_processes": args.clients * 2,
@@ -946,6 +962,8 @@ def main():
                         help="Readers wait until each writer has at least this many readable files after lag; 0 uses hot-read-window.")
     parser.add_argument("--pinned-read-files", type=int, default=256,
                         help="For timed read/write cases, each reader opens this many prepared files before writers start.")
+    parser.add_argument("--shared-pinned-read-dir", action="store_true",
+                        help="For timed read/write cases, all readers open the same prepared directory.")
     parser.add_argument("--hot-read-retry-sleep-sec", type=float, default=0.001,
                         help="Sleep between hot-read retries while waiting for enough writer files or after a read error.")
     parser.add_argument("--dir", required=True)

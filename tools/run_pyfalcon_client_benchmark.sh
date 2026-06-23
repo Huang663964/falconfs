@@ -28,6 +28,7 @@ CLIENTS="${CLIENTS:-4}"
 FILES="${FILES:-6000}"
 READ_FILES="${READ_FILES:-$FILES}"
 PINNED_READ_FILES="${PINNED_READ_FILES:-256}"
+SHARED_PINNED_READ_DIR="${SHARED_PINNED_READ_DIR:-1}"
 UNLINK_FILES="${UNLINK_FILES:-6000}"
 P5_UNLINK_FILES="${P5_UNLINK_FILES:-200000}"
 P5_WRITE_FILES="${P5_WRITE_FILES:-$P5_UNLINK_FILES}"
@@ -109,6 +110,7 @@ Environment overrides:
   FILES=${FILES}
   READ_FILES=${READ_FILES}
   PINNED_READ_FILES=${PINNED_READ_FILES}
+  SHARED_PINNED_READ_DIR=${SHARED_PINNED_READ_DIR}
   UNLINK_FILES=${UNLINK_FILES}
   P5_UNLINK_FILES=${P5_UNLINK_FILES}
   P5_WRITE_FILES=${P5_WRITE_FILES}
@@ -233,6 +235,7 @@ write_storage_info() {
         echo "p5_prepare_max_avail_ratio=$P5_PREPARE_MAX_AVAIL_RATIO"
         echo "read_files=$READ_FILES"
         echo "pinned_read_files=$PINNED_READ_FILES"
+        echo "shared_pinned_read_dir=$SHARED_PINNED_READ_DIR"
         echo "mixed_duration_sec=$MIXED_DURATION_SEC"
         echo "hot_read_window=$HOT_READ_WINDOW"
         echo "hot_read_lag=$HOT_READ_LAG"
@@ -1211,6 +1214,7 @@ write_final_report() {
         echo "files=$FILES"
         echo "read_files=$READ_FILES"
         echo "pinned_read_files=$PINNED_READ_FILES"
+        echo "shared_pinned_read_dir=$SHARED_PINNED_READ_DIR"
         echo "unlink_files=$UNLINK_FILES"
         echo "p5_unlink_files=$P5_UNLINK_FILES"
         echo "p5_write_files=$P5_WRITE_FILES"
@@ -1331,7 +1335,7 @@ write_case_failure_diagnostics() {
         echo "generated_at=$(date '+%F %T')"
         echo "out_dir=$OUT_DIR"
         echo "cache_root=$CACHE_ROOT"
-        echo "clients=$CLIENTS files=$FILES read_files=$READ_FILES pinned_read_files=$PINNED_READ_FILES file_size=$FILE_SIZE"
+        echo "clients=$CLIENTS files=$FILES read_files=$READ_FILES pinned_read_files=$PINNED_READ_FILES shared_pinned_read_dir=$SHARED_PINNED_READ_DIR file_size=$FILE_SIZE"
         echo "mixed_duration_sec=$MIXED_DURATION_SEC max_local_disk_size_gib=$MAX_LOCAL_DISK_SIZE evict_threshold=$EVICT_THRESHOLD"
         echo
 
@@ -1523,9 +1527,13 @@ run_case() {
     local mode="$2"
     local threshold="$3"
     local status case_files case_unlink_files case_threshold case_config case_log monitor_log bench_pid monitor_pid
+    local -a shared_pinned_read_arg=()
     case_files="$FILES"
     case_unlink_files="$UNLINK_FILES"
     case_threshold="$threshold"
+    if [[ "$SHARED_PINNED_READ_DIR" == "1" ]]; then
+        shared_pinned_read_arg=(--shared-pinned-read-dir)
+    fi
     ensure_binary || return 1
     clean_runtime || return 1
     if [[ "$mode" == "concurrent_unlink" ]]; then
@@ -1569,6 +1577,7 @@ run_case() {
             --hot-read-window "$HOT_READ_WINDOW" \
             --hot-read-lag "$HOT_READ_LAG" \
             --hot-read-min-files "$HOT_READ_MIN_FILES" \
+            "${shared_pinned_read_arg[@]}" \
             --dir "/py_${case_id}" \
             --workspace "$OUT_DIR/work_${case_id}" \
             --config "$case_config" \
