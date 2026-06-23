@@ -334,6 +334,7 @@ static PyObject* PyWrapper_Read(PyObject* self, PyObject* args)
         return NULL;
     if (buffer.len < size)
     {
+        PyBuffer_Release(&buffer);
         PyErr_SetString(PyExc_RuntimeError, "the buffer is not enough for requested data.");
         return NULL;
     }
@@ -345,10 +346,11 @@ static PyObject* PyWrapper_Read(PyObject* self, PyObject* args)
     }
     catch (const std::exception& e)
     {
+        PyBuffer_Release(&buffer);
         PyErr_SetString(PyExc_RuntimeError, e.what());
         return NULL;
     }
-    
+    PyBuffer_Release(&buffer);
     return PyLong_FromLong(ret);
 }
 
@@ -375,6 +377,7 @@ static PyObject* PyWrapper_Write(PyObject* self, PyObject* args)
         return NULL;
     if (buffer.len < size)
     {
+        PyBuffer_Release(&buffer);
         PyErr_SetString(PyExc_RuntimeError, "the buffer is not enough for writing data.");
         return NULL;
     }
@@ -386,10 +389,11 @@ static PyObject* PyWrapper_Write(PyObject* self, PyObject* args)
     }
     catch (const std::exception& e)
     {
+        PyBuffer_Release(&buffer);
         PyErr_SetString(PyExc_RuntimeError, e.what());
         return NULL;
     }
-    
+    PyBuffer_Release(&buffer);
     return PyLong_FromLong(ret);
 }
 
