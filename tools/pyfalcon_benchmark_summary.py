@@ -110,6 +110,9 @@ def add_cleanup(bucket, files, size, failed, scanned, cleanup_us, remove_us):
 def iter_text_files(root):
     if not root.exists():
         return
+    if root.is_file():
+        yield root
+        return
     for path in root.rglob("*"):
         if not path.is_file():
             continue
@@ -245,9 +248,9 @@ def append_evict_section(lines, evict_stats):
     lines.append("## DiskCache evict 删除性能与时延")
     lines.append("")
     if evict_stats["combined"]["files"] == 0 and not evict_stats["unlink_stats"]:
-        lines.append("未在输出目录中采集到 `DiskCache::CleanupForEvict()` / `DiskCache::Cleanup()` / `FalconEvictUnlinkListener stopped` 日志。")
+        lines.append("未在输出目录中采集到 `DiskCache::CleanupForEvict()` / `DiskCache::Cleanup()` / `FalconEvictUnlinkListener stopped` evict 事件日志。")
         lines.append("")
-        lines.append("说明：Python internal API 会把 client 侧 Falcon 日志写到 `$OUT_DIR/work_*` 下；summary 必须在清理 `work_*` 之前生成，才能统计 evict 删除吞吐。")
+        lines.append("说明：脚本会在成功清理临时日志前，把命中的 evict 事件行保留到 `$OUT_DIR/evict_logs/`；没有事件时只展示读写性能。")
         return
 
     lines.append(table(
@@ -336,6 +339,26 @@ def fmt_ms(value):
     return f"{float(value) * 1000.0:.2f}ms" if value is not None else "N/A"
 
 
+def active_rate(group, file_size):
+    files = group.get("files")
+    if files is None:
+        files = sum(item.get("files", 0) for item in group.get("per_client", []))
+    elapsed = group.get("max_worker_elapsed_sec") or group.get("elapsed_sec")
+    try:
+        files = float(files)
+        elapsed = float(elapsed)
+        file_size = float(file_size)
+    except (TypeError, ValueError):
+        return None, None
+    if elapsed <= 0:
+        return None, None
+    return files / elapsed, files * file_size / elapsed / 1048576.0
+
+
+def fmt_active_rate(group, file_size):
+    return fmt_rate(*active_rate(group, file_size))
+
+
 def fmt_rate(files_per_sec, mib_per_sec):
     if files_per_sec is None and mib_per_sec is None:
         return "N/A"
@@ -400,7 +423,7 @@ def python_row(case_id, data, evict_stats=None):
             name,
             str(data.get("total_processes", data.get("clients", "N/A"))),
             fmt_rate(reader.get("files_per_sec"), reader.get("mib_per_sec")),
-            fmt_rate(writer.get("files_per_sec"), writer.get("mib_per_sec")),
+            fmt_active_rate(writer, data.get("file_size_bytes")),
             evict,
             fmt_sec(data.get("mixed_elapsed_sec")),
             str(error),
@@ -496,6 +519,8 @@ def python_detail_rows(case_id, data):
             [case_id, "reader.mib_per_sec", fmt_num(reader.get("mib_per_sec"), 6)],
             [case_id, "writer.files_per_sec", fmt_num(writer.get("files_per_sec"), 6)],
             [case_id, "writer.mib_per_sec", fmt_num(writer.get("mib_per_sec"), 6)],
+            [case_id, "writer.active_files_per_sec", fmt_num(active_rate(writer, data.get("file_size_bytes"))[0], 6)],
+            [case_id, "writer.active_mib_per_sec", fmt_num(active_rate(writer, data.get("file_size_bytes"))[1], 6)],
             [case_id, "reader.latency_p99", fmt_ms(reader.get("latency_p99_sec"))],
             [case_id, "writer.latency_p99", fmt_ms(writer.get("latency_p99_sec"))],
             [case_id, "reader.operation_error_count", fmt_num(reader.get("operation_error_count"), 0)],
@@ -641,10 +666,10 @@ def main():
 
     python_data = {case: load_json(python_dir / f"{case}.json") for case in PYTHON_CASES}
     fio_data = {case: load_json(fio_dir / f"{case}.json") for case in FIO_CASES}
-    evict_stats = parse_evict_stats(out_dir)
+    evict_stats = parse_evict_stats(out_dir / "evict_logs") if (out_dir / "evict_logs").exists() else parse_evict_stats(out_dir)
     evict_stats_by_case = {
-        "P-3": parse_evict_stats(out_dir / "work_P-3"),
-        "P-RWE": parse_evict_stats(out_dir / "work_P-RWE"),
+        "P-3": parse_evict_stats(out_dir / "evict_logs" / "P-3.log") if (out_dir / "evict_logs" / "P-3.log").exists() else parse_evict_stats(out_dir / "work_P-3"),
+        "P-RWE": parse_evict_stats(out_dir / "evict_logs" / "P-RWE.log") if (out_dir / "evict_logs" / "P-RWE.log").exists() else parse_evict_stats(out_dir / "work_P-RWE"),
     }
 
     lines = []
@@ -674,6 +699,8 @@ def main():
         ["编号", "场景", "并发", "读吞吐", "写吞吐", "删除/evict 吞吐", "主要耗时", "错误"],
         [python_row(case, python_data[case], evict_stats_by_case.get(case, evict_stats) if case in ("P-3", "P-RWE") else None) for case in PYTHON_CASES],
     ))
+    lines.append("")
+    lines.append("说明：P-RW/P-RWE 总览写吞吐使用 writer.max_worker_elapsed_sec active 口径；窗口平均值保留在 Python JSON 明细的 writer.files_per_sec。")
     detail_rows = []
     for case in PYTHON_CASES:
         detail_rows.extend(python_detail_rows(case, python_data[case]))

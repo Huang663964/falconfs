@@ -1554,6 +1554,21 @@ run_step() {
     return 0
 }
 
+collect_case_evict_artifacts() {
+    local case_id="$1"
+    local out="$OUT_DIR/evict_logs/${case_id}.log"
+    local falcon_log_dir="$OUT_DIR/python/${case_id}-falcon-log"
+    local work_dir="$OUT_DIR/work_${case_id}"
+    local case_log="$OUT_DIR/python/${case_id}.log"
+    mkdir -p "$OUT_DIR/evict_logs"
+    : > "$out"
+    rg -n "DiskCache::|FalconEvictUnlinkListener" \
+        "$falcon_log_dir" "$work_dir" "$case_log" 2>/dev/null >> "$out" || true
+    if [[ ! -s "$out" ]]; then
+        rm -f "$out"
+    fi
+}
+
 cleanup_case_artifacts() {
     local case_id="$1"
     local status="${2:-success}"
@@ -1649,6 +1664,7 @@ run_case() {
         wait "$monitor_pid" 2>/dev/null || true
     fi
     stop_idle_server || true
+    collect_case_evict_artifacts "$case_id" || true
     if [[ "$status" == "0" ]]; then
         cleanup_case_artifacts "$case_id" success
     fi
