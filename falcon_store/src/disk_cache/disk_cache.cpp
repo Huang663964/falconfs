@@ -118,14 +118,14 @@ void LogSlowDiskCacheLock(const char *operation, uint64_t waitUs)
 void AddEvictFailureSample(EvictFailureSummary &summary,
                            const EvictedItem &item,
                            const std::string &fileName,
-                           const char *reason)
+                           const std::string &reason)
 {
     if (summary.samples.size() >= EVICT_FAILURE_LOG_SAMPLE_LIMIT) {
         return;
     }
     std::ostringstream oss;
-    oss << "{reason=" << reason << ", inode=" << item.inode << ", path=" << item.path
-        << ", cache_path=" << fileName << "}";
+    oss << "{reason=" << reason << ", inode=" << item.inode << ", size=" << item.size
+        << ", path=" << item.path << ", cache_path=" << fileName << "}";
     summary.samples.push_back(oss.str());
 }
 
@@ -556,7 +556,10 @@ void DiskCache::FinishPreparedEvictions(std::vector<EvictCandidate> &candidates,
             itemIt->evicting = false;
             ++failedInode;
             ++failureSummary.processLockBusy;
-            AddEvictFailureSample(failureSummary, candidate.item, candidate.fileName, "process_lock_busy");
+            AddEvictFailureSample(failureSummary,
+                                  candidate.item,
+                                  candidate.fileName,
+                                  std::string("process_lock_busy:") + strerror(-lockFd));
             continue;
         }
 
@@ -568,10 +571,28 @@ void DiskCache::FinishPreparedEvictions(std::vector<EvictCandidate> &candidates,
     std::vector<EvictRemoveResult> removeResults;
     removeResults.reserve(removeTasks.size());
     for (const auto &task : removeTasks) {
+        FALCON_LOG(LOG_DEBUG) << "DiskCache::FinishPreparedEvictions(): remove begin, tid="
+                             << std::this_thread::get_id() << ", inode=" << task.item.inode
+                             << ", size=" << task.item.size << ", path=" << task.item.path
+                             << ", cache_path=" << task.fileName;
         auto removeStart = DiskCacheClock::now();
         int ret = remove(task.fileName.c_str());
         uint64_t elapsedUs = ElapsedUs(removeStart, DiskCacheClock::now());
         int err = ret == 0 ? 0 : errno;
+        if (ret == 0 || err == ENOENT) {
+            FALCON_LOG(LOG_DEBUG) << "DiskCache::FinishPreparedEvictions(): remove done, tid="
+                                 << std::this_thread::get_id() << ", ret=" << ret
+                                 << ", err=" << (ret == 0 ? "OK" : strerror(err))
+                                 << ", elapsed_us=" << elapsedUs << ", inode=" << task.item.inode
+                                 << ", size=" << task.item.size << ", path=" << task.item.path
+                                 << ", cache_path=" << task.fileName;
+        } else {
+            FALCON_LOG(LOG_ERROR) << "DiskCache::FinishPreparedEvictions(): remove done, tid="
+                                  << std::this_thread::get_id() << ", ret=" << ret
+                                  << ", err=" << strerror(err) << ", elapsed_us=" << elapsedUs
+                                  << ", inode=" << task.item.inode << ", size=" << task.item.size
+                                  << ", path=" << task.item.path << ", cache_path=" << task.fileName;
+        }
         removeElapsedUs += elapsedUs;
         ReleaseProcessLock(task.lockFd);
         removeResults.push_back({task, ret, err, elapsedUs});

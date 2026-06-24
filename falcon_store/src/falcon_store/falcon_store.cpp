@@ -8,6 +8,7 @@
 #include <limits>
 #include <sstream>
 #include <atomic>
+#include <thread>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -80,6 +81,16 @@ void LogOpenFileCacheMiss(OpenInstance *openInstance, const std::string &fileNam
         << ", node=" << openInstance->nodeId << ", original_size=" << openInstance->originalSize
         << ", is_remote_call=" << openInstance->isRemoteCall;
     FALCON_LOG(LOG_ERROR) << oss.str();
+}
+
+std::string OpenInstanceLogContext(OpenInstance *openInstance)
+{
+    std::ostringstream oss;
+    oss << "path=" << openInstance->path << ", inode=" << openInstance->inodeId
+        << ", node=" << openInstance->nodeId << ", fd=" << openInstance->physicalFd
+        << ", oflags=" << openInstance->oflags << ", current_size=" << openInstance->currentSize.load()
+        << ", original_size=" << openInstance->originalSize << ", remote=" << openInstance->isRemoteCall;
+    return oss.str();
 }
 
 int OpenExistingLocalCacheFile(OpenInstance *openInstance, const std::string &fileName)
@@ -381,7 +392,8 @@ int FalconStore::WriteLocalFileForBrpc(OpenInstance *openInstance, butil::IOBuf 
 
 int FalconStore::WriteFile(OpenInstance *openInstance, const char *buf, size_t size, off_t offset)
 {
-    FALCON_LOG(LOG_INFO) << "WriteFile(): called";
+    FALCON_LOG(LOG_DEBUG) << "WriteFile(): called, " << OpenInstanceLogContext(openInstance)
+                         << ", write_size=" << size << ", offset=" << offset;
     int ret = 0;
     FalconWriteBuffer falconBuf{buf, size};
 
@@ -397,6 +409,9 @@ int FalconStore::WriteFile(OpenInstance *openInstance, const char *buf, size_t s
         std::unique_lock<std::shared_mutex> openLock(openInstance->fileMutex);
         ret = OpenFile(openInstance);
         if (ret != 0) {
+            FALCON_LOG(LOG_ERROR) << "WriteFile(): OpenFile failed, ret=" << ret << ", "
+                                  << OpenInstanceLogContext(openInstance) << ", write_size=" << size
+                                  << ", offset=" << offset;
             openInstance->writeFail = true;
             return ret;
         }
@@ -405,7 +420,9 @@ int FalconStore::WriteFile(OpenInstance *openInstance, const char *buf, size_t s
 
     ret = openInstance->writeStream.Push(falconBuf, offset, openInstance->currentSize.load());
     if (ret != 0) {
-        FALCON_LOG(LOG_ERROR) << "WriteFile(): openInstance->stream.push() failed";
+        FALCON_LOG(LOG_ERROR) << "WriteFile(): writeStream.Push failed, ret=" << ret << ", "
+                              << OpenInstanceLogContext(openInstance) << ", write_size=" << size
+                              << ", offset=" << offset;
         openInstance->writeFail = true;
         return ret;
     }
@@ -431,10 +448,13 @@ int FalconStore::ReadFile(OpenInstance *openInstance, char *buf, size_t size, of
     /* first persist the current write stream to let data to be read */
     if (openInstance->writeStream.GetSize() > 0) {
         /* write will wait for local cache to be loaded from obs, so safe to call persist */
-        FALCON_LOG(LOG_INFO) << "In ReadFile(): Persisting the written";
+        FALCON_LOG(LOG_DEBUG) << "ReadFile(): persisting pending writes, " << OpenInstanceLogContext(openInstance)
+                             << ", read_size=" << size << ", offset=" << offset;
         ret = openInstance->writeStream.Complete(openInstance->currentSize.load(), true, false);
         if (ret != 0) {
-            FALCON_LOG(LOG_ERROR) << "In ReadFile(): persist written before read failed";
+            FALCON_LOG(LOG_ERROR) << "ReadFile(): persist before read failed, ret=" << ret << ", "
+                                  << OpenInstanceLogContext(openInstance) << ", read_size=" << size
+                                  << ", offset=" << offset;
             return ret;
         }
     }
@@ -447,7 +467,9 @@ int FalconStore::ReadFile(OpenInstance *openInstance, char *buf, size_t size, of
             std::unique_lock<std::shared_mutex> openLock(openInstance->fileMutex);
             ret = OpenFile(openInstance);
             if (ret != 0) {
-                FALCON_LOG(LOG_ERROR) << "In ReadFile(): big file OpenFile() failed";
+                FALCON_LOG(LOG_ERROR) << "ReadFile(): OpenFile failed, ret=" << ret << ", "
+                                  << OpenInstanceLogContext(openInstance) << ", read_size=" << size
+                                  << ", offset=" << offset;
                 return ret;
             }
             openInstance->isOpened = true;
@@ -464,7 +486,9 @@ int FalconStore::ReadFile(OpenInstance *openInstance, char *buf, size_t size, of
 
         int readSize = ReadToBuffer(falconBuf, openInstance, offset);
         if (readSize < 0) {
-            FALCON_LOG(LOG_ERROR) << "In ReadFile(): ReadToBuffer() failed";
+            FALCON_LOG(LOG_ERROR) << "ReadFile(): ReadToBuffer failed, ret=" << readSize << ", "
+                              << OpenInstanceLogContext(openInstance) << ", read_size=" << size
+                              << ", offset=" << offset;
         }
         return readSize;
     } else {
@@ -586,19 +610,30 @@ ssize_t FalconStore::ReadFileLR(char *readBuffer, off_t offset, OpenInstance *op
             /* not locked, read cache file */
             FalconStats::GetInstance().stats[BLOCKCACHE_READ] += checkReadLength;
             retSize = pread(openInstance->physicalFd, readBuffer, readBufferSize, offset);
-            if (retSize != checkReadLength) {
+            if (retSize == checkReadLength) {
+                FALCON_LOG(LOG_DEBUG) << "ReadFileLR(): local pread done, tid=" << std::this_thread::get_id()
+                                     << ", actual=" << retSize << ", expected=" << checkReadLength
+                                     << ", read_size=" << readBufferSize << ", offset=" << offset
+                                     << ", cache_path=" << GetFilePath(openInstance->inodeId)
+                                     << ", " << OpenInstanceLogContext(openInstance);
+            } else {
                 int err = errno;
                 if (err == EAGAIN) {
                     retSize = pread(openInstance->physicalFd, readBuffer, checkReadLength, offset);
                     if (retSize != checkReadLength) {
                         err = errno;
-                        FALCON_LOG(LOG_ERROR) << "In ReadFileLR(): pread fd = " << openInstance->physicalFd
-                                              << " failed : " << strerror(err);
+                        FALCON_LOG(LOG_ERROR) << "ReadFileLR(): local pread retry failed, err=" << strerror(err)
+                                              << ", actual=" << retSize << ", expected=" << checkReadLength
+                                              << ", read_size=" << readBufferSize << ", offset=" << offset
+                                              << ", " << OpenInstanceLogContext(openInstance);
                         retSize = -err;
                     }
                 } else {
                     FALCON_LOG(LOG_ERROR)
-                        << "In ReadFileLR(): pread fd = " << openInstance->physicalFd << " failed : " << strerror(err);
+                        << "ReadFileLR(): local pread failed, err=" << strerror(err)
+                        << ", actual=" << retSize << ", expected=" << checkReadLength
+                        << ", read_size=" << readBufferSize << ", offset=" << offset
+                        << ", " << OpenInstanceLogContext(openInstance);
                     retSize = -err;
                 }
             }
@@ -627,8 +662,10 @@ ssize_t FalconStore::ReadFileLR(char *readBuffer, off_t offset, OpenInstance *op
                 }
             }
             if (retSize != checkReadLength) {
-                FALCON_LOG(LOG_ERROR) << "In ReadFileLR(): read remote failed: " << strerror(-retSize) << ", for node "
-                                      << openInstance->nodeId;
+                FALCON_LOG(LOG_ERROR) << "ReadFileLR(): remote read failed, err=" << strerror(-retSize)
+                                      << ", actual=" << retSize << ", expected=" << checkReadLength
+                                      << ", read_size=" << readBufferSize << ", offset=" << offset
+                                      << ", " << OpenInstanceLogContext(openInstance);
                 openInstance->remoteFailed = true;
             }
         }
@@ -638,7 +675,9 @@ ssize_t FalconStore::ReadFileLR(char *readBuffer, off_t offset, OpenInstance *op
         FALCON_LOG(LOG_DEBUG) << "ReadFile from obs : " << openInstance->path;
         retSize = storage->ReadObject(openInstance->path.substr(1), offset, readBufferSize, -1, readBuffer);
         if (retSize < 0) {
-            FALCON_LOG(LOG_ERROR) << "In ReadFileLR(): obs ReadObject() failed";
+            FALCON_LOG(LOG_ERROR) << "ReadFileLR(): obs ReadObject failed, ret=" << retSize
+                                  << ", read_size=" << readBufferSize << ", offset=" << offset
+                                  << ", " << OpenInstanceLogContext(openInstance);
             retSize = -EIO;
         }
     }
@@ -987,7 +1026,8 @@ int FalconStore::CloseTmpFiles(OpenInstance *openInstance, bool isFlush, bool is
         FALCON_LOG(LOG_WARNING) << "CloseTmpFiles(): close called without flush";
         ret = CloseTmpFiles(openInstance, true, isSync);
         if (ret != 0) {
-            FALCON_LOG(LOG_ERROR) << "CloseTmpFiles(): call flush in close failed";
+            FALCON_LOG(LOG_ERROR) << "CloseTmpFiles(): flush in close failed, ret=" << ret << ", "
+                                  << OpenInstanceLogContext(openInstance) << ", sync=" << isSync;
             openInstance->writeFail = true;
         }
     }
@@ -1002,8 +1042,9 @@ int FalconStore::CloseTmpFiles(OpenInstance *openInstance, bool isFlush, bool is
     if (!openInstance->isRemoteCall) {
         int completeRet = openInstance->writeStream.Complete(openInstance->currentSize.load(), isFlush, isSync);
         if (completeRet != 0) {
-            FALCON_LOG(LOG_ERROR) << "In FalconStore::CloseTmpFiles() call complete() failed for node "
-                                  << openInstance->nodeId;
+            FALCON_LOG(LOG_ERROR) << "CloseTmpFiles(): writeStream.Complete failed, ret=" << completeRet
+                                  << ", is_flush=" << isFlush << ", sync=" << isSync
+                                  << ", " << OpenInstanceLogContext(openInstance);
             openInstance->writeFail = true;
             ret = completeRet;
         }
