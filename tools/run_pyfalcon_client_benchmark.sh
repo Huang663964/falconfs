@@ -63,6 +63,7 @@ P3_MONITOR_INTERVAL="${P3_MONITOR_INTERVAL:-30}"
 P3_STALL_SECONDS="${P3_STALL_SECONDS:-180}"
 KEEP_WORK_DIRS="${KEEP_WORK_DIRS:-1}"
 MAX_LOCAL_DISK_SIZE="${MAX_LOCAL_DISK_SIZE:-16}"
+SHARED_FUSE_FILES="${SHARED_FUSE_FILES:-128}"
 FALCON_LOG_LEVEL="${FALCON_LOG_LEVEL:-}"
 EVICT_FALCON_LOG_LEVEL="${EVICT_FALCON_LOG_LEVEL:-INFO}"
 PREPARE_ENV="${PREPARE_ENV:-1}"
@@ -75,6 +76,7 @@ PREPARE_FIX_BUILD_PERMS="${PREPARE_FIX_BUILD_PERMS:-1}"
 CASE_SPACE_MARGIN_BYTES="${CASE_SPACE_MARGIN_BYTES:-1073741824}"
 SCENARIO="${1:-all}"
 FAILED_CASES=()
+FUSE_PID=""
 
 usage() {
     cat <<EOF
@@ -82,9 +84,10 @@ Usage:
   $0 <scenario>
 
 Scenarios:
-  all    Run Python internal P-LOCK/P-1/P-2/P-3/P-5/P-R1/P-RW/P-RWE/P-DIO and fio B-1..B-6 plus fio matrix/direct probes.
-  python Run Python internal cases only.
-  fio    Run fio/local baseline B-1..B-6, fio numjobs matrix, and fio direct-unaligned probe.
+  all    Run the trimmed Python/FUSE set only: P-SHARED/P-LOCK and non-direct Python cases.
+  python Run the trimmed Python/FUSE set only.
+  fio    Run fio/local baseline B-1..B-6 and fio numjobs matrix; direct probe is explicit B-DIO only.
+  P-SHARED Python clients and FUSE/POSIX writer sharing the same CACHE_ROOT and store node.
   P-LOCK Run DiskCache shared-cache process-lock regression test.
   P-1    Python internal 4-client write-only benchmark.
   P-2    Python internal 4-client unlink-only benchmark.
@@ -147,6 +150,7 @@ Environment overrides:
   P3_MONITOR_INTERVAL=${P3_MONITOR_INTERVAL}
   P3_STALL_SECONDS=${P3_STALL_SECONDS}
   MAX_LOCAL_DISK_SIZE=${MAX_LOCAL_DISK_SIZE}
+  SHARED_FUSE_FILES=${SHARED_FUSE_FILES}
   FALCON_LOG_LEVEL=${FALCON_LOG_LEVEL}
   EVICT_FALCON_LOG_LEVEL=${EVICT_FALCON_LOG_LEVEL}
   PREPARE_ENV=${PREPARE_ENV}
@@ -162,7 +166,7 @@ Environment overrides:
   PYTHON_INTERFACE=${PYTHON_INTERFACE}
 
 Example:
-  BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 UNLINK_FILES=6000 FIO_SIZE=2G FIO_LARGE_SIZE=10G FIO_LARGE_RUNTIME=10 $0 all
+  BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 UNLINK_FILES=6000 SHARED_FUSE_FILES=128 MAX_LOCAL_DISK_SIZE=16 $0 all
 EOF
 }
 
@@ -294,6 +298,7 @@ cleanup_temp_dirs() {
 
 on_exit() {
     stop_idle_server 2>/dev/null || true
+    stop_fuse_server 2>/dev/null || true
     cleanup_temp_dirs 2>/dev/null || true
 }
 
@@ -512,6 +517,7 @@ create_case_config() {
     CACHE_ROOT_VALUE="$CACHE_ROOT" \
     BENCHMARK_CLUSTER_VIEW_VALUE="$BENCHMARK_CLUSTER_VIEW" \
     CASE_LOG_DIR="$OUT_DIR/python/${case_id}-falcon-log" \
+    MOUNT_DIR_VALUE="$MOUNT_DIR" \
     MAX_LOCAL_DISK_SIZE_VALUE="$MAX_LOCAL_DISK_SIZE" \
     FALCON_LOG_LEVEL_VALUE="$case_log_level" \
     python3 - <<'PYCONFIG'
@@ -529,6 +535,7 @@ main = config.setdefault("main", {})
 main["falcon_cache_root"] = os.environ["CACHE_ROOT_VALUE"]
 main["falcon_cluster_view"] = cluster_view
 main["falcon_log_dir"] = os.environ["CASE_LOG_DIR"]
+main["falcon_mount_path"] = os.environ["MOUNT_DIR_VALUE"]
 max_local_disk_size = os.environ.get("MAX_LOCAL_DISK_SIZE_VALUE", "")
 if max_local_disk_size:
     main["max_local_disk_size"] = int(max_local_disk_size)
@@ -581,6 +588,91 @@ stop_idle_server() {
         wait "$IDLE_PID" 2>/dev/null || true
         IDLE_PID=""
     fi
+}
+
+ensure_fuse_binary() {
+    if [[ ! -x "$BUILD_DIR/bin/falcon_client" ]]; then
+        log "building falcon_client"
+        ninja -C "$BUILD_DIR" falcon_client
+    fi
+}
+
+stop_fuse_server() {
+    if [[ -n "${FUSE_PID:-}" ]]; then
+        kill "$FUSE_PID" 2>/dev/null || true
+        wait "$FUSE_PID" 2>/dev/null || true
+        FUSE_PID=""
+    fi
+    sudo umount -l "$MOUNT_DIR" >/dev/null 2>&1 || true
+}
+
+start_fuse_server() {
+    local threshold="$1"
+    local case_id="$2"
+    local case_config="$3"
+    local fuse_log="$OUT_DIR/python/${case_id}-fuse.log"
+
+    ensure_fuse_binary
+    mkdir -p "$MOUNT_DIR"
+    log "starting shared FUSE/RemoteIOServer for ${case_id}, cache_root=${CACHE_ROOT}, mount=${MOUNT_DIR}"
+    (
+        cd "$ROOT_DIR"
+        source_falcon_env
+        CONFIG_FILE="$case_config" STORAGE_THRESHOLD="$threshold" "$BUILD_DIR/bin/falcon_client" \
+            "$MOUNT_DIR" \
+            -f \
+            -o direct_io \
+            -o attr_timeout=20 \
+            -o entry_timeout=20 \
+            -brpc true \
+            -rpc_endpoint="0.0.0.0:56039" \
+            -socket_max_unwritten_bytes=268435456
+    ) >"$fuse_log" 2>&1 &
+    FUSE_PID=$!
+
+    for _ in $(seq 1 30); do
+        if ! kill -0 "$FUSE_PID" 2>/dev/null; then
+            echo "falcon_client exited during startup" >&2
+            cat "$fuse_log" >&2 || true
+            FUSE_PID=""
+            return 1
+        fi
+        if [[ -n "$(idle_server_port_listeners)" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "shared FUSE/RemoteIOServer did not start for ${case_id}" >&2
+    cat "$fuse_log" >&2 || true
+    stop_fuse_server
+    return 1
+}
+
+run_fuse_posix_writer() {
+    local case_id="$1"
+    local fuse_dir="$MOUNT_DIR/py_${case_id}_fuse"
+    local fuse_log="$OUT_DIR/python/${case_id}-fuse-posix.log"
+    FUSE_DIR="$fuse_dir" FUSE_FILES="$SHARED_FUSE_FILES" FILE_SIZE_VALUE="$FILE_SIZE" python3 - <<PYFUSE >"$fuse_log" 2>&1
+import os
+import time
+
+fuse_dir = os.environ["FUSE_DIR"]
+files = int(os.environ["FUSE_FILES"])
+file_size = int(os.environ["FILE_SIZE_VALUE"])
+payload = b"f" * file_size
+os.makedirs(fuse_dir, exist_ok=True)
+start = time.monotonic()
+for i in range(files):
+    path = os.path.join(fuse_dir, f"fuse_{i:08d}")
+    with open(path, "wb", buffering=0) as out:
+        out.write(payload)
+with open(os.path.join(fuse_dir, "fuse_00000000"), "rb", buffering=0) as src:
+    data = src.read(file_size)
+if len(data) != file_size:
+    raise SystemExit(f"short fuse read: {len(data)} != {file_size}")
+print(f"files={files} file_size={file_size} elapsed_sec={time.monotonic() - start:.6f}")
+PYFUSE
 }
 
 bytes_to_mib() {
@@ -1211,6 +1303,69 @@ PYDIO
     return 0
 }
 
+run_shared_fuse_py_case() {
+    local case_id="P-SHARED"
+    local mode="write_only"
+    local threshold="$WRITE_THRESHOLD"
+    local case_config case_log fuse_writer_pid py_status fuse_status
+
+    ensure_binary || return 1
+    ensure_fuse_binary || return 1
+    clean_runtime || return 1
+    prepare_cache_dirs || return 1
+    safe_rm_rf "$OUT_DIR/work_${case_id}" >/dev/null 2>&1 || true
+    mkdir -p "$OUT_DIR/python" "$OUT_DIR/work_${case_id}" || return 1
+    case_config="$(create_case_config "$case_id" "$FALCON_LOG_LEVEL")" || return 1
+    case_log="$OUT_DIR/python/${case_id}.log"
+
+    log "case ${case_id} config: ${case_config}, shared cache_root=${CACHE_ROOT}, mount=${MOUNT_DIR}, max_local_disk_size=${MAX_LOCAL_DISK_SIZE}GiB"
+    start_meta "$threshold" "$case_id" || return 1
+    start_fuse_server "$threshold" "$case_id" "$case_config" || return 1
+
+    log "running ${case_id}: FUSE files=${SHARED_FUSE_FILES}, py clients=${CLIENTS}, py files=${FILES}, file_size=${FILE_SIZE}"
+    run_fuse_posix_writer "$case_id" &
+    fuse_writer_pid=$!
+
+    set +e
+    (
+        cd "$ROOT_DIR"
+        STORAGE_THRESHOLD="$threshold" python3 "$ROOT_DIR/tools/pyfalcon_client_perf.py" \
+            --mode "$mode" \
+            --clients "$CLIENTS" \
+            --files "$FILES" \
+            --read-files "$READ_FILES" \
+            --pinned-read-files "$PINNED_READ_FILES" \
+            --unlink-files "$UNLINK_FILES" \
+            --file-size "$FILE_SIZE" \
+            --wait-sec "$WAIT_SEC" \
+            --duration-sec "$MIXED_DURATION_SEC" \
+            --hot-read-window "$HOT_READ_WINDOW" \
+            --hot-read-lag "$HOT_READ_LAG" \
+            --hot-read-min-files "$HOT_READ_MIN_FILES" \
+            --dir "/py_${case_id}" \
+            --workspace "$OUT_DIR/work_${case_id}" \
+            --config "$case_config" \
+            --python-interface "$PYTHON_INTERFACE" \
+            --output "$OUT_DIR/python/${case_id}.json"
+    ) >"$case_log" 2>&1
+    py_status=$?
+    wait "$fuse_writer_pid"
+    fuse_status=$?
+    set -e
+
+    stop_fuse_server || true
+    collect_case_evict_artifacts "$case_id" || true
+    if [[ "$py_status" -ne 0 || "$fuse_status" -ne 0 ]]; then
+        log "case ${case_id} failed, py_status=${py_status}, fuse_status=${fuse_status}"
+        print_python_case_diagnostics "$case_id"
+        return 1
+    fi
+    cleanup_case_artifacts "$case_id" success
+    log "case ${case_id} finished"
+    return 0
+}
+
+
 run_cache_lock_ut() {
     mkdir -p "$OUT_DIR/unit"
     log "building DiskCacheUT"
@@ -1221,6 +1376,7 @@ run_cache_lock_ut() {
 }
 
 run_python_group() {
+    run_step P-SHARED run_shared_fuse_py_case
     run_step P-LOCK run_cache_lock_ut
     run_step P-1 run_case P-1 write_only "$WRITE_THRESHOLD"
     run_step P-2 run_case P-2 unlink_only "$WRITE_THRESHOLD"
@@ -1229,7 +1385,6 @@ run_python_group() {
     run_step P-R1 run_case P-R1 read_only "$WRITE_THRESHOLD"
     run_step P-RW run_case P-RW read_write "$WRITE_THRESHOLD"
     run_step P-RWE run_case P-RWE read_write_evict "$EVICT_THRESHOLD"
-    run_step P-DIO run_case P-DIO direct_unaligned "$WRITE_THRESHOLD"
 }
 
 run_fio_group() {
@@ -1240,7 +1395,6 @@ run_fio_group() {
     run_step B-5 run_fio_case B-5
     run_step B-6 run_fio_case B-6
     run_step B-MATRIX run_fio_matrix
-    run_step B-DIO run_fio_direct_unaligned
 }
 
 
@@ -1687,11 +1841,9 @@ run_case() {
 
 run_group() {
     case "$1" in
-        all)
-            run_python_group
-            run_fio_group
-            ;;
+        all) run_python_group ;;
         python) run_python_group ;;
+        P-SHARED) run_step P-SHARED run_shared_fuse_py_case ;;
         fio) run_fio_group ;;
         P-LOCK) run_step P-LOCK run_cache_lock_ut ;;
         P-1) run_step P-1 run_case P-1 write_only "$WRITE_THRESHOLD" ;;
