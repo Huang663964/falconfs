@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -145,6 +146,45 @@ TEST_F(DiskCacheUT, StartWithZeroWatermarkUsesDirectFileChecks)
     EXPECT_FALSE(std::filesystem::exists(file));
 
     std::filesystem::remove_all(directRoot);
+}
+
+TEST_F(DiskCacheUT, SharedCacheDirectoriesAndLocksIgnoreRestrictiveUmask)
+{
+    std::string cacheRoot = "/tmp/testdir_shared_permissions";
+    std::filesystem::remove_all(cacheRoot);
+
+    mode_t oldMask = umask(0077);
+    {
+        DiskCache cache;
+        EXPECT_EQ(cache.Start(cacheRoot, 2, 0.1), 0);
+
+        int sharedFd = cache.AcquireProcessLock(7, false, false);
+        EXPECT_GE(sharedFd, 0);
+        DiskCache::ReleaseProcessLock(sharedFd);
+
+        int exclusiveFd = cache.AcquireProcessLock(8, true, true);
+        EXPECT_GE(exclusiveFd, 0);
+        DiskCache::ReleaseProcessLock(exclusiveFd);
+    }
+    umask(oldMask);
+
+    auto modeOf = [](const std::string &path) -> mode_t {
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) {
+            return 0;
+        }
+        return st.st_mode & 0777;
+    };
+
+    EXPECT_EQ(modeOf(cacheRoot), 0777);
+    EXPECT_EQ(modeOf(cacheRoot + "/0"), 0777);
+    EXPECT_EQ(modeOf(cacheRoot + "/1"), 0777);
+    EXPECT_EQ(modeOf(cacheRoot + "/.falcon_cache_locks"), 0777);
+    EXPECT_EQ(modeOf(cacheRoot + "/.falcon_cache_locks/1"), 0777);
+    EXPECT_EQ(modeOf(cacheRoot + "/.falcon_cache_locks/1/7.lock"), 0666);
+    EXPECT_EQ(modeOf(cacheRoot + "/.falcon_cache_locks/0/8.lock"), 0666);
+
+    std::filesystem::remove_all(cacheRoot);
 }
 
 TEST_F(DiskCacheUT, InsertUpdatePinAndDeleteLifecycle)
@@ -763,10 +803,15 @@ TEST_F(DiskCacheUT, PublicEvictAndFailureBranches)
     EXPECT_FALSE(cache.Find(removableKey, false));
     EXPECT_FALSE(std::filesystem::exists(GetFilePath(removableKey)));
 
-    std::string missingRoot = "/tmp/testdir_public_evict_start_missing";
-    std::filesystem::remove_all(missingRoot);
+    std::string fileRoot = "/tmp/testdir_public_evict_start_file";
+    std::filesystem::remove_all(fileRoot);
+    {
+        std::ofstream out(fileRoot);
+        out << "not-a-directory";
+    }
     DiskCache startFailureCache;
-    EXPECT_EQ(startFailureCache.Start(missingRoot, 1, 0.1), RETURN_ERROR);
+    EXPECT_EQ(startFailureCache.Start(fileRoot, 1, 0.1), -ENOTDIR);
+    std::filesystem::remove(fileRoot);
 
     uint64_t deleteMissingKey = 504;
     cache.InsertAndUpdate(deleteMissingKey, 1, false);

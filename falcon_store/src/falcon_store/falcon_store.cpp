@@ -55,10 +55,21 @@ bool RecoverCacheFileOnDisk(OpenInstance *openInstance, const std::string &fileN
     return true;
 }
 
+constexpr mode_t SHARED_CACHE_FILE_MODE = 0666;
+
 std::string MakeCacheTmpFileName(const std::string &fileName)
 {
     static std::atomic<uint64_t> tmpSeq{0};
     return fileName + ".tmp." + std::to_string(getpid()) + "." + std::to_string(tmpSeq.fetch_add(1));
+}
+
+int OpenSharedCacheFile(const std::string &fileName, int flags)
+{
+    int fd = open(fileName.c_str(), flags, SHARED_CACHE_FILE_MODE);
+    if (fd >= 0 && (flags & O_CREAT) != 0) {
+        (void)fchmod(fd, SHARED_CACHE_FILE_MODE);
+    }
+    return fd;
 }
 
 int CommitCacheTmpFile(const std::string &tmpFileName, const std::string &fileName)
@@ -95,7 +106,7 @@ std::string OpenInstanceLogContext(OpenInstance *openInstance)
 
 int OpenExistingLocalCacheFile(OpenInstance *openInstance, const std::string &fileName)
 {
-    int localFd = open(fileName.c_str(), openInstance->oflags, 0755);
+    int localFd = OpenSharedCacheFile(fileName, openInstance->oflags);
     if (localFd < 0) {
         int err = errno;
         DiskCache::GetInstance().Unpin(openInstance->inodeId);
@@ -768,7 +779,7 @@ int FalconStore::OpenFile(OpenInstance *openInstance)
                         }
                     }
                     if (!localFileOpened) {
-                        int localFd = open(fileName.c_str(), openInstance->oflags | O_CREAT, 0755);
+                        int localFd = OpenSharedCacheFile(fileName, openInstance->oflags | O_CREAT);
                         if (localFd < 0) {
                             err = errno;
                             FALCON_LOG(LOG_ERROR)
@@ -856,7 +867,7 @@ int FalconStore::DownLoadFromStorage(OpenInstance *openInstance, bool isSync, bo
 
     /* here cache file must not exist */
     std::string tmpFileName = MakeCacheTmpFileName(fileName);
-    auto fd = open(tmpFileName.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    auto fd = OpenSharedCacheFile(tmpFileName, O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0) {
         int err = errno;
         FALCON_LOG(LOG_ERROR) << "DownLoadFromStorage(): Create local tmp file for loading failed, tmp="
@@ -1223,7 +1234,7 @@ int FalconStore::WriteToFileAsync(uint64_t inodeId, const std::string &path, std
 
     /* Cache file must not exist. Create a tmp file and publish it with rename after the write completes. */
     std::string tmpFileName = MakeCacheTmpFileName(fileName);
-    auto fd = open(tmpFileName.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    auto fd = OpenSharedCacheFile(tmpFileName, O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0) {
         int err = errno;
         FALCON_LOG(LOG_ERROR) << "WriteToFileAsync(): open tmp file failed, tmp=" << tmpFileName
@@ -1370,7 +1381,7 @@ int FalconStore::DownLoadFromStorageForBrpc(uint64_t inodeId,
 
     /* here cache file must not exist */
     std::string tmpFileName = MakeCacheTmpFileName(fileName);
-    auto fd = open(tmpFileName.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    auto fd = OpenSharedCacheFile(tmpFileName, O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0) {
         int err = errno;
         FALCON_LOG(LOG_ERROR) << "DownLoadFromStorage(): Create local tmp file for loading failed, tmp="

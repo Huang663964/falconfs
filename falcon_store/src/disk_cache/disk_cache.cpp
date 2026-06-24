@@ -39,6 +39,8 @@ constexpr std::size_t EVICT_FAILURE_LOG_SAMPLE_LIMIT = 3;
 constexpr float DEFAULT_DISKCACHE_EVICTION_RATIO = 0.1F;
 constexpr uint64_t EVICT_LOOKUP_WAIT_MS = 1000;
 constexpr uint64_t SLOW_LOCK_LOG_US = 10 * 1000;
+constexpr mode_t SHARED_CACHE_DIR_MODE = 0777;
+constexpr mode_t SHARED_CACHE_FILE_MODE = 0666;
 
 struct EvictFailureSummary {
     uint64_t metadataUnlinkFailed{0};
@@ -115,6 +117,53 @@ void LogSlowDiskCacheLock(const char *operation, uint64_t waitUs)
     FALCON_LOG(LOG_WARNING) << oss.str();
 }
 
+int EnsureSharedCacheDir(const std::string &path)
+{
+    if (mkdir(path.c_str(), SHARED_CACHE_DIR_MODE) != 0 && errno != EEXIST) {
+        return -errno;
+    }
+
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        return -errno;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        return -ENOTDIR;
+    }
+    if ((st.st_mode & 0777) == SHARED_CACHE_DIR_MODE) {
+        return 0;
+    }
+
+    if (chmod(path.c_str(), SHARED_CACHE_DIR_MODE) == 0) {
+        return 0;
+    }
+
+    int err = errno;
+    if (access(path.c_str(), W_OK | X_OK) == 0) {
+        FALCON_LOG(LOG_WARNING) << "EnsureSharedCacheDir(): chmod failed but directory is writable, path="
+                                << path << ", err=" << strerror(err);
+        return 0;
+    }
+    return -err;
+}
+
+int EnsureSharedCacheDirs(const std::string &rootDir, int totalDirNum)
+{
+    int ret = EnsureSharedCacheDir(rootDir);
+    if (ret != 0) {
+        return ret;
+    }
+
+    for (int i = 0; i < totalDirNum; ++i) {
+        ret = EnsureSharedCacheDir(rootDir + "/" + std::to_string(i));
+        if (ret != 0) {
+            return ret;
+        }
+    }
+
+    return EnsureSharedCacheDir(rootDir + "/.falcon_cache_locks");
+}
+
 void AddEvictFailureSample(EvictFailureSummary &summary,
                            const EvictedItem &item,
                            const std::string &fileName,
@@ -175,20 +224,23 @@ int DiskCache::AcquireProcessLock(uint64_t key, bool exclusive, bool nonBlocking
     }
 
     std::string lockRoot = rootDir + "/.falcon_cache_locks";
-    if (mkdir(lockRoot.c_str(), 0755) != 0 && errno != EEXIST) {
-        return -errno;
+    int ret = EnsureSharedCacheDir(lockRoot);
+    if (ret != 0) {
+        return ret;
     }
     uint64_t shard = totalDirNum > 0 ? key % static_cast<uint64_t>(totalDirNum) : 0;
     std::string lockDir = lockRoot + "/" + std::to_string(shard);
-    if (mkdir(lockDir.c_str(), 0755) != 0 && errno != EEXIST) {
-        return -errno;
+    ret = EnsureSharedCacheDir(lockDir);
+    if (ret != 0) {
+        return ret;
     }
 
     std::string lockFile = lockDir + "/" + std::to_string(key) + ".lock";
-    int fd = open(lockFile.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+    int fd = open(lockFile.c_str(), O_CREAT | O_RDONLY | O_CLOEXEC, SHARED_CACHE_FILE_MODE);
     if (fd < 0) {
         return -errno;
     }
+    (void)fchmod(fd, SHARED_CACHE_FILE_MODE);
 
     int operation = exclusive ? LOCK_EX : LOCK_SH;
     if (nonBlocking) {
@@ -268,6 +320,12 @@ int DiskCache::Start(std::string &path, int dirNum, float foregroundFreeWatermar
     this->foregroundFreeWatermark = foregroundFreeWatermark;
     this->maxLocalDiskSizeBytes = maxLocalDiskSizeBytes;
     int ret = RETURN_OK;
+    ret = EnsureSharedCacheDirs(rootDir, totalDirNum);
+    if (ret != RETURN_OK) {
+        FALCON_LOG(LOG_ERROR) << "Prepare shared cache directories failed, root=" << rootDir
+                              << ", ret=" << ret << ", err=" << strerror(-ret);
+        return ret;
+    }
     if (foregroundFreeWatermark == 0) {
         stop = true;
         return ret;
