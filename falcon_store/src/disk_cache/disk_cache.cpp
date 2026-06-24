@@ -130,9 +130,6 @@ int EnsureSharedCacheDir(const std::string &path)
     if (!S_ISDIR(st.st_mode)) {
         return -ENOTDIR;
     }
-    if ((st.st_mode & 0777) == SHARED_CACHE_DIR_MODE) {
-        return 0;
-    }
 
     if (chmod(path.c_str(), SHARED_CACHE_DIR_MODE) == 0) {
         return 0;
@@ -319,8 +316,7 @@ int DiskCache::Start(std::string &path, int dirNum, float foregroundFreeWatermar
     totalDirNum = dirNum;
     this->foregroundFreeWatermark = foregroundFreeWatermark;
     this->maxLocalDiskSizeBytes = maxLocalDiskSizeBytes;
-    int ret = RETURN_OK;
-    ret = EnsureSharedCacheDirs(rootDir, totalDirNum);
+    int ret = EnsureSharedCacheDirs(rootDir, totalDirNum);
     if (ret != RETURN_OK) {
         FALCON_LOG(LOG_ERROR) << "Prepare shared cache directories failed, root=" << rootDir
                               << ", ret=" << ret << ", err=" << strerror(-ret);
