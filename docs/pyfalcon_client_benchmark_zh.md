@@ -1,13 +1,14 @@
 # Python internal client 并发 benchmark 使用说明
 
-本文说明如何在服务器上通过 Python internal API 调用 Falcon 内部接口做并发性能测试。该 benchmark 不通过 FUSE 挂载点发起业务操作。
+本文说明如何在服务器上通过 Python internal API 调用 Falcon 内部接口做并发性能测试。默认一键场景会额外覆盖一个 FUSE 进程和多个 Python client 共用同一 cache root 的场景。
 
 ## 1. 测试目标
 
-benchmark 覆盖 Python internal API 和 fio 本地基准两类场景。Python internal API 覆盖 4 个场景：
+benchmark 覆盖 Python internal API、FUSE 共享 cache root 和 fio 本地基准场景。默认 `all` 和 `python` 只跑 Python/FUSE 相关场景，不跑 fio 和 direct I/O 探测：
 
 | 编号 | 场景 | 并发模型 |
 | --- | --- | --- |
+| P-SHARED | FUSE + Python 共享 cache root | 启动真实 `falcon_client` FUSE/RemoteIOServer，FUSE/POSIX writer 和多个 `pyfalconfs.Client` 使用同一份 config、同一个 `CACHE_ROOT` |
 | P-1 | 纯写 | 4 个 Python 进程，每个进程 1 个 `pyfalconfs.Client` |
 | P-2 | 纯删除 | 先 4 client 预创建文件，再 4 client 并发 `FalconUnlink` |
 | P-3 | 写触发 evict | 4 writer client 并发写，DiskCache 后台 cleanup 删除 cache |
@@ -96,7 +97,7 @@ test -x build/internal_perf/falcon_internal_perf
 
 ## 4. 一键执行
 
-完整执行 P-1/P-2/P-3/P-5 和 fio B-1..B-5。另一台服务器如果 NVMe 盘挂载在 `/data4/hxing`，建议显式设置 `BENCHMARK_ROOT=/data4/hxing`：
+默认一键执行 `P-SHARED` 和非 direct 的 Python 场景，不跑 fio、P-DIO 或 B-DIO。另一台服务器如果 NVMe 盘挂载在 `/data4/hxing`，建议显式设置 `BENCHMARK_ROOT=/data4/hxing`：
 
 ```bash
 cd ~/code/falconfs
@@ -107,16 +108,18 @@ FILES=6000 \
 UNLINK_FILES=6000 \
 FILE_SIZE=2097152 \
 WAIT_SEC=45 \
-FIO_SIZE=2G \
+SHARED_FUSE_FILES=128 \
+MAX_LOCAL_DISK_SIZE_GIB=16 \
 bash tools/run_pyfalcon_client_benchmark.sh all
 ```
 
-`all/python/fio` 会按 case 独立执行。某个 case 失败时，脚本会记录失败状态并继续执行后续 case，最后生成 summary，并在 `run.log` 末尾列出失败项。
+`all` 和 `python` 会按 case 独立执行精简后的 Python/FUSE 场景。某个 case 失败时，脚本会记录失败状态并继续执行后续 case，最后生成 summary，并在 `run.log` 末尾列出失败项。`fio`、`P-DIO`、`B-DIO` 仍可显式单独执行。
 
 只跑 Python internal 场景或单个场景：
 
 ```bash
 bash tools/run_pyfalcon_client_benchmark.sh python
+bash tools/run_pyfalcon_client_benchmark.sh P-SHARED
 bash tools/run_pyfalcon_client_benchmark.sh P-1
 bash tools/run_pyfalcon_client_benchmark.sh P-2
 bash tools/run_pyfalcon_client_benchmark.sh P-3
@@ -161,6 +164,8 @@ bash tools/run_pyfalcon_client_benchmark.sh B-DIO
 | `REQUIRE_NVME` | 1 | 是否要求 `OUT_DIR/CACHE_ROOT/FIO_DIR/metadata workspace` 都在 NVMe 设备上；临时非 NVMe 测试可设为 0 |
 | `WRITE_THRESHOLD` | 1 | P-1/P-2/P-5 使用的 `STORAGE_THRESHOLD` |
 | `EVICT_THRESHOLD` | 0.72 | `AUTO_EVICT_CONFIG=0` 时 P-3 使用的固定 `STORAGE_THRESHOLD` |
+| `MAX_LOCAL_DISK_SIZE_GIB` | 空 | 非空时覆盖 case config 中的 `max_local_disk_size`，例如设为 `16` 验证共享 cache root 下的配额行为 |
+| `SHARED_FUSE_FILES` | 128 | P-SHARED 中 FUSE/POSIX writer 写入的文件数 |
 | `AUTO_EVICT_CONFIG` | 1 | 是否自动按 `CACHE_ROOT` 所在文件系统容量和当前已用空间计算 P-3 的水位线和文件数 |
 | `AUTO_EVICT_WRITE_RATIO` | 0.01 | 自动模式下目标 P-3 写入量至少覆盖文件系统总容量的比例 |
 | `AUTO_EVICT_MIN_WRITE_BYTES` | 12884901888 | 自动模式下 P-3 最小目标写入量，默认 12GiB |
@@ -373,19 +378,19 @@ cat "$OUT_DIR"/python/*-idle.log
 
 ## 11. 新增混合读写 evict 与 direct I/O 验证
 
-`all` 现在会覆盖基础 Python internal 场景、混合读写场景、fio 基准、fio 多并发矩阵和 direct I/O 未对齐探测。为了在非 NVMe 或本地功能验证时缩短时间，可以先用小规模参数跑完整流程：
+`all` 现在只覆盖 P-SHARED 和非 direct 的 Python 场景。为了在非 NVMe 或本地功能验证时缩短时间，可以先用小规模参数跑完整流程：
 
 ```bash
-REQUIRE_NVME=0 BENCHMARK_ROOT=/tmp/falconfs_local_benchmark CLIENTS=2 FILES=64 READ_FILES=64 UNLINK_FILES=64 WAIT_SEC=5 FIO_SIZE=64M FIO_LARGE_SIZE=256M FIO_LARGE_RUNTIME=3 FIO_NUMJOBS_LIST="1 2" FIO_MATRIX_SIZE=64M FIO_UNALIGNED_SIZE=16M bash tools/run_pyfalcon_client_benchmark.sh all
+REQUIRE_NVME=0 BENCHMARK_ROOT=/tmp/falconfs_local_benchmark CLIENTS=2 FILES=64 READ_FILES=64 UNLINK_FILES=64 WAIT_SEC=5 SHARED_FUSE_FILES=16 MAX_LOCAL_DISK_SIZE_GIB=16 bash tools/run_pyfalcon_client_benchmark.sh all
 ```
 
-在 NVMe 服务器正式测试时，建议恢复 4 client 和 `1/4/8/16` 的 fio 矩阵：
+在 NVMe 服务器正式测试时，建议恢复 4 client 和较大的 Python 数据集。fio 矩阵需要显式执行 `fio` 或 `B-MATRIX`：
 
 ```bash
-BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 READ_FILES=6000 UNLINK_FILES=6000 WAIT_SEC=45 MIXED_DURATION_SEC=120 FIO_SIZE=2G FIO_LARGE_SIZE=10G FIO_LARGE_RUNTIME=10 FIO_NUMJOBS_LIST="1 4 8 16" bash tools/run_pyfalcon_client_benchmark.sh all
+BENCHMARK_ROOT=/data4/hxing CLIENTS=4 FILES=6000 READ_FILES=6000 UNLINK_FILES=6000 WAIT_SEC=45 MIXED_DURATION_SEC=120 SHARED_FUSE_FILES=128 MAX_LOCAL_DISK_SIZE_GIB=16 bash tools/run_pyfalcon_client_benchmark.sh all
 ```
 
-混合场景判断顺序：先看 fio 多并发读写上限，再看 P-R1/P-1 的 Falcon 纯读纯写，再看固定时长 P-RW 的 pinned-read + write 基线，最后用固定时长 P-RWE 对比 P-RW，评估 evict 对已打开读热集和持续写入的额外影响。P-RW/P-RWE 的 JSON 中必须确认 `timed=true`、`read_pattern=pinned_read_set`。
+混合场景判断顺序：先看 P-SHARED 是否稳定复现 FUSE 和 Python client 共用 cache root，再看 P-R1/P-1 的 Falcon 纯读纯写，再看固定时长 P-RW 的 pinned-read + write 基线，最后用固定时长 P-RWE 对比 P-RW，评估 evict 对已打开读热集和持续写入的额外影响。P-RW/P-RWE 的 JSON 中必须确认 `timed=true`、`read_pattern=pinned_read_set`。
 
 P-DIO 和 B-DIO 不把未对齐写失败当成脚本失败。它们会记录实际返回值：fio 看 `B-DIO-status.json` 和 `B-DIO.stderr`，Falcon internal 看 `python/P-DIO.json` 中每个 probe 的 `create_ret/write_ret/flush_ret/close_ret/error`。
 
