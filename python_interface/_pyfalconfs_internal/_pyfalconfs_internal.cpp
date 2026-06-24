@@ -27,22 +27,6 @@ static int64_t steady_clock_now_us() {
     ).count();
 }
 
-static void ReleasePyBufferWithGil(Py_buffer* buffer)
-{
-    PyGILState_STATE gstate = PyGILState_Ensure();
-    PyBuffer_Release(buffer);
-    PyGILState_Release(gstate);
-}
-
-struct AsyncState;
-
-static void ReleaseAsyncStateWithGil(AsyncState* state);
-
-struct AsyncStateRefGuard {
-    AsyncState* state;
-    ~AsyncStateRefGuard() { ReleaseAsyncStateWithGil(state); }
-};
-
 /* =================== Blocking Methods =======================*/
 static void Init(const char* workspace, const char* runningConfigFile) 
 {
@@ -334,7 +318,6 @@ static PyObject* PyWrapper_Read(PyObject* self, PyObject* args)
         return NULL;
     if (buffer.len < size)
     {
-        PyBuffer_Release(&buffer);
         PyErr_SetString(PyExc_RuntimeError, "the buffer is not enough for requested data.");
         return NULL;
     }
@@ -346,11 +329,10 @@ static PyObject* PyWrapper_Read(PyObject* self, PyObject* args)
     }
     catch (const std::exception& e)
     {
-        PyBuffer_Release(&buffer);
         PyErr_SetString(PyExc_RuntimeError, e.what());
         return NULL;
     }
-    PyBuffer_Release(&buffer);
+    
     return PyLong_FromLong(ret);
 }
 
@@ -377,7 +359,6 @@ static PyObject* PyWrapper_Write(PyObject* self, PyObject* args)
         return NULL;
     if (buffer.len < size)
     {
-        PyBuffer_Release(&buffer);
         PyErr_SetString(PyExc_RuntimeError, "the buffer is not enough for writing data.");
         return NULL;
     }
@@ -389,11 +370,10 @@ static PyObject* PyWrapper_Write(PyObject* self, PyObject* args)
     }
     catch (const std::exception& e)
     {
-        PyBuffer_Release(&buffer);
         PyErr_SetString(PyExc_RuntimeError, e.what());
         return NULL;
     }
-    PyBuffer_Release(&buffer);
+    
     return PyLong_FromLong(ret);
 }
 
@@ -423,17 +403,6 @@ static int Stat(const char *path, struct stat *stbuf)
     int ret = FalconGetStat(path, stbuf);
     return ret > 0 ? -ErrorCodeToErrno(ret) : ret;
 }
-static int SetLongItem(PyObject* dict, const char* key, long long value)
-{
-    PyObject* pyValue = PyLong_FromLongLong(value);
-    if (pyValue == nullptr) {
-        return -1;
-    }
-    int ret = PyDict_SetItemString(dict, key, pyValue);
-    Py_DECREF(pyValue);
-    return ret;
-}
-
 static PyObject* PyWrapper_Stat(PyObject* self, PyObject* args)
 {
     // T_entry: C++ function entry timestamp (GIL already held by Python)
@@ -459,27 +428,21 @@ static PyObject* PyWrapper_Stat(PyObject* self, PyObject* args)
     int64_t exit_us = steady_clock_now_us();
 
     PyObject* dict = PyDict_New();
-    if (dict == nullptr) {
-        return NULL;
-    }
     if (ret == 0)
     {
-        if (SetLongItem(dict, "st_dev", stbuf.st_dev) != 0 ||
-            SetLongItem(dict, "st_ino", stbuf.st_ino) != 0 ||
-            SetLongItem(dict, "st_nlink", stbuf.st_nlink) != 0 ||
-            SetLongItem(dict, "st_mode", stbuf.st_mode) != 0 ||
-            SetLongItem(dict, "st_uid", stbuf.st_uid) != 0 ||
-            SetLongItem(dict, "st_gid", stbuf.st_gid) != 0 ||
-            SetLongItem(dict, "st_rdev", stbuf.st_rdev) != 0 ||
-            SetLongItem(dict, "st_size", stbuf.st_size) != 0 ||
-            SetLongItem(dict, "st_blksize", stbuf.st_blksize) != 0 ||
-            SetLongItem(dict, "st_blocks", stbuf.st_blocks) != 0 ||
-            SetLongItem(dict, "st_atime", stbuf.st_atime) != 0 ||
-            SetLongItem(dict, "st_mtime", stbuf.st_mtime) != 0 ||
-            SetLongItem(dict, "st_ctime", stbuf.st_ctime) != 0) {
-            Py_DECREF(dict);
-            return NULL;
-        }
+        PyDict_SetItem(dict, PyUnicode_FromString("st_dev"), PyLong_FromLong(stbuf.st_dev));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_ino"), PyLong_FromLong(stbuf.st_ino));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_nlink"), PyLong_FromLong(stbuf.st_nlink));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_mode"), PyLong_FromLong(stbuf.st_mode));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_uid"), PyLong_FromLong(stbuf.st_uid));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_gid"), PyLong_FromLong(stbuf.st_gid));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_rdev"), PyLong_FromLong(stbuf.st_rdev));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_size"), PyLong_FromLong(stbuf.st_size));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_blksize"), PyLong_FromLong(stbuf.st_blksize));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_blocks"), PyLong_FromLong(stbuf.st_blocks));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_atime"), PyLong_FromLong(stbuf.st_atime));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_mtime"), PyLong_FromLong(stbuf.st_mtime));
+        PyDict_SetItem(dict, PyUnicode_FromString("st_ctime"), PyLong_FromLong(stbuf.st_ctime));
     }
 
     // Return 4-tuple: (ret, dict, entry_us, exit_us)
@@ -569,13 +532,8 @@ static PyObject* PyWrapper_ReadDir(PyObject* self, PyObject* args)
     {
         PyObject* list = (PyObject*)buf;
         mode_t mode = stbuf ? stbuf->st_mode : (S_IFDIR | 0755);
-        PyObject* item = Py_BuildValue("(si)", name, mode);
-        if (item == nullptr) {
-            return -1;
-        }
-        int ret = PyList_Append(list, item);
-        Py_DECREF(item);
-        return ret;
+        PyList_Append(list, Py_BuildValue("(si)", name, mode));
+        return 0;
     };
     int ret = 0;
     int offset = 0;
@@ -718,7 +676,7 @@ public:
         PyErr_SetString(PyExc_RuntimeError, exceptionInfo);
         return NULL;
     }
-    virtual ~AsyncResultBase()
+    ~AsyncResultBase()
     {
         if (exceptionInfo)
             free(exceptionInfo);
@@ -800,18 +758,9 @@ static PyObject* AsyncState_iternext(PyObject* self)
 
     std::unique_ptr<AsyncResultBase> result = state->future.get();
     PyObject* pyResult = result->GeneratePyObject();
-    if (pyResult == nullptr)
-        return nullptr;
     PyErr_SetObject(PyExc_StopIteration, pyResult);
     Py_DECREF(pyResult);
     return NULL;
-}
-
-static void ReleaseAsyncStateWithGil(AsyncState* state)
-{
-    PyGILState_STATE gstate = PyGILState_Ensure();
-    Py_DECREF((PyObject*)state);
-    PyGILState_Release(gstate);
 }
 
 static PyObject* AsyncState_await(PyObject *self)
@@ -848,18 +797,15 @@ static PyObject* PyWrapper_AsyncExists(PyObject* self, PyObject* args)
     if (!PyArg_ParseTuple(args, "s", &path))
         return nullptr;
 
-    std::string pathStr(path);
     AsyncState* state = (AsyncState*)AsyncStateType.tp_new(&AsyncStateType, nullptr, nullptr);
     state->cpp_recv_time_us = steady_clock_now_us();
-    Py_INCREF((PyObject*)state);
-    auto task = [pathStr, state]() -> std::unique_ptr<AsyncResultBase>
+    auto task = [path, state]() -> std::unique_ptr<AsyncResultBase>
     {
-        AsyncStateRefGuard stateGuard{state};
         int ret = -1;
         struct stat stbuf;
         try
         {
-            ret = Stat(pathStr.c_str(), &stbuf);
+            ret = Stat(path, &stbuf);
         }
         catch (const std::exception& e)
         {
@@ -882,44 +828,31 @@ static PyObject* PyWrapper_AsyncGet(PyObject* self, PyObject* args)
     int offset;
     if (!PyArg_ParseTuple(args, "sw*ii", &path, &buffer, &size, &offset))
         return nullptr;
-    if (size < 0 || buffer.len < size)
-    {
-        PyBuffer_Release(&buffer);
-        PyErr_SetString(PyExc_RuntimeError, "the buffer is not enough for requested data.");
-        return nullptr;
-    }
 
-    std::string pathStr(path);
     AsyncState *state = (AsyncState *)AsyncStateType.tp_new(&AsyncStateType, nullptr, nullptr);
     state->cpp_recv_time_us = steady_clock_now_us();
-    Py_INCREF((PyObject*)state);
-    auto task = [pathStr, buffer, size, offset, state]() mutable -> std::unique_ptr<AsyncResultBase> {
-        AsyncStateRefGuard stateGuard{state};
-        struct BufferGuard {
-            Py_buffer* buffer;
-            ~BufferGuard() { ReleasePyBufferWithGil(buffer); }
-        } guard{&buffer};
+    auto task = [path, buffer, size, offset, state]() -> std::unique_ptr<AsyncResultBase> {
         int ret = -1;
-        int readSize = 0;
+        int readSize;
         uint64_t fd = UINT64_MAX;
         try
         {
-            ret = Open(pathStr.c_str(), O_RDONLY, fd);
+            ret = Open(path, O_RDONLY, fd);
             if (ret != 0)
             {
                 state->cpp_done_time_us = steady_clock_now_us();
                 return std::make_unique<AsyncResultIntOnly>(ret);
             }
 
-            readSize = Read(pathStr.c_str(), fd, (char*)buffer.buf, size, offset);
+            readSize = Read(path, fd, (char*)buffer.buf, size, offset);
             if (readSize < 0)
             {
-                Close(pathStr.c_str(), fd);
+                Close(path, fd);
                 state->cpp_done_time_us = steady_clock_now_us();
                 return std::make_unique<AsyncResultIntOnly>(readSize);
             }
 
-            ret = Close(pathStr.c_str(), fd);
+            ret = Close(path, fd);
             if (ret != 0)
             {
                 state->cpp_done_time_us = steady_clock_now_us();
@@ -929,7 +862,7 @@ static PyObject* PyWrapper_AsyncGet(PyObject* self, PyObject* args)
         catch (const std::exception& e)
         {
             if (fd != UINT64_MAX)
-                Close(pathStr.c_str(), fd);
+                Close(path, fd);
             state->cpp_done_time_us = steady_clock_now_us();
             return std::make_unique<AsyncResultBase>(strdup(e.what()));
         }
@@ -948,51 +881,39 @@ static PyObject* PyWrapper_AsyncPut(PyObject* self, PyObject* args)
     int offset;
     if (!PyArg_ParseTuple(args, "sw*ii", &path, &buffer, &size, &offset))
         return nullptr;
-    if (size < 0 || buffer.len < size)
-    {
-        PyBuffer_Release(&buffer);
-        PyErr_SetString(PyExc_RuntimeError, "the buffer is not enough for writing data.");
-        return nullptr;
-    }
-
-    std::string pathStr(path);
-    std::string writeBuffer(static_cast<char*>(buffer.buf), static_cast<size_t>(size));
-    PyBuffer_Release(&buffer);
 
     AsyncState *state = (AsyncState *)AsyncStateType.tp_new(&AsyncStateType, nullptr, nullptr);
     state->cpp_recv_time_us = steady_clock_now_us();
-    Py_INCREF((PyObject*)state);
-    auto task = [pathStr, writeBuffer = std::move(writeBuffer), size, offset, state]() mutable -> std::unique_ptr<AsyncResultBase>
+    auto task = [path, buffer, size, offset, state]() -> std::unique_ptr<AsyncResultBase>
     {
-        AsyncStateRefGuard stateGuard{state};
         int ret = -1;
         uint64_t fd = UINT64_MAX;
         try
         {
-            ret = Create(pathStr.c_str(), O_CREAT | O_WRONLY | O_TRUNC, fd);
+            ret = Create(path, O_CREAT | O_WRONLY | O_TRUNC, fd);
             if (ret != 0)
             {
                 state->cpp_done_time_us = steady_clock_now_us();
                 return std::make_unique<AsyncResultIntOnly>(ret);
             }
 
-            ret = Write(pathStr.c_str(), fd, writeBuffer.data(), size, offset);
+            ret = Write(path, fd, (char*)buffer.buf, size, offset);
             if (ret != 0)
             {
-                Close(pathStr.c_str(), fd);
+                Close(path, fd);
                 state->cpp_done_time_us = steady_clock_now_us();
                 return std::make_unique<AsyncResultIntOnly>(ret);
             }
 
-            ret = Flush(pathStr.c_str(), fd);
+            ret = Flush(path, fd);
             if (ret != 0)
             {
-                Close(pathStr.c_str(), fd);
+                Close(path, fd);
                 state->cpp_done_time_us = steady_clock_now_us();
                 return std::make_unique<AsyncResultIntOnly>(ret);
             }
 
-            ret = Close(pathStr.c_str(), fd);
+            ret = Close(path, fd);
             if (ret != 0)
             {
                 state->cpp_done_time_us = steady_clock_now_us();
@@ -1002,7 +923,7 @@ static PyObject* PyWrapper_AsyncPut(PyObject* self, PyObject* args)
         catch (const std::exception& e)
         {
             if (fd != UINT64_MAX)
-                Close(pathStr.c_str(), fd);
+                Close(path, fd);
             state->cpp_done_time_us = steady_clock_now_us();
             return std::make_unique<AsyncResultBase>(strdup(e.what()));
         }
@@ -1022,53 +943,51 @@ static PyObject* PyWrapper_AsyncPutNoWait(PyObject* self, PyObject* args)
     PyObject* memobj = nullptr;
     if (!PyArg_ParseTuple(args, "sy*iiO", &path, &buffer, &size, &offset, &memobj))
         return nullptr;
-    if (size < 0 || buffer.len < size)
-    {
-        PyBuffer_Release(&buffer);
-        PyErr_SetString(PyExc_RuntimeError, "the buffer is not enough for writing data.");
-        return nullptr;
-    }
 
+    // 0-copy: only take the raw pointer, no memcpy
+    char* dataPtr = (char*)buffer.buf;
     std::string pathStr(path);
-    Py_INCREF(memobj);
 
-    try {
-        AsyncTaskThreadPoolForPy->DispatchFireAndForget(
-            TASK_PRIORITY_PUT,
-            [pathStr, buffer, size, offset, memobj]() mutable -> void {
-                uint64_t fd = UINT64_MAX;
-                try {
-                    int ret = Create(pathStr.c_str(), O_CREAT | O_WRONLY | O_TRUNC, fd);
-                    if (ret != 0) goto done;
+    // Keep both Python objects alive until async task completes
+    PyObject* bufObj = buffer.obj;
+    Py_INCREF(bufObj);   // prevents memoryview from being GC'd
+    Py_INCREF(memobj);   // prevents MemoryObj from being GC'd
 
-                    ret = Write(pathStr.c_str(), fd, static_cast<char*>(buffer.buf), size, offset);
-                    if (ret != 0) {
-                        Close(pathStr.c_str(), fd);
-                        goto done;
-                    }
+    // Release the buffer view (we already have the raw pointer)
+    PyBuffer_Release(&buffer);
 
-                    ret = Flush(pathStr.c_str(), fd);
+    AsyncTaskThreadPoolForPy->DispatchFireAndForget(
+        TASK_PRIORITY_PUT,
+        [pathStr, dataPtr, size, offset, bufObj, memobj]() -> void {
+            uint64_t fd = UINT64_MAX;
+            try {
+                int ret = Create(pathStr.c_str(), O_CREAT | O_WRONLY | O_TRUNC, fd);
+                if (ret != 0) goto done;
+
+                ret = Write(pathStr.c_str(), fd, dataPtr, size, offset);
+                if (ret != 0) {
                     Close(pathStr.c_str(), fd);
-                } catch (...) {
-                    if (fd != UINT64_MAX)
-                        Close(pathStr.c_str(), fd);
+                    goto done;
                 }
 
-            done:
-                PyGILState_STATE gstate = PyGILState_Ensure();
-                PyBuffer_Release(&buffer);
-                PyObject* r = PyObject_CallMethod(memobj, "ref_count_down", NULL);
-                Py_XDECREF(r);
-                Py_DECREF(memobj);
-                PyGILState_Release(gstate);
+                ret = Flush(pathStr.c_str(), fd);
+                Close(pathStr.c_str(), fd);
+            } catch (...) {
+                if (fd != UINT64_MAX)
+                    Close(pathStr.c_str(), fd);
             }
-        );
-    } catch (...) {
-        Py_DECREF(memobj);
-        PyBuffer_Release(&buffer);
-        PyErr_SetString(PyExc_RuntimeError, "AsyncPutNoWait dispatch failed.");
-        return nullptr;
-    }
+
+        done:
+            // Cleanup: acquire GIL to release Python references
+            PyGILState_STATE gstate = PyGILState_Ensure();
+            // Call ref_count_down to allow memory pool to reclaim
+            PyObject* r = PyObject_CallMethod(memobj, "ref_count_down", NULL);
+            Py_XDECREF(r);
+            Py_DECREF(memobj);
+            Py_DECREF(bufObj);
+            PyGILState_Release(gstate);
+        }
+    );
 
     Py_RETURN_NONE;
 }
