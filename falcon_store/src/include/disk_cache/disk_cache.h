@@ -160,5 +160,6 @@ class DiskCache {
     void RequestBackgroundCleanup(uint64_t size);
     int ScanCache();
     static int Walk(std::string dirPath);
+    void RemoveStaleEntryLocked(uint64_t key, const char *operation);
     int CheckSpaceEnough();
 };

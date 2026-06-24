@@ -829,6 +829,24 @@ void DiskCache::RefreshFreeRatiosFromAccounting()
     }
 }
 
+void DiskCache::RemoveStaleEntryLocked(uint64_t key, const char *operation)
+{
+    auto item = inodeToCacheIter.find(key);
+    if (item == inodeToCacheIter.end()) {
+        return;
+    }
+
+    uint64_t size = item->second->size;
+    std::string fileName = GetFilePath(key);
+    cacheItems.erase(item->second);
+    inodeToCacheIter.erase(item);
+    usedCap -= size;
+    freeCap += size;
+    RefreshFreeRatiosFromAccounting();
+    FALCON_LOG(LOG_WARNING) << "DiskCache::" << operation << " cleared stale cache index, file missing: "
+                            << fileName;
+}
+
 int DiskCache::Delete(uint64_t key)
 {
     if (stop) {
@@ -845,6 +863,10 @@ int DiskCache::Delete(uint64_t key)
         ret = remove(fileName.c_str());
         if (ret != 0) {
             int err = errno;
+            if (err == ENOENT) {
+                RemoveStaleEntryLocked(key, "Delete");
+                return 0;
+            }
             FALCON_LOG(LOG_ERROR) << "Delete file: " << fileName << " failed: " << strerror(err);
             return -err;
         }
@@ -907,6 +929,17 @@ DiskCacheFindResult DiskCache::FindWithWait(uint64_t key, bool needPin, uint64_t
             return DiskCacheFindResult::MISS;
         }
         if (!item->second->evicting) {
+            std::string fileName = GetFilePath(key);
+            if (access(fileName.c_str(), F_OK) != 0) {
+                int err = errno;
+                if (err == ENOENT) {
+                    RemoveStaleEntryLocked(key, "Find");
+                    return DiskCacheFindResult::MISS;
+                }
+                FALCON_LOG(LOG_WARNING) << "DiskCache::Find access failed: " << fileName
+                                        << ", err=" << strerror(err);
+                return DiskCacheFindResult::MISS;
+            }
             if (needPin) {
                 item->second->refs += 1;
                 item->second->atime = static_cast<uint64_t>(time(nullptr));
@@ -941,6 +974,10 @@ void DiskCache::DeleteOldCacheWithNoPin(uint64_t key)
             ReleaseProcessLock(lockFd);
             if (ret != 0) {
                 int err = errno;
+                if (err == ENOENT) {
+                    RemoveStaleEntryLocked(key, "DeleteOldCacheWithNoPin");
+                    return;
+                }
                 FALCON_LOG(LOG_ERROR) << "DeleteOldCacheWithNoPin file: " << fileName << " failed: " << strerror(err);
                 return;
             }

@@ -256,6 +256,63 @@ TEST_F(DiskCacheUT, StartScansExistingCacheFiles)
     std::filesystem::remove_all(cacheRoot);
 }
 
+TEST_F(DiskCacheUT, SharedRootIndependentCachesKeepStaleIndexes)
+{
+    std::string cacheRoot = "/tmp/testdir_shared_stale_index";
+    std::filesystem::remove_all(cacheRoot);
+    std::filesystem::create_directories(cacheRoot + "/0");
+    SetRootPath(cacheRoot);
+    SetTotalDirectory(1);
+
+    uint64_t key = 2601;
+    std::string file = GetFilePath(key);
+    {
+        std::ofstream out(file);
+        out << "cache-data";
+    }
+
+    DiskCache cacheA;
+    DiskCache cacheB;
+    ASSERT_EQ(cacheA.Start(cacheRoot, 1, 0.001), 0);
+    ASSERT_EQ(cacheB.Start(cacheRoot, 1, 0.001), 0);
+    ASSERT_TRUE(cacheA.Find(key, false));
+    ASSERT_TRUE(cacheB.Find(key, false));
+
+    ASSERT_EQ(cacheB.Delete(key), 0);
+    ASSERT_FALSE(std::filesystem::exists(file));
+
+    EXPECT_FALSE(cacheA.Find(key, false));
+    EXPECT_EQ(cacheA.Delete(key), 0);
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
+TEST_F(DiskCacheUT, SharedRootMaxLocalDiskSizeIsPerCacheInstance)
+{
+    std::string cacheRoot = "/tmp/testdir_shared_max_local_disk_size";
+    std::filesystem::remove_all(cacheRoot);
+    std::filesystem::create_directories(cacheRoot + "/0");
+    SetRootPath(cacheRoot);
+    SetTotalDirectory(1);
+
+    DiskCache cacheA;
+    DiskCache cacheB;
+    ASSERT_EQ(cacheA.Start(cacheRoot, 1, 0.2F, 1024), 0);
+    ASSERT_EQ(cacheB.Start(cacheRoot, 1, 0.2F, 1024), 0);
+
+    uint64_t keyA = 2602;
+    {
+        std::ofstream out(GetFilePath(keyA));
+        out << std::string(700, 'a');
+    }
+    cacheA.InsertAndUpdate(keyA, 700, false, "/logical/shared-max-local-disk-size-a");
+
+    EXPECT_TRUE(cacheB.PreAllocSpace(300));
+    cacheB.FreePreAllocSpace(300);
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
 TEST_F(DiskCacheUT, ZeroWatermarkStopModeCoversNoopBranches)
 {
     std::string cacheRoot = "/tmp/testdir_zero_stop";
@@ -622,7 +679,6 @@ TEST_F(DiskCacheUT, EvictClearsStaleIndexWhenLocalCacheFileAlreadyMissing)
     std::string logicalPath = "/logical/missing-local-cache";
     cache.InsertAndUpdate(inode, 10, false, logicalPath);
     ASSERT_FALSE(std::filesystem::exists(GetFilePath(inode)));
-    ASSERT_TRUE(cache.Find(inode, false));
 
     RecordingEvictListener listener;
     cache.SetEvictListener(&listener);
@@ -714,12 +770,12 @@ TEST_F(DiskCacheUT, PublicEvictAndFailureBranches)
 
     uint64_t deleteMissingKey = 504;
     cache.InsertAndUpdate(deleteMissingKey, 1, false);
-    EXPECT_LT(cache.Delete(deleteMissingKey), 0);
+    EXPECT_EQ(cache.Delete(deleteMissingKey), 0);
 
     uint64_t oldMissingKey = 505;
     cache.InsertAndUpdate(oldMissingKey, 1, false);
     cache.DeleteOldCacheWithNoPin(oldMissingKey);
-    EXPECT_TRUE(cache.Find(oldMissingKey, false));
+    EXPECT_FALSE(cache.Find(oldMissingKey, false));
 
     EXPECT_FALSE(cache.PreAllocSpace(UINT64_MAX / 4));
     EXPECT_FALSE(cache.HasFreeSpace());
